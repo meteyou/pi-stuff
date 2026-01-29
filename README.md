@@ -1,0 +1,41 @@
+# pi-stuff
+
+This repository contains my personal collection of resources for the [pi](https://buildwithpi.ai/) coding agent. It
+serves as a comprehensive package to enhance the capabilities of `pi` with custom tools, workflows, and aesthetic
+configurations.
+
+Here you will find:
+- **Skills**: Reusable capabilities that teach `pi` how to perform specific tasks (e.g., browsing the web, managing tmux
+  sessions).
+- **Extensions**: Add-ons that extend the core functionality of the agent.
+- **Prompts**: Curated system prompts and templates to steer the agent's behavior.
+- **Themes**: Custom color schemes to personalize the TUI experience.
+
+Feel free to explore, use, and modify these resources to build your own perfect coding assistant environment.
+
+## 🚀 Installation
+
+You can easily install this package directly using the `pi` command line interface. This will make all contained skills,
+themes, and extensions immediately available to your agent.
+
+### Standard Installation
+
+Run the following command to install the package from GitHub:
+
+```bash
+pi install https://github.com/meteyou/pi-stuff.git
+```
+
+Once installed, `pi` will automatically detect the new capabilities. You can start using the skills immediately in your
+next session.
+
+## Skills
+
+| Skill | Description |
+|-------|-------------|
+| `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. |
+| `improve-skill` | Analyze coding agent session transcripts to improve existing skills or create new ones. Use when asked to improve a skill based on a session, or extract a new skill from session history. |
+| `pi-share` | Load and parse session transcripts from shittycodingagent.ai/buildwithpi.ai/buildwithpi.com (pi-share) URLs. Fetches gists, decodes embedded session data, and extracts conversation history. |
+| `web-browser` | Allows to interact with web pages by performing actions such as clicking buttons, filling out forms, and navigating links. It works by remote controlling Google Chrome or Chromium browsers using the Chrome DevTools Protocol (CDP). |
+
+> **Note**: The skills `github`, `improve-skill`, `pi-share`, and `web-browser` are stolen from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/).

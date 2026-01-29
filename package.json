@@ -1,0 +1,19 @@
+{
+  "name": "pi-stuff",
+  "version": "1.0.0",
+  "description": "My pi extensions, skills and more",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "themes": ["./themes"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
