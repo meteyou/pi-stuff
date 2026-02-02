@@ -31,10 +31,9 @@ next session.
 
 ## Skills
 
-| Skill | Description |
-|-------|-------------|
-| `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. |
-| `improve-skill` | Analyze coding agent session transcripts to improve existing skills or create new ones. Use when asked to improve a skill based on a session, or extract a new skill from session history. |
-| `pi-share` | Load and parse session transcripts from shittycodingagent.ai/buildwithpi.ai/buildwithpi.com (pi-share) URLs. Fetches gists, decodes embedded session data, and extracts conversation history. |
-
-> **Note**: The skills `github`, `improve-skill` and `pi-share` are stolen from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/).
+| Skill | Description | Source |
+|-------|-------------|--------|
+| `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `improve-skill` | Analyze coding agent session transcripts to improve existing skills or create new ones. Use when asked to improve a skill based on a session, or extract a new skill from session history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `pi-share` | Load and parse session transcripts from shittycodingagent.ai/buildwithpi.ai/buildwithpi.com (pi-share) URLs. Fetches gists, decodes embedded session data, and extracts conversation history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | [anthropics/skills](https://github.com/anthropics/skills/) |
