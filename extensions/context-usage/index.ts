@@ -9,7 +9,6 @@
  * - Breakdown by System Prompt and Messages with tree structure
  * - Tracking of read files (via read tool)
  * - Tracking of loaded skills (via /skill:name)
- * - Status display in footer
  *
  * Usage: pi -e ./extensions/context-usage.ts
  *        then: /context
@@ -532,24 +531,5 @@ export default function (pi: ExtensionAPI) {
 				return component;
 			});
 		},
-	});
-
-	// Status update after each turn
-	pi.on("turn_end", async (_event, ctx) => {
-		const usage = ctx.getContextUsage();
-		if (usage) {
-			const theme = ctx.ui.theme;
-			const percent = usage.percent.toFixed(0);
-			const tokens = formatTokens(usage.tokens);
-
-			let color: "success" | "warning" | "error" = "success";
-			if (usage.percent > 70) color = "warning";
-			if (usage.percent > 85) color = "error";
-
-			ctx.ui.setStatus(
-				"context",
-				theme.fg(color, `⛁ ${tokens}/${formatTokens(usage.contextWindow)} (${percent}%)`)
-			);
-		}
 	});
 }
