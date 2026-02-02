@@ -29,6 +29,13 @@ pi install https://github.com/meteyou/pi-stuff.git
 Once installed, `pi` will automatically detect the new capabilities. You can start using the skills immediately in your
 next session.
 
+## Extensions
+
+| Extension | Description | Command |
+|-----------|-------------|---------|
+| `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` |
+| `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` |
+
 ## Skills
 
 | Skill | Description | Source |
