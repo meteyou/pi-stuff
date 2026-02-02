@@ -36,6 +36,5 @@ next session.
 | `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. |
 | `improve-skill` | Analyze coding agent session transcripts to improve existing skills or create new ones. Use when asked to improve a skill based on a session, or extract a new skill from session history. |
 | `pi-share` | Load and parse session transcripts from shittycodingagent.ai/buildwithpi.ai/buildwithpi.com (pi-share) URLs. Fetches gists, decodes embedded session data, and extracts conversation history. |
-| `web-browser` | Allows to interact with web pages by performing actions such as clicking buttons, filling out forms, and navigating links. It works by remote controlling Google Chrome or Chromium browsers using the Chrome DevTools Protocol (CDP). |
 
-> **Note**: The skills `github`, `improve-skill`, `pi-share`, and `web-browser` are stolen from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/).
+> **Note**: The skills `github`, `improve-skill` and `pi-share` are stolen from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/).
