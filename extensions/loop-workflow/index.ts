@@ -297,7 +297,20 @@ Help me define a clear plan by:
 - Verifiable (clear "done" criteria)
 - Independent (minimal dependencies on other tasks)
 
-Start by asking me your questions!`);
+Start by asking me your questions!
+
+---
+
+## ⚠️ STOP AFTER PLANNING
+
+**DO NOT** start executing tasks after creating the plan!
+
+Once the plan is finalized in PLAN.md:
+1. Show a summary of the tasks
+2. Tell the user to review the plan
+3. **STOP and WAIT** for the user to run \`/loop run\`
+
+The user must explicitly trigger execution with \`/loop run\`.`);
 					break;
 				}
 
