@@ -72,7 +72,9 @@ function getAccessTokenFromPiAuth(): string | null {
  * Fetches usage data from the Anthropic API.
  * Uses the same headers as Claude Code.
  */
-async function fetchUsageLimits(accessToken: string): Promise<UsageLimits | null> {
+async function fetchUsageLimits(
+  accessToken: string
+): Promise<{ usage: UsageLimits | null; status?: number }> {
   try {
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
       method: "GET",
@@ -89,13 +91,13 @@ async function fetchUsageLimits(accessToken: string): Promise<UsageLimits | null
 
     if (!response.ok) {
       console.error(`Claude Usage API error: ${response.status} ${response.statusText}`);
-      return null;
+      return { usage: null, status: response.status };
     }
 
-    return (await response.json()) as UsageLimits;
+    return { usage: (await response.json()) as UsageLimits, status: response.status };
   } catch (error) {
     console.error("Claude Usage fetch error:", error);
-    return null;
+    return { usage: null };
   }
 }
 
@@ -212,21 +214,36 @@ export default function (pi: ExtensionAPI) {
 
     const theme = ctx.ui.theme;
 
-    // Load access token on first call
+    // Always reload access token (pi may refresh it on model use)
+    accessToken = getAccessTokenFromPiAuth();
     if (!accessToken) {
+      ctx.ui.setStatus(
+        "claude-usage",
+        theme.fg("warning", "⚠ Claude OAuth not found (use /login)")
+      );
+      return;
+    }
+
+    const firstAttempt = await fetchUsageLimits(accessToken);
+    let usage = firstAttempt.usage;
+    let status = firstAttempt.status;
+
+    // Retry once in case the token was refreshed on disk
+    if (!usage && status === 401) {
       accessToken = getAccessTokenFromPiAuth();
-      if (!accessToken) {
-        ctx.ui.setStatus(
-          "claude-usage",
-          theme.fg("warning", "⚠ Claude OAuth not found (use /login)")
-        );
-        return;
+      if (accessToken) {
+        const retryAttempt = await fetchUsageLimits(accessToken);
+        usage = retryAttempt.usage;
+        status = retryAttempt.status ?? status;
       }
     }
 
-    const usage = await fetchUsageLimits(accessToken);
     if (!usage) {
-      ctx.ui.setStatus("claude-usage", theme.fg("error", "✗ Failed to fetch usage"));
+      const statusSuffix = status ? ` (${status})` : "";
+      ctx.ui.setStatus(
+        "claude-usage",
+        theme.fg("error", `✗ Failed to fetch usage${statusSuffix}`)
+      );
       return;
     }
 
