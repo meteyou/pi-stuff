@@ -198,16 +198,25 @@ export default function (pi: ExtensionAPI) {
   let updateInterval: ReturnType<typeof setInterval> | null = null;
   let accessToken: string | null = null;
   let isAnthropicModel = false;
+  let hasAnthropicTurn = false;
 
   function checkIsAnthropicModel(ctx: ExtensionContext): boolean {
     return ctx.model?.provider === "anthropic";
   }
 
-  async function updateUsageStatus(ctx: ExtensionContext) {
+  async function updateUsageStatus(
+    ctx: ExtensionContext,
+    options: { force?: boolean } = {}
+  ) {
     if (!ctx.hasUI) return;
 
     // Only show status for Anthropic models
     if (!isAnthropicModel) {
+      ctx.ui.setStatus("claude-usage", undefined);
+      return;
+    }
+
+    if (!hasAnthropicTurn && !options.force) {
       ctx.ui.setStatus("claude-usage", undefined);
       return;
     }
@@ -288,6 +297,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     isAnthropicModel = checkIsAnthropicModel(ctx);
+    hasAnthropicTurn = false;
     await updateUsageStatus(ctx);
 
     // Update every 5 minutes
@@ -304,6 +314,7 @@ export default function (pi: ExtensionAPI) {
   // Update after each turn (only for Anthropic models)
   pi.on("turn_end", async (_event, ctx) => {
     if (!isAnthropicModel) return;
+    hasAnthropicTurn = true;
     // Wait briefly so the API has the new values
     setTimeout(() => updateUsageStatus(ctx), 2000);
   });
@@ -321,7 +332,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       // Reload token (in case login changed)
       accessToken = getAccessTokenFromPiAuth();
-      await updateUsageStatus(ctx);
+      await updateUsageStatus(ctx, { force: true });
 
       if (!lastUsage) {
         ctx.ui.notify("No usage data available", "error");
