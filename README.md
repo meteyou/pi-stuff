@@ -36,6 +36,7 @@ next session.
 | `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` |
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` |
+| `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with optional fresh review branch and `/end-review`. Based on ideas from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/). | `/review`, `/end-review` |
 
 ## Skills
 
