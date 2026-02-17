@@ -37,6 +37,7 @@ next session.
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` |
 | `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with optional fresh review branch and `/end-review`. Based on ideas from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/). | `/review`, `/end-review` |
+| `session-breakdown` | Interactive breakdown of the last 7/30/90 days of Pi session usage (sessions/messages/tokens/cost) with heatmap and model table. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/session-breakdown.ts). | `/session-breakdown` |
 
 ## Skills
 
