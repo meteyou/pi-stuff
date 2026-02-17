@@ -33,6 +33,7 @@ next session.
 
 | Extension | Description | Command |
 |-----------|-------------|---------|
+| `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/answer.ts). | `/answer` (+ `Ctrl+.`) |
 | `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` |
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` |
