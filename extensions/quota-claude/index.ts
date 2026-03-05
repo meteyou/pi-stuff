@@ -16,6 +16,8 @@ import { join } from "node:path";
 
 // Version must match Claude Code
 const claudeCodeVersion = "2.1.2";
+const MIN_FETCH_INTERVAL_MS = 30_000;
+const DEFAULT_RATE_LIMIT_BACKOFF_MS = 120_000;
 
 interface UsageLimits {
   five_hour: {
@@ -68,13 +70,30 @@ function getAccessTokenFromPiAuth(): string | null {
   }
 }
 
+function parseRetryAfterMs(retryAfterHeader: string | null): number | undefined {
+  if (!retryAfterHeader) return undefined;
+
+  const seconds = Number(retryAfterHeader);
+  if (!Number.isNaN(seconds) && seconds > 0) {
+    return Math.round(seconds * 1000);
+  }
+
+  const retryAt = new Date(retryAfterHeader).getTime();
+  if (!Number.isNaN(retryAt)) {
+    const diff = retryAt - Date.now();
+    if (diff > 0) return diff;
+  }
+
+  return undefined;
+}
+
 /**
  * Fetches usage data from the Anthropic API.
  * Uses the same headers as Claude Code.
  */
 async function fetchUsageLimits(
   accessToken: string
-): Promise<{ usage: UsageLimits | null; status?: number }> {
+): Promise<{ usage: UsageLimits | null; status?: number; retryAfterMs?: number }> {
   try {
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
       method: "GET",
@@ -91,7 +110,11 @@ async function fetchUsageLimits(
 
     if (!response.ok) {
       console.error(`Claude Usage API error: ${response.status} ${response.statusText}`);
-      return { usage: null, status: response.status };
+      return {
+        usage: null,
+        status: response.status,
+        retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
+      };
     }
 
     return { usage: (await response.json()) as UsageLimits, status: response.status };
@@ -199,6 +222,8 @@ export default function (pi: ExtensionAPI) {
   let accessToken: string | null = null;
   let isAnthropicModel = false;
   let hasAnthropicTurn = false;
+  let lastFetchAt = 0;
+  let rateLimitedUntil = 0;
 
   function checkIsAnthropicModel(ctx: ExtensionContext): boolean {
     return ctx.model?.provider === "anthropic";
@@ -223,6 +248,23 @@ export default function (pi: ExtensionAPI) {
 
     const theme = ctx.ui.theme;
 
+    const now = Date.now();
+    if (!options.force) {
+      if (now < rateLimitedUntil) {
+        if (lastUsage) {
+          renderStatus(ctx, { stale: true });
+        } else {
+          ctx.ui.setStatus("claude-usage", theme.fg("warning", "⚠ Usage API rate-limited"));
+        }
+        return;
+      }
+
+      if (now - lastFetchAt < MIN_FETCH_INTERVAL_MS && lastUsage) {
+        renderStatus(ctx);
+        return;
+      }
+    }
+
     // Always reload access token (pi may refresh it on model use)
     accessToken = getAccessTokenFromPiAuth();
     if (!accessToken) {
@@ -233,9 +275,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    lastFetchAt = Date.now();
     const firstAttempt = await fetchUsageLimits(accessToken);
     let usage = firstAttempt.usage;
     let status = firstAttempt.status;
+    let retryAfterMs = firstAttempt.retryAfterMs;
 
     // Retry once in case the token was refreshed on disk
     if (!usage && status === 401) {
@@ -244,10 +288,22 @@ export default function (pi: ExtensionAPI) {
         const retryAttempt = await fetchUsageLimits(accessToken);
         usage = retryAttempt.usage;
         status = retryAttempt.status ?? status;
+        retryAfterMs = retryAttempt.retryAfterMs ?? retryAfterMs;
       }
     }
 
     if (!usage) {
+      if (status === 429) {
+        const backoffMs = retryAfterMs ?? DEFAULT_RATE_LIMIT_BACKOFF_MS;
+        rateLimitedUntil = Date.now() + backoffMs;
+        if (lastUsage) {
+          renderStatus(ctx, { stale: true });
+        } else {
+          ctx.ui.setStatus("claude-usage", theme.fg("warning", "⚠ Usage API rate-limited"));
+        }
+        return;
+      }
+
       const statusSuffix = status ? ` (${status})` : "";
       ctx.ui.setStatus(
         "claude-usage",
@@ -256,11 +312,12 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    rateLimitedUntil = 0;
     lastUsage = usage;
     renderStatus(ctx);
   }
 
-  function renderStatus(ctx: ExtensionContext) {
+  function renderStatus(ctx: ExtensionContext, options: { stale?: boolean } = {}) {
     if (!lastUsage || !ctx.hasUI) return;
     const theme = ctx.ui.theme;
 
@@ -291,7 +348,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const status = theme.fg("dim", "Claude: ") + parts.join(theme.fg("dim", " │ "));
+    const warningSuffix = options.stale ? theme.fg("warning", " ⚠") : "";
+    const status = theme.fg("dim", "Claude: ") + parts.join(theme.fg("dim", " │ ")) + warningSuffix;
     ctx.ui.setStatus("claude-usage", status);
   }
 

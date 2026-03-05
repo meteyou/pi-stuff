@@ -83,7 +83,8 @@ The extension uses Pi's OAuth credentials:
 
 ### Polling
 
-- **Footer status**: Updates every 5 minutes + after each turn
+- **Footer status**: Updates every 5 minutes + after each turn (throttled to max 1 request / 30s)
+- **429 handling**: Uses `Retry-After` (or 2 min fallback), keeps last quota visible, adds `⚠` suffix while stale
 - **Command**: Always fetches fresh data
 
 ## Troubleshooting
@@ -95,6 +96,11 @@ The extension uses Pi's OAuth credentials:
 ### "Failed to fetch usage"
 - Your OAuth token may have expired - try `/login` again
 - Check your internet connection
+
+### "Failed to fetch usage (429)"
+- Anthropic usage endpoint is rate-limited
+- Extension now auto-throttles requests and backs off on 429
+- Wait ~1-2 min (or the `Retry-After` time) before retrying `/quota-claude`
 
 ### Status not showing in footer
 - Verify you're using an Anthropic model (`/model`)
