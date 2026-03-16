@@ -67,11 +67,24 @@ Example output:
   ]
 }`;
 
-const CODEX_MODEL_ID = "gpt-5.1-codex-mini";
-const HAIKU_MODEL_ID = "claude-haiku-4-5";
+/**
+ * Cheap/fast model per provider for question extraction.
+ * Uses the same provider as the current model to reuse the active subscription/API key.
+ */
+const EXTRACTION_MODELS: Record<string, string> = {
+	"anthropic": "claude-haiku-4-5",
+	"openai": "gpt-5.1-codex-mini",
+	"openai-codex": "gpt-5.1-codex-mini",
+	"google": "gemini-3-flash-preview",
+	"google-gemini-cli": "gemini-3-flash-preview",
+	"google-antigravity": "gemini-3-flash",
+	"google-vertex": "gemini-3-flash-preview",
+	"github-copilot": "gpt-5-mini",
+};
 
 /**
- * Prefer Codex mini for extraction when available, otherwise fallback to haiku or the current model.
+ * Select the cheapest/fastest model from the same provider as the current model.
+ * Falls back to the current model if no mapping exists or the model isn't available.
  */
 async function selectExtractionModel(
 	currentModel: Model<Api>,
@@ -80,25 +93,27 @@ async function selectExtractionModel(
 		getApiKey: (model: Model<Api>) => Promise<string | undefined>;
 	},
 ): Promise<Model<Api>> {
-	const codexModel = modelRegistry.find("openai-codex", CODEX_MODEL_ID);
-	if (codexModel) {
-		const apiKey = await modelRegistry.getApiKey(codexModel);
-		if (apiKey) {
-			return codexModel;
-		}
-	}
-
-	const haikuModel = modelRegistry.find("anthropic", HAIKU_MODEL_ID);
-	if (!haikuModel) {
+	const cheapModelId = EXTRACTION_MODELS[currentModel.provider];
+	if (!cheapModelId) {
 		return currentModel;
 	}
 
-	const apiKey = await modelRegistry.getApiKey(haikuModel);
+	// Skip lookup if already using the cheap model
+	if (currentModel.id === cheapModelId) {
+		return currentModel;
+	}
+
+	const cheapModel = modelRegistry.find(currentModel.provider, cheapModelId);
+	if (!cheapModel) {
+		return currentModel;
+	}
+
+	const apiKey = await modelRegistry.getApiKey(cheapModel);
 	if (!apiKey) {
 		return currentModel;
 	}
 
-	return haikuModel;
+	return cheapModel;
 }
 
 /**
