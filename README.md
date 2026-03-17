@@ -45,7 +45,10 @@ next session.
 | Skill | Description | Source |
 |-------|-------------|--------|
 | `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `grill-me` | Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/grill-me) |
 | `improve-skill` | Analyze coding agent session transcripts to improve existing skills or create new ones. Use when asked to improve a skill based on a session, or extract a new skill from session history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `pi-share` | Load and parse session transcripts from shittycodingagent.ai/buildwithpi.ai/buildwithpi.com (pi-share) URLs. Fetches gists, decodes embedded session data, and extracts conversation history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `prd-to-todos` | Break a PRD into independently-grabbable todos using tracer-bullet vertical slices. Adapted from `prd-to-issues`: uses local todos instead of GitHub Issues, removed HITL/AFK distinction (solo workflow). | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
 | `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | [anthropics/skills](https://github.com/anthropics/skills/) |
 | `summarize` | Extract and summarize content from web pages, YouTube videos, and local files. No API keys required - uses direct content extraction. Based on [steipete/summarize](https://github.com/steipete/summarize). | custom |
+| `write-a-prd` | Create a PRD through user interview, codebase exploration, and module design. Adapted from original: saves PRD as a local todo (tagged `prd`) instead of a GitHub Issue. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/write-a-prd) |
