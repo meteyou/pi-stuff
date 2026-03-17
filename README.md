@@ -49,6 +49,8 @@ git push
 
 ## Extensions
 
+### Custom Extensions
+
 | Extension | Description | Command |
 |-----------|-------------|---------|
 | `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/answer.ts). | `/answer` (+ `Ctrl+.`) |
@@ -56,8 +58,14 @@ git push
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` |
 | `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) |
-| `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with optional fresh review branch and `/end-review`. Based on ideas from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/). | `/review`, `/end-review` |
-| `session-breakdown` | Interactive breakdown of the last 7/30/90 days of Pi session usage (sessions/messages/tokens/cost) with heatmap and model table. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/session-breakdown.ts). | `/session-breakdown` |
+
+### From [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) (via npm dependency)
+
+| Extension | Description | Command |
+|-----------|-------------|---------|
+| `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with review loop and auto-fixing. | `/review`, `/end-review` |
+| `session-breakdown` | Interactive breakdown of session usage (sessions/messages/tokens/cost) with heatmap, model table, and breakdowns by CWD, day of week, and time of day. | `/session-breakdown` |
+| `todos` | File-based todo manager with claiming, locking, and garbage collection. Includes a visual `/todos` TUI and a `todo` tool for the LLM. | `/todos` |
 
 ## Skills
 
