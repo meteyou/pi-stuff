@@ -1,11 +1,23 @@
 ---
 name: summarize
-description: Extract and summarize content from web pages, YouTube videos, and local files. Use when asked to summarize a URL, article, blog post, or YouTube video. Also use for extracting readable text from web pages, fetching YouTube transcripts, or reading online documentation/articles. No API keys required - uses direct content extraction.
+description: Summarize web articles, blog posts, or YouTube videos when the user explicitly asks for a summary. Use ONLY when the user says "summarize", "give me a summary", "what is this article/video about", or similar. Do NOT use this skill for fetching raw file content, downloading code, reading GitHub repos/files/issues/PRs, or any task that doesn't involve summarization.
 ---
 
 # Summarize
 
-Extract readable content from web pages and YouTube video transcripts using Python scripts. No external API keys needed - content is extracted directly and can be summarized by the current LLM.
+Extract readable content from web articles and YouTube video transcripts, then summarize them. No external API keys needed - content is extracted directly and summarized by the current LLM.
+
+## When to use this skill
+
+- User explicitly asks to **summarize** a web page, article, blog post, or YouTube video
+- User asks "what is this article/video about?"
+
+## When NOT to use this skill
+
+- Fetching raw content from GitHub (repos, files, issues, PRs, raw URLs) → use `gh` CLI or `curl` instead
+- Downloading or reading source code files from URLs → use `curl` instead
+- Reading documentation to follow instructions → use `curl` instead
+- Any task where the user does NOT ask for a summary
 
 ## Scripts
 
