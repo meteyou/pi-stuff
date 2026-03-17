@@ -4,10 +4,16 @@
   "description": "My pi extensions, skills and more",
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./extensions"],
+    "extensions": [
+      "./extensions",
+      "./node_modules/agent-stuff/pi-extensions/todos.ts"
+    ],
     "skills": ["./skills"],
     "prompts": ["./prompts"],
     "themes": ["./themes"]
+  },
+  "dependencies": {
+    "agent-stuff": "github:mitsuhiko/agent-stuff"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",

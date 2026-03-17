@@ -15,19 +15,37 @@ Feel free to explore, use, and modify these resources to build your own perfect 
 
 ## 🚀 Installation
 
-You can easily install this package directly using the `pi` command line interface. This will make all contained skills,
-themes, and extensions immediately available to your agent.
-
-### Standard Installation
-
-Run the following command to install the package from GitHub:
+Install the package directly using the `pi` CLI:
 
 ```bash
 pi install https://github.com/meteyou/pi-stuff.git
 ```
 
-Once installed, `pi` will automatically detect the new capabilities. You can start using the skills immediately in your
-next session.
+This clones the repo, runs `npm install` to fetch third-party dependencies (e.g. the `todos` tool from
+[mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff)), and makes all skills, extensions, themes, and
+prompts available immediately.
+
+### Updating
+
+Update the package (including third-party dependencies) with:
+
+```bash
+pi update
+```
+
+Then run `/reload` in pi or restart your session.
+
+### Note to Self: Updating Third-Party Dependencies
+
+When upstream dependencies (e.g. `mitsuhiko/agent-stuff`) have new changes, update and commit the lock file so users get
+them via `pi update`:
+
+```bash
+npm update
+git add package-lock.json
+git commit -m "chore: update dependencies"
+git push
+```
 
 ## Extensions
 
