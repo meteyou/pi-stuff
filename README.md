@@ -74,7 +74,6 @@ git push
 | Skill | Description | Source |
 |-------|-------------|--------|
 | `grill-me` | Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/grill-me) |
-| `improve-skill` | Analyze coding agent session transcripts to improve existing skills or create new ones. Use when asked to improve a skill based on a session, or extract a new skill from session history. | custom |
 | `prd-to-todos` | Break a PRD into independently-grabbable todos using tracer-bullet vertical slices. Adapted from `prd-to-issues`: uses local todos instead of GitHub Issues, removed HITL/AFK distinction (solo workflow). | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
 | `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | [anthropics/skills](https://github.com/anthropics/skills/) |
 | `summarize` | Extract and summarize content from web pages, YouTube videos, and local files. No API keys required - uses direct content extraction. Based on [steipete/summarize](https://github.com/steipete/summarize). | custom |
