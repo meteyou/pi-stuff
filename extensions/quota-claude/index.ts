@@ -16,8 +16,16 @@ import { join } from "node:path";
 
 // Version must match Claude Code
 const claudeCodeVersion = "2.1.2";
-const MIN_FETCH_INTERVAL_MS = 30_000;
-const DEFAULT_RATE_LIMIT_BACKOFF_MS = 120_000;
+
+// Fetch at most once every 10 minutes
+const MIN_FETCH_INTERVAL_MS = 10 * 60 * 1000;
+
+// Background polling interval: 15 minutes
+const POLL_INTERVAL_MS = 15 * 60 * 1000;
+
+// Rate-limit backoff: start at 15 min, double each time, cap at 2 hours
+const INITIAL_BACKOFF_MS = 15 * 60 * 1000;
+const MAX_BACKOFF_MS = 2 * 60 * 60 * 1000;
 
 interface UsageLimits {
   five_hour: {
@@ -65,7 +73,6 @@ function getAccessTokenFromPiAuth(): string | null {
     
     return null;
   } catch (error) {
-    // File not found or invalid JSON
     return null;
   }
 }
@@ -89,7 +96,6 @@ function parseRetryAfterMs(retryAfterHeader: string | null): number | undefined 
 
 /**
  * Fetches usage data from the Anthropic API.
- * Uses the same headers as Claude Code.
  */
 async function fetchUsageLimits(
   accessToken: string
@@ -119,14 +125,18 @@ async function fetchUsageLimits(
 
     return { usage: (await response.json()) as UsageLimits, status: response.status };
   } catch (error) {
-    console.error("Claude Usage fetch error:", error);
+    // Network errors (ENETUNREACH, ENOTFOUND, etc.) are expected when offline — don't spam the console
+    const cause = (error as any)?.cause;
+    const code = cause?.code;
+    if (code === "ENETUNREACH" || code === "ENOTFOUND" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ECONNRESET") {
+      // Silently ignore transient network errors
+    } else {
+      console.error("Claude Usage fetch error:", error);
+    }
     return { usage: null };
   }
 }
 
-/**
- * Formats the reset time relative to the current time.
- */
 function formatResetTime(resetAt: string | null): string {
   if (!resetAt) return "";
   const reset = new Date(resetAt);
@@ -148,19 +158,12 @@ function formatResetTime(resetAt: string | null): string {
   return `${minutes}m`;
 }
 
-/**
- * Returns the color based on usage percentage.
- */
 function getUsageColor(pct: number): "success" | "warning" | "error" {
   if (pct >= 90) return "error";
   if (pct >= 70) return "warning";
   return "success";
 }
 
-/**
- * Renders a progress bar with Unicode characters.
- * █ = filled (bold color), ░ = empty (dark background)
- */
 function renderProgressBar(
   pct: number,
   width: number,
@@ -180,28 +183,19 @@ function renderProgressBar(
   return bar;
 }
 
-/**
- * Capitalizes the first letter of a string.
- */
-function capitalizeFirstLetter(val) {
+function capitalizeFirstLetter(val: string) {
   return String(val).charAt(0).toUpperCase() + String(val).slice(1);
 }
 
-/**
- * Formats the reset time nicely with timezone.
- * e.g. "11:59pm (Europe/Vienna)"
- */
 function formatResetTimeNice(resetAt: string, showTimezone: boolean = false): string {
   const reset = new Date(resetAt);
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-  // Date format
   const dateStr = capitalizeFirstLetter(reset.toLocaleDateString("en-US", {
     weekday: "short",
     timeZone: timezone,
   }).toLowerCase());
 
-  // Time in 12-hour format
   const timeStr = reset.toLocaleTimeString("en-US", {
     hour: "numeric",
     minute: "2-digit",
@@ -224,18 +218,23 @@ export default function (pi: ExtensionAPI) {
   let hasAnthropicTurn = false;
   let lastFetchAt = 0;
   let rateLimitedUntil = 0;
+  let currentBackoffMs = INITIAL_BACKOFF_MS;
 
   function checkIsAnthropicModel(ctx: ExtensionContext): boolean {
     return ctx.model?.provider === "anthropic";
   }
 
+  /**
+   * Core fetch + update function.
+   * Respects rate limits and minimum fetch intervals.
+   * Only `force: true` (from /quota-claude command) bypasses the interval guard.
+   */
   async function updateUsageStatus(
     ctx: ExtensionContext,
     options: { force?: boolean } = {}
   ) {
     if (!ctx.hasUI) return;
 
-    // Only show status for Anthropic models
     if (!isAnthropicModel) {
       ctx.ui.setStatus("claude-usage", undefined);
       return;
@@ -247,25 +246,31 @@ export default function (pi: ExtensionAPI) {
     }
 
     const theme = ctx.ui.theme;
-
     const now = Date.now();
+
+    // --- Guards (skipped only for force) ---
     if (!options.force) {
+      // Guard 1: Rate-limited → show stale/warning, don't fetch
       if (now < rateLimitedUntil) {
         if (lastUsage) {
           renderStatus(ctx, { stale: true });
         } else {
-          ctx.ui.setStatus("claude-usage", theme.fg("warning", "⚠ Usage API rate-limited"));
+          const remainMin = Math.ceil((rateLimitedUntil - now) / 60_000);
+          ctx.ui.setStatus("claude-usage",
+            theme.fg("warning", `⚠ Usage API rate-limited (retry in ${remainMin}m)`));
         }
         return;
       }
 
-      if (now - lastFetchAt < MIN_FETCH_INTERVAL_MS && lastUsage) {
-        renderStatus(ctx);
+      // Guard 2: Min interval not reached → show cached, don't fetch
+      // NOTE: No `&& lastUsage` — always enforce the interval!
+      if (now - lastFetchAt < MIN_FETCH_INTERVAL_MS) {
+        if (lastUsage) renderStatus(ctx);
         return;
       }
     }
 
-    // Always reload access token (pi may refresh it on model use)
+    // --- Fetch ---
     accessToken = getAccessTokenFromPiAuth();
     if (!accessToken) {
       ctx.ui.setStatus(
@@ -281,7 +286,7 @@ export default function (pi: ExtensionAPI) {
     let status = firstAttempt.status;
     let retryAfterMs = firstAttempt.retryAfterMs;
 
-    // Retry once in case the token was refreshed on disk
+    // Retry once on 401 (token may have been refreshed on disk)
     if (!usage && status === 401) {
       accessToken = getAccessTokenFromPiAuth();
       if (accessToken) {
@@ -294,12 +299,22 @@ export default function (pi: ExtensionAPI) {
 
     if (!usage) {
       if (status === 429) {
-        const backoffMs = retryAfterMs ?? DEFAULT_RATE_LIMIT_BACKOFF_MS;
+        // Exponential backoff: use retry-after if provided, otherwise double the backoff
+        const serverBackoff = retryAfterMs;
+        const backoffMs = serverBackoff ?? currentBackoffMs;
         rateLimitedUntil = Date.now() + backoffMs;
+
+        // Increase backoff for next 429 (exponential, capped)
+        if (!serverBackoff) {
+          currentBackoffMs = Math.min(currentBackoffMs * 2, MAX_BACKOFF_MS);
+        }
+
         if (lastUsage) {
           renderStatus(ctx, { stale: true });
         } else {
-          ctx.ui.setStatus("claude-usage", theme.fg("warning", "⚠ Usage API rate-limited"));
+          const remainMin = Math.ceil(backoffMs / 60_000);
+          ctx.ui.setStatus("claude-usage",
+            theme.fg("warning", `⚠ Usage API rate-limited (retry in ${remainMin}m)`));
         }
         return;
       }
@@ -312,7 +327,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Success → reset backoff, store data
     rateLimitedUntil = 0;
+    currentBackoffMs = INITIAL_BACKOFF_MS;
     lastUsage = usage;
     renderStatus(ctx);
   }
@@ -323,21 +340,18 @@ export default function (pi: ExtensionAPI) {
 
     const parts: string[] = [];
 
-    // 5-hour limit
     if (lastUsage.five_hour) {
       const pct = lastUsage.five_hour.utilization;
       const reset = formatResetTime(lastUsage.five_hour.resets_at);
       parts.push(theme.fg(getUsageColor(pct), `5h: ${pct}%`) + ' ' + theme.fg("dim", `(${reset})`));
     }
 
-    // 7-day limit
     if (lastUsage.seven_day) {
       const pct = lastUsage.seven_day.utilization;
       const reset = formatResetTimeNice(lastUsage.seven_day.resets_at);
       parts.push(theme.fg(getUsageColor(pct), `7d: ${pct}%`) + ' ' + theme.fg("dim", `(${reset})`));
     }
 
-    // Opus limit (if present)
     if (lastUsage.seven_day_opus && lastUsage.seven_day_opus.utilization > 0) {
       const pct = lastUsage.seven_day_opus.utilization;
       parts.push(theme.fg(getUsageColor(pct), `Opus: ${pct}%`));
@@ -353,28 +367,45 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("claude-usage", status);
   }
 
+  // --- Event handlers ---
+
   pi.on("session_start", async (_event, ctx) => {
     isAnthropicModel = checkIsAnthropicModel(ctx);
     hasAnthropicTurn = false;
-    await updateUsageStatus(ctx);
 
-    // Update every 5 minutes
+    // Don't fetch on session start — wait for first turn or interval
+    if (lastUsage && isAnthropicModel) {
+      renderStatus(ctx);
+    }
+
+    // Background poll every 15 minutes
     if (updateInterval) clearInterval(updateInterval);
-    updateInterval = setInterval(() => updateUsageStatus(ctx), 5 * 60 * 1000);
+    updateInterval = setInterval(() => updateUsageStatus(ctx), POLL_INTERVAL_MS);
   });
 
-  // Update when model changes
   pi.on("model_select", async (event, ctx) => {
     isAnthropicModel = event.model.provider === "anthropic";
-    await updateUsageStatus(ctx);
+    // Only re-render cached data, never fetch on model change
+    if (isAnthropicModel && lastUsage) {
+      renderStatus(ctx);
+    } else if (!isAnthropicModel && ctx.hasUI) {
+      ctx.ui.setStatus("claude-usage", undefined);
+    }
   });
 
-  // Update after each turn (only for Anthropic models)
   pi.on("turn_end", async (_event, ctx) => {
     if (!isAnthropicModel) return;
+
+    const wasFirstTurn = !hasAnthropicTurn;
     hasAnthropicTurn = true;
-    // Wait briefly so the API has the new values
-    setTimeout(() => updateUsageStatus(ctx), 2000);
+
+    if (wasFirstTurn) {
+      // First turn in session: fetch after a short delay (respects all guards)
+      setTimeout(() => updateUsageStatus(ctx), 5000);
+    } else {
+      // Subsequent turns: just re-render cached status
+      renderStatus(ctx);
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -384,11 +415,11 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Command for manual refresh and detailed display
+  // --- Manual refresh command ---
+
   pi.registerCommand("quota-claude", {
     description: "Show/refresh Claude usage",
     handler: async (_args, ctx) => {
-      // Reload token (in case login changed)
       accessToken = getAccessTokenFromPiAuth();
       await updateUsageStatus(ctx, { force: true });
 
@@ -400,7 +431,6 @@ export default function (pi: ExtensionAPI) {
       const theme = ctx.ui.theme;
       const lines: string[] = [];
 
-      // Current session (5h)
       if (lastUsage.five_hour) {
         const pct = lastUsage.five_hour.utilization;
         lines.push(theme.bold("  Current session"));
@@ -411,7 +441,6 @@ export default function (pi: ExtensionAPI) {
         lines.push("");
       }
 
-      // Current week (7d)
       if (lastUsage.seven_day) {
         const pct = lastUsage.seven_day.utilization;
         lines.push(theme.bold("  Current week (all models)"));
@@ -422,7 +451,6 @@ export default function (pi: ExtensionAPI) {
         lines.push("");
       }
 
-      // Opus (if present and > 0)
       if (lastUsage.seven_day_opus && lastUsage.seven_day_opus.utilization > 0) {
         const pct = lastUsage.seven_day_opus.utilization;
         lines.push(theme.bold("  Opus (7 days)"));
@@ -433,7 +461,6 @@ export default function (pi: ExtensionAPI) {
         lines.push("");
       }
 
-      // Sonnet (if present and > 0)
       if (lastUsage.seven_day_sonnet && lastUsage.seven_day_sonnet.utilization > 0) {
         const pct = lastUsage.seven_day_sonnet.utilization;
         lines.push(theme.bold("  Sonnet (7 days)"));
@@ -444,7 +471,6 @@ export default function (pi: ExtensionAPI) {
         lines.push("");
       }
 
-      // Remove last line (empty line)
       if (lines.length > 0 && lines[lines.length - 1] === "") {
         lines.pop();
       }
