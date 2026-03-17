@@ -49,39 +49,26 @@ git push
 
 ## Extensions
 
-### Custom Extensions
-
-| Extension | Description | Command |
-|-----------|-------------|---------|
-| `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/answer.ts). | `/answer` (+ `Ctrl+.`) |
-| `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` |
-| `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` |
-| `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` |
-| `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) |
-
-### From [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) (via npm dependency)
-
-| Extension | Description | Command |
-|-----------|-------------|---------|
-| `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with review loop and auto-fixing. | `/review`, `/end-review` |
-| `session-breakdown` | Interactive breakdown of session usage (sessions/messages/tokens/cost) with heatmap, model table, and breakdowns by CWD, day of week, and time of day. | `/session-breakdown` |
-| `todos` | File-based todo manager with claiming, locking, and garbage collection. Includes a visual `/todos` TUI and a `todo` tool for the LLM. | `/todos` |
+| Extension | Description | Command | Source |
+|-----------|-------------|---------|--------|
+| `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. | `/answer` (+ `Ctrl+.`) | custom, based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` | custom |
+| `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` | custom |
+| `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` | custom |
+| `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) | custom |
+| `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with review loop and auto-fixing. | `/review`, `/end-review` | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `session-breakdown` | Interactive breakdown of session usage (sessions/messages/tokens/cost) with heatmap, model table, and breakdowns by CWD, day of week, and time of day. | `/session-breakdown` | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `todos` | File-based todo manager with claiming, locking, and garbage collection. Includes a visual `/todos` TUI and a `todo` tool for the LLM. | `/todos` | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `ghostty` | Ghostty terminal integration — dynamic title bar, progress indicators, and error states. | — | [pi-ghostty](https://github.com/HazAT/pi-ghostty) |
 
 ## Skills
 
-### Custom Skills
-
 | Skill | Description | Source |
 |-------|-------------|--------|
+| `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `grill-me` | Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/grill-me) |
-| `prd-to-todos` | Break a PRD into independently-grabbable todos using tracer-bullet vertical slices. Adapted from `prd-to-issues`: uses local todos instead of GitHub Issues, removed HITL/AFK distinction (solo workflow). | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
-| `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | [anthropics/skills](https://github.com/anthropics/skills/) |
-| `summarize` | Extract and summarize content from web pages, YouTube videos, and local files. No API keys required - uses direct content extraction. Based on [steipete/summarize](https://github.com/steipete/summarize). | custom |
-| `write-a-prd` | Create a PRD through user interview, codebase exploration, and module design. Adapted from original: saves PRD as a local todo (tagged `prd`) instead of a GitHub Issue. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/write-a-prd) |
-
-### From [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) (via npm dependency)
-
-| Skill | Description |
-|-------|-------------|
-| `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. |
-| `pi-share` | Load and parse session transcripts from pi-share URLs (shittycodingagent.ai, buildwithpi.ai, buildwithpi.com, pi.dev). Fetches gists, decodes embedded session data, and extracts conversation history. |
+| `pi-share` | Load and parse session transcripts from pi-share URLs (shittycodingagent.ai, buildwithpi.ai, buildwithpi.com, pi.dev). Fetches gists, decodes embedded session data, and extracts conversation history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `prd-to-todos` | Break a PRD into independently-grabbable todos using tracer-bullet vertical slices. Adapted from `prd-to-issues`: uses local todos instead of GitHub Issues, removed HITL/AFK distinction (solo workflow). | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
+| `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | custom, based on [anthropics/skills](https://github.com/anthropics/skills/) |
+| `summarize` | Extract and summarize content from web pages, YouTube videos, and local files. No API keys required - uses direct content extraction. | custom, based on [steipete/summarize](https://github.com/steipete/summarize) |
+| `write-a-prd` | Create a PRD through user interview, codebase exploration, and module design. Adapted from original: saves PRD as a local todo (tagged `prd`) instead of a GitHub Issue. | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/write-a-prd) |
