@@ -11,7 +11,7 @@ Break a PRD into independently-grabbable todos using vertical slices (tracer bul
 
 ### 1. Locate the PRD
 
-Ask the user which PRD to break down. If the PRD is a todo, fetch it with the todo tool.
+Ask the user which PRD to break down. If the PRD is a todo, fetch it with the todo tool. Extract the PRD number from the title (e.g., `PRD #3: ...` → number is `3`).
 
 ### 2. Explore the codebase (optional)
 
@@ -45,12 +45,27 @@ Iterate until the user approves.
 
 For each approved slice, create a todo using the todo tool. Create them in dependency order (blockers first) so real todo IDs can be referenced.
 
+#### Todo title format
+
+Use the PRD number from step 1. Prefix every title with `PRD #N - Task M/T:` where N is the PRD number, M is the sequence position, and T is the total task count.
+
+Example for `PRD #2: User Authentication`:
+
+- `PRD #2 - Task 1/4: Database Schema & Models`
+- `PRD #2 - Task 2/4: Auth API Endpoints`
+- `PRD #2 - Task 3/4: Login UI & Session Handling`
+- `PRD #2 - Task 4/4: E2E Tests & Error Handling`
+
+Tasks at the same dependency level share the same sequence number (e.g., two independent tasks could both be `Task 1/4`).
+
+#### Todo body structure
+
 Use this structure for the todo body:
 
-```
+```markdown
 ## Parent PRD
 
-TODO-<prd-todo-id>
+TODO-<prd-todo-id> (PRD #N: <prd-title>)
 
 ## What to build
 
@@ -64,7 +79,11 @@ Concise description of this vertical slice. Describe end-to-end behavior, not la
 
 ## Blocked by
 
-- TODO-<id> (if any), or "None - can start immediately"
+- TODO-<id> (PRD #N - Task M/T: <title>), or "None — can start immediately"
+
+## Next task
+
+- TODO-<id> (PRD #N - Task M+1/T: <title>), or "None — this is the last task"
 
 ## User stories addressed
 
@@ -74,4 +93,41 @@ Reference by number from the parent PRD:
 - User story 7
 ```
 
-Tag each todo with `task` and any relevant tags from the PRD.
+#### Tagging
+
+Tag each todo with `task` and `prd-N` (same tag as the parent PRD, e.g., `prd-2`). This enables filtering all todos belonging to one PRD.
+
+### 6. Update the PRD todo with task index
+
+After all tasks are created, **update the parent PRD todo body** using the todo `update` action. Prepend a task index block **before** the existing PRD content.
+
+The Task Index encodes **dependencies and status** so that any agent reading the PRD immediately knows which tasks are actionable:
+
+```markdown
+## ⚠️ Working on this PRD
+
+Do NOT implement this PRD directly. It has been broken into sequential tasks.
+Work through the tasks below in order. Use skill:work-on-prd or pick individual tasks.
+
+## Task Index
+
+| # | Task | Todo | Blocked by | Status |
+|---|------|------|------------|--------|
+| 1/4 | Database Schema & Models | TODO-<id> | — | 🔄 open |
+| 2/4 | Auth API Endpoints | TODO-<id> | TODO-<task1-id> | ⏳ blocked |
+| 3/4 | Login UI & Session Handling | TODO-<id> | TODO-<task2-id> | ⏳ blocked |
+| 4/4 | E2E Tests & Error Handling | TODO-<id> | TODO-<task3-id> | ⏳ blocked |
+
+Start with: **TODO-<first-task-id>** (PRD #N - Task 1/T: <title>)
+
+---
+
+<original PRD content follows>
+```
+
+Status values:
+- `🔄 open` — actionable, no unresolved blockers
+- `⏳ blocked` — waiting for blocker tasks to complete
+- `✅ closed` — completed (set by `work-on-prd` after task completion)
+
+This ensures that when someone selects the PRD via `/todo` and says "work", the agent sees the task index with dependencies and can determine exactly which task to work on next — even if earlier tasks were already completed in a previous session.
