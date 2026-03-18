@@ -17,7 +17,7 @@ Feel free to explore, use, and modify these resources to build your own perfect 
 
 | Document | Description |
 |----------|-------------|
-| [PRD Workflow](docs/prd-workflow.md) | End-to-end guide for the `grill-me` → `write-a-prd` → `prd-to-todos` → `work-on-prd` workflow |
+| [PRD Workflow](docs/prd-workflow.md) | End-to-end guide for the `grill-me` → `write-a-prd` → `prd-to-todos` → `/prd-loop` workflow |
 
 ## 🚀 Installation
 
@@ -59,6 +59,7 @@ git push
 |-----------|-------------|---------|--------|
 | `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. | `/answer` (+ `Ctrl+.`) | custom, based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` | custom |
+| `prd-loop` | Autonomous PRD task orchestrator. Spawns isolated subagents per task, auto-commits, retries on failure, shows live progress widget. Supports `--smart-commits` for granular conventional commits. Part of the [PRD Workflow](docs/prd-workflow.md). | `/prd-loop` (alias: `/ralph`) | custom |
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` | custom |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` | custom |
 | `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) | custom |
@@ -78,5 +79,4 @@ git push
 | `prd-to-todos` | Break a PRD into sequenced, dependency-aware tasks with `PRD #N - Task M/T:` titles. Updates the PRD with a Task Index for status tracking. Part of the [PRD Workflow](docs/prd-workflow.md). | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
 | `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | custom, based on [anthropics/skills](https://github.com/anthropics/skills/) |
 | `summarize` | Extract and summarize content from web pages, YouTube videos, and local files. No API keys required - uses direct content extraction. | custom, based on [steipete/summarize](https://github.com/steipete/summarize) |
-| `work-on-prd` | Execute all tasks of a PRD sequentially, respecting dependencies. Syncs the PRD Task Index, resolves blockers, and tracks progress. Part of the [PRD Workflow](docs/prd-workflow.md). | custom |
 | `write-a-prd` | Create a numbered PRD (`PRD #N`) through user interview, codebase exploration, and module design. Saves as a tagged todo and offers handoff to `prd-to-todos`. Part of the [PRD Workflow](docs/prd-workflow.md). | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/write-a-prd) |
