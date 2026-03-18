@@ -9,11 +9,18 @@ Create a PRD. Skip steps if not necessary.
 
 2. Explore the repo to verify assertions and understand the current state.
 
-3. Interview the user relentlessly about every aspect of this plan until reaching a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one.
+3. Interview the user relentlessly about every aspect of this plan until reaching a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. **Skip this step if the user has already been interviewed (e.g., via grill-me) and provides the interview context.**
 
 4. Sketch out major modules to build or modify. Look for opportunities to extract deep modules — modules that encapsulate a lot of functionality behind a simple, testable interface that rarely changes. Check with the user that these modules match expectations and which need tests.
 
-5. Write the PRD using the template below and save it as a todo (title: the PRD title, tag: `prd`, body: the full PRD content).
+5. Determine the next PRD number: List all existing todos with tag `prd`. Find the highest `PRD #N` number from their titles. Use N+1 for the new PRD. If no PRDs exist, start with `PRD #1`.
+
+6. Write the PRD using the template below and save it as a todo:
+   - **Title**: `PRD #N: <descriptive title>`
+   - **Tags**: `prd`, `prd-N` (e.g., `prd-1`, `prd-2`)
+   - **Body**: the full PRD content
+
+7. After saving the PRD todo, ask the user if they want to break it into tasks now (skill:prd-to-todos).
 
 <prd-template>
 
