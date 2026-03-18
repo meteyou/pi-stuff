@@ -35,7 +35,7 @@ interface ExtractionResult {
 	questions: ExtractedQuestion[];
 }
 
-const SYSTEM_PROMPT = `You are a question extractor. Given text from a conversation, extract any questions that need answering.
+const SYSTEM_PROMPT = `You are a question extractor. Given text from a conversation, extract only the questions the assistant expects the user to answer next.
 
 Output a JSON object with this structure:
 {
@@ -48,10 +48,11 @@ Output a JSON object with this structure:
 }
 
 Rules:
-- Extract all questions that require user input
-- Keep questions in the order they appeared
-- Be concise with question text
-- Include context only when it provides essential information for answering
+- If the text ends with a final summary or numbered list of questions (e.g. "please answer these 4 points", "bitte beantworte diese Punkte"), extract ONLY those final questions. Ignore all earlier questions in the text — they are superseded.
+- Otherwise, extract only the actionable questions the assistant expects the user to answer next.
+- Ignore rhetorical questions, examples, and brainstorming.
+- Be concise with question text.
+- Include context only when it provides essential information for answering.
 - If no questions are found, return {"questions": []}
 
 Example output:
@@ -59,7 +60,7 @@ Example output:
   "questions": [
     {
       "question": "What is your preferred database?",
-      "context": "We can only configure MySQL and PostgreSQL because of what is implemented."
+      "context": "MySQL or PostgreSQL only."
     },
     {
       "question": "Should we use TypeScript or JavaScript?"
