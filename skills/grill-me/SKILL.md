@@ -6,3 +6,5 @@ description: Interview the user relentlessly about a plan or design until reachi
 Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one.
 
 If a question can be answered by exploring the codebase, explore the codebase instead.
+
+When the interview is complete, summarize all key decisions in a structured format (problem, solution, constraints, open questions resolved). Then ask if the user wants to create a PRD from the results (skill:write-a-prd).
