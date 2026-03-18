@@ -1,7 +1,7 @@
 # PRD Workflow: From Idea to Implementation
 
-A structured workflow for turning a vague idea into a fully planned and sequentially executable set of tasks — using
-four skills that chain together seamlessly.
+A structured workflow for turning a vague idea into a fully planned and autonomously executable set of tasks — using
+skills and an extension that chain together seamlessly.
 
 **Based on:** [5 Agent Skills I Use Every Day](https://www.aihero.dev/5-agent-skills-i-use-every-day) by Matt Pocock.
 Adapted for local todo management using the
@@ -10,15 +10,15 @@ Adapted for local todo management using the
 ## Overview
 
 ```
-grill-me → write-a-prd → prd-to-todos → work-on-prd
+grill-me → write-a-prd → prd-to-todos → /prd-loop
 ```
 
-| Step | Skill | What it does |
-|------|-------|-------------|
-| 1 | `grill-me` | Stress-test your idea through relentless interview |
-| 2 | `write-a-prd` | Turn decisions into a structured PRD (saved as a numbered todo) |
-| 3 | `prd-to-todos` | Break PRD into sequenced, dependency-aware tasks |
-| 4 | `work-on-prd` | Execute tasks in order, tracking progress in the PRD |
+| Step | Trigger | What it does |
+|------|---------|-------------|
+| 1 | `skill:grill-me` | Stress-test your idea through relentless interview |
+| 2 | `skill:write-a-prd` | Turn decisions into a structured PRD (saved as a numbered todo) |
+| 3 | `skill:prd-to-todos` | Break PRD into sequenced, dependency-aware tasks |
+| 4 | `/prd-loop` (or `/ralph`) | Execute tasks autonomously with isolated subagents |
 
 ## Step-by-Step
 
@@ -83,18 +83,72 @@ After creating all tasks, the skill **updates the PRD todo** with a Task Index:
 | 4/4 | Monitoring & E2E Tests     | TODO-jkl012  | TODO-ghi789  | ⏳ blocked  |
 ```
 
-### 4. Work on PRD — Execute tasks sequentially
+### 4. PRD Loop — Execute tasks autonomously
 
-When you're ready to implement, use `skill:work-on-prd` or say "work on PRD #1".
+When you're ready to implement, run `/prd-loop` (or its alias `/ralph`):
 
-The skill:
+```
+/prd-loop prd-1
+```
 
-1. **Fetches all tasks** for the PRD (by `prd-N` tag)
-2. **Syncs the Task Index** — checks actual todo status, updates the PRD
-3. **Finds the next actionable task** — first open task whose blockers are all closed
-4. **Works on it** — claims the task, implements it, verifies acceptance criteria
-5. **Updates the PRD** — marks the task as ✅, unblocks the next task
-6. **Asks to continue** — or stops if all tasks are done
+The extension:
+
+1. **Checks git status** — aborts if the working directory is dirty
+2. **Selects the PRD** — via argument or interactive dialog
+3. **Configures the run** — retry count, smart commits, model selection (via dialogs or flags)
+4. **Shows a confirmation dialog** — PRD name, task count, configuration summary
+5. **Runs the orchestrator loop:**
+   - Resolves task dependencies (topological sort)
+   - Spawns a **fresh subagent process** per task (isolated context window)
+   - Each subagent implements the task, validates acceptance criteria, runs tests/build/lint
+   - Returns structured JSON result (`{success, errors, summary}`)
+   - On success: auto-commits, updates task todo to closed, updates PRD Task Index
+   - On failure: retries with error context (if retries configured), or stops the loop
+6. **Shows a live progress widget** — per-task status, elapsed time, cost, retries
+7. **Shows a final summary** — per-task stats, totals
+
+#### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/prd-loop [prd-N]` | Execute all open tasks of a PRD autonomously |
+| `/ralph [prd-N]` | Alias for `/prd-loop` |
+
+#### Flags
+
+Skip interactive dialogs with command-line flags:
+
+```
+/prd-loop prd-1 --retry-fixes=3 --smart-commits --model=anthropic/claude-sonnet-4-5
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--retry-fixes=N` | Number of retry attempts per failed task | `0` (no retries) |
+| `--smart-commits` | Use a committer subagent for granular conventional commits | off (single auto-commit) |
+| `--model=<id>` | Model for subagents (`provider/model-id` or just `model-id`) | active model |
+
+#### How it works under the hood
+
+Each task runs in a **fresh, isolated context window** via a spawned `pi` subprocess. This keeps the LLM in the
+"smart zone" (first ~40% of context window) and prevents degradation over time — the core idea behind the
+[Ralph methodology](https://www.aihero.dev/getting-started-with-ralph).
+
+The orchestrator manages:
+- **Task dependencies** — topological sort based on "Blocked by" references
+- **Todo status** — closes tasks and updates the PRD Task Index automatically
+- **Git commits** — simple auto-commit per task, or granular conventional commits via `--smart-commits`
+- **Retries** — failed tasks get retried with error context from the previous attempt
+- **Abort handling** — Ctrl+C kills the current subagent, stops the loop, leaves code on disk
+
+#### Subagents
+
+The extension uses two specialized agent definitions:
+
+| Agent | File | Purpose |
+|-------|------|---------|
+| `prd-worker` | `agents/prd-worker.md` | Implements a task, validates acceptance criteria, returns JSON result |
+| `prd-committer` | `agents/prd-committer.md` | Analyzes `git diff`, creates granular conventional commits (smart-commits mode) |
 
 ## Alternative Entry Points
 
@@ -102,13 +156,21 @@ You don't have to follow the full chain every time:
 
 ### Start from `/todos`
 
-Open `/todos`, select a **PRD** todo, and say "work". The agent reads the Task Index in the PRD body and works through
-the tasks — skipping already completed ones.
+Open `/todos`, select a **PRD** todo, and say "work". The agent reads the Task Index in the PRD body and can work
+through individual tasks — though for full autonomous execution, use `/prd-loop`.
 
 ### Start from a single task
 
 Open `/todos`, select a specific **task** (e.g., `PRD #1 - Task 3/4: ...`), and say "work". The agent checks its
 blockers, and either starts working or tells you which tasks need to be done first.
+
+### Skip dialogs for CI/automation
+
+Use flags to run non-interactively:
+
+```
+/prd-loop prd-1 --retry-fixes=2 --smart-commits --model=anthropic/claude-sonnet-4-5
+```
 
 ### Create multiple PRDs first, implement later
 
@@ -126,7 +188,7 @@ PRD #2 - Task 2/3: Auth API Endpoints                  [task, prd-2]
 PRD #2 - Task 3/3: Login UI & Session Handling         [task, prd-2]
 ```
 
-Then come back later and say `skill:work-on-prd` to pick which PRD to implement.
+Then come back later and run `/prd-loop` to pick which PRD to implement.
 
 ## How Status Tracking Works
 
@@ -134,12 +196,13 @@ Status is synchronized in **two places** for resilience:
 
 | Source of Truth | What | Updated by |
 |----------------|------|-----------|
-| **Individual task todos** (status field) | Whether a task is open/closed | `work-on-prd` after each task |
-| **PRD Task Index** (in PRD body) | Dashboard view with dependencies + status | `work-on-prd` at start + after each task |
+| **Individual task todos** (status field) | Whether a task is open/closed | `/prd-loop` after each task |
+| **PRD Task Index** (in PRD body) | Dashboard view with dependencies + status | `/prd-loop` at start + after each task |
 
-The Task Index is a **cache** that gets re-synced from the actual task statuses every time `work-on-prd` starts. This
-means it works correctly even if:
+The Task Index gets updated from the actual task statuses after each completed task. This means it works correctly even
+if:
 
-- A session crashes mid-task
+- A previous run was aborted mid-task
 - Someone closes a task manually
 - Tasks are worked on across multiple sessions
+- You resume after an interruption (closed tasks are skipped automatically)
