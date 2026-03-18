@@ -65,6 +65,7 @@ git push
 
 | Skill | Description | Source |
 |-------|-------------|--------|
+| `frontend-design` | Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when building web components, pages, dashboards, apps, or when beautifying any web UI. | [anthropics/skills](https://github.com/anthropics/skills/blob/main/skills/frontend-design/LICENSE.txt) |
 | `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `grill-me` | Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/grill-me) |
 | `pi-share` | Load and parse session transcripts from pi-share URLs (shittycodingagent.ai, buildwithpi.ai, buildwithpi.com, pi.dev). Fetches gists, decodes embedded session data, and extracts conversation history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
