@@ -73,13 +73,13 @@ Example output:
  */
 const EXTRACTION_MODELS: Record<string, string> = {
 	"anthropic": "claude-haiku-4-5",
-	"openai": "gpt-5.1-codex-mini",
-	"openai-codex": "gpt-5.1-codex-mini",
+	"openai": "gpt-5.4-mini",
+	"openai-codex": "gpt-5.4-mini",
 	"google": "gemini-3-flash-preview",
 	"google-gemini-cli": "gemini-3-flash-preview",
 	"google-antigravity": "gemini-3-flash",
 	"google-vertex": "gemini-3-flash-preview",
-	"github-copilot": "gpt-5-mini",
+	"github-copilot": "gpt-5.4-mini",
 };
 
 /**
