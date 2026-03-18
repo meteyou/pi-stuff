@@ -13,6 +13,12 @@ Here you will find:
 
 Feel free to explore, use, and modify these resources to build your own perfect coding assistant environment.
 
+## 📖 Documentation
+
+| Document | Description |
+|----------|-------------|
+| [PRD Workflow](docs/prd-workflow.md) | End-to-end guide for the `grill-me` → `write-a-prd` → `prd-to-todos` → `work-on-prd` workflow |
+
 ## 🚀 Installation
 
 Install the package directly using the `pi` CLI:
@@ -67,9 +73,10 @@ git push
 |-------|-------------|--------|
 | `frontend-design` | Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when building web components, pages, dashboards, apps, or when beautifying any web UI. | [anthropics/skills](https://github.com/anthropics/skills/blob/main/skills/frontend-design/LICENSE.txt) |
 | `github` | Interact with GitHub using the `gh` CLI. Use `gh issue`, `gh pr`, `gh run`, and `gh api` for issues, PRs, CI runs, and advanced queries. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
-| `grill-me` | Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree. | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/grill-me) |
+| `grill-me` | Interview the user relentlessly about a plan or design until reaching shared understanding. Summarizes decisions and offers handoff to `write-a-prd`. Part of the [PRD Workflow](docs/prd-workflow.md). | [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/grill-me) |
 | `pi-share` | Load and parse session transcripts from pi-share URLs (shittycodingagent.ai, buildwithpi.ai, buildwithpi.com, pi.dev). Fetches gists, decodes embedded session data, and extracts conversation history. | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
-| `prd-to-todos` | Break a PRD into independently-grabbable todos using tracer-bullet vertical slices. Adapted from `prd-to-issues`: uses local todos instead of GitHub Issues, removed HITL/AFK distinction (solo workflow). | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
+| `prd-to-todos` | Break a PRD into sequenced, dependency-aware tasks with `PRD #N - Task M/T:` titles. Updates the PRD with a Task Index for status tracking. Part of the [PRD Workflow](docs/prd-workflow.md). | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/prd-to-issues) |
 | `skill-creator` | Guide for creating effective skills. Use to create new skills or update existing ones with specialized knowledge, workflows, or tool integrations. | custom, based on [anthropics/skills](https://github.com/anthropics/skills/) |
 | `summarize` | Extract and summarize content from web pages, YouTube videos, and local files. No API keys required - uses direct content extraction. | custom, based on [steipete/summarize](https://github.com/steipete/summarize) |
-| `write-a-prd` | Create a PRD through user interview, codebase exploration, and module design. Adapted from original: saves PRD as a local todo (tagged `prd`) instead of a GitHub Issue. | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/write-a-prd) |
+| `work-on-prd` | Execute all tasks of a PRD sequentially, respecting dependencies. Syncs the PRD Task Index, resolves blockers, and tracks progress. Part of the [PRD Workflow](docs/prd-workflow.md). | custom |
+| `write-a-prd` | Create a numbered PRD (`PRD #N`) through user interview, codebase exploration, and module design. Saves as a tagged todo and offers handoff to `prd-to-todos`. Part of the [PRD Workflow](docs/prd-workflow.md). | custom, based on [mattpocock/skills](https://github.com/mattpocock/skills/tree/main/write-a-prd) |
