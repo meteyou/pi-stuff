@@ -140,6 +140,7 @@ export interface LoopConfig {
 	retryFixes: number;
 	smartCommits: boolean;
 	model: string; // "provider/model-id" format
+	thinkingLevel?: string; // "minimal" | "low" | "medium" | "high" | "xhigh" | undefined
 }
 
 /** Parsed flags from the command args string. */
@@ -148,6 +149,7 @@ interface ParsedFlags {
 	retryFixes: number | null;
 	smartCommits: boolean | null;
 	model: string | null;
+	thinkingLevel: string | null;
 	error: string | null;
 }
 
@@ -162,6 +164,7 @@ export function parseCommandArgs(args: string): ParsedFlags {
 		retryFixes: null,
 		smartCommits: null,
 		model: null,
+		thinkingLevel: null,
 		error: null,
 	};
 
@@ -189,6 +192,14 @@ export function parseCommandArgs(args: string): ParsedFlags {
 				return result;
 			}
 			result.model = value;
+		} else if (token.startsWith("--thinking=")) {
+			const value = token.slice("--thinking=".length);
+			const validLevels = ["minimal", "low", "medium", "high", "xhigh"];
+			if (!validLevels.includes(value)) {
+				result.error = `Invalid --thinking value: "${value}" (must be one of: ${validLevels.join(", ")})`;
+				return result;
+			}
+			result.thinkingLevel = value;
 		} else if (token.startsWith("--")) {
 			result.error = `Unknown flag: "${token}"`;
 			return result;
@@ -376,11 +387,12 @@ const SIGKILL_TIMEOUT_MS = 5000;
 export async function spawnSubagent(options: {
 	taskPrompt: string;
 	model?: string;
+	thinkingLevel?: string;
 	cwd: string;
 	agent: AgentDefinition;
 	signal?: AbortSignal;
 }): Promise<SubagentResult> {
-	const { taskPrompt, model, cwd, agent, signal } = options;
+	const { taskPrompt, model, thinkingLevel, cwd, agent, signal } = options;
 
 	// Write agent system prompt to temp file
 	const tmpDir = mkdtempSync(join(tmpdir(), "prd-loop-"));
@@ -393,6 +405,9 @@ export async function spawnSubagent(options: {
 	// Model: prefer explicit option, fall back to agent definition
 	const effectiveModel = model ?? agent.model;
 	if (effectiveModel) args.push("--model", effectiveModel);
+
+	// Thinking level
+	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 
 	// Tools from agent definition
 	if (agent.tools && agent.tools.length > 0) {
@@ -1095,6 +1110,7 @@ async function spawnCommitterSubagent(
 	cwd: string,
 	prdTag: string,
 	model: string,
+	thinkingLevel?: string,
 	signal?: AbortSignal,
 ): Promise<{ success: boolean; commitCount: number; cost: number }> {
 	try {
@@ -1109,6 +1125,7 @@ async function spawnCommitterSubagent(
 		const result = await spawnSubagent({
 			taskPrompt: prompt,
 			model,
+			thinkingLevel,
 			cwd,
 			agent,
 			signal,
@@ -1279,6 +1296,7 @@ async function runOrchestratorLoop(
 				result = await spawnSubagent({
 					taskPrompt: currentPrompt,
 					model: config.model,
+					thinkingLevel: config.thinkingLevel,
 					cwd: ctx.cwd,
 					agent,
 					signal: abortController.signal,
@@ -1352,6 +1370,7 @@ async function runOrchestratorLoop(
 					ctx.cwd,
 					prdTag,
 					config.model,
+					config.thinkingLevel,
 					abortController.signal,
 				);
 
@@ -1508,10 +1527,12 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		smartCommits = await ctx.ui.confirm("Smart commits", "Use a subagent for granular conventional commits?");
 	}
 
-	// 3c. Model selection
+	// 3c. Model selection (filtered to current provider)
 	let selectedModelId: string;
+	let selectedModelObj: { provider: string; id: string; name: string; reasoning: boolean } | undefined;
 	const currentModel = ctx.model;
 	const currentModelId = currentModel ? modelDisplayId(currentModel) : undefined;
+	const currentProvider = currentModel?.provider;
 
 	if (flags.model !== null) {
 		// Validate that the specified model exists
@@ -1522,24 +1543,56 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 			return;
 		}
 		selectedModelId = modelDisplayId(match);
+		selectedModelObj = match;
 	} else {
-		const availableModels = ctx.modelRegistry.getAvailable();
-		if (availableModels.length === 0) {
+		const allAvailableModels = ctx.modelRegistry.getAvailable();
+		if (allAvailableModels.length === 0) {
 			ctx.ui.notify("No models available. Please configure an API key.", "error");
 			return;
 		}
 
-		const modelOptions = availableModels.map((m) => {
+		// Filter to models from the current provider only
+		const providerModels = currentProvider
+			? allAvailableModels.filter((m) => m.provider === currentProvider)
+			: allAvailableModels;
+
+		if (providerModels.length === 0) {
+			ctx.ui.notify(`No models available for provider "${currentProvider}".`, "error");
+			return;
+		}
+
+		const modelOptions = providerModels.map((m) => {
 			const id = modelDisplayId(m);
 			return currentModelId === id ? `${m.name} (${id}) ★` : `${m.name} (${id})`;
 		});
 
-		const modelChoice = await ctx.ui.select("Model", modelOptions);
+		const modelChoice = await ctx.ui.select(`Model (${currentProvider})`, modelOptions);
 		if (modelChoice === undefined) return; // User cancelled
 
 		const modelIndex = modelOptions.indexOf(modelChoice);
 		if (modelIndex === -1) return;
-		selectedModelId = modelDisplayId(availableModels[modelIndex]);
+		selectedModelId = modelDisplayId(providerModels[modelIndex]);
+		selectedModelObj = providerModels[modelIndex];
+	}
+
+	// 3d. Thinking level selection (only for reasoning models)
+	let thinkingLevel: string | undefined;
+	if (flags.thinkingLevel !== null) {
+		thinkingLevel = flags.thinkingLevel;
+	} else if (selectedModelObj?.reasoning) {
+		const thinkingLevels = ["minimal", "low", "medium", "high", "xhigh"];
+		const currentThinking = pi.getThinkingLevel();
+
+		const thinkingOptions = thinkingLevels.map((level) =>
+			level === currentThinking ? `${level} ★` : level,
+		);
+
+		const thinkingChoice = await ctx.ui.select("Thinking level", thinkingOptions);
+		if (thinkingChoice === undefined) return; // User cancelled
+
+		const thinkingIndex = thinkingOptions.indexOf(thinkingChoice);
+		if (thinkingIndex === -1) return;
+		thinkingLevel = thinkingLevels[thinkingIndex];
 	}
 
 	// Build the config object
@@ -1547,6 +1600,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		retryFixes,
 		smartCommits,
 		model: selectedModelId,
+		thinkingLevel,
 	};
 
 	// Step 4: Confirmation dialog
@@ -1558,6 +1612,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		`   Retry Fixes:   ${config.retryFixes}`,
 		`   Smart Commits: ${config.smartCommits ? "Yes" : "No"}`,
 		`   Model:         ${config.model}`,
+		`   Thinking:      ${config.thinkingLevel ?? "off"}`,
 		``,
 		`Start loop?`,
 	].join("\n");
