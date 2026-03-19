@@ -142,6 +142,69 @@ function parseExtractionResult(text: string): ExtractionResult | null {
 }
 
 /**
+ * Try to parse structured question format directly from text (no LLM needed).
+ *
+ * Recognizes blocks separated by horizontal rules (---):
+ *
+ *   Optional intro text
+ *
+ *   ---
+ *
+ *   Headline of question
+ *
+ *   Description / context text
+ *
+ *   ---
+ *
+ * Returns null if the format is not detected (fewer than 2 horizontal rules).
+ */
+function parseStructuredQuestions(text: string): ExtractedQuestion[] | null {
+	// Require at least 2 horizontal rules to detect the format
+	const hrPattern = /^-{3,}\s*$/gm;
+	const hrMatches = text.match(hrPattern);
+	if (!hrMatches || hrMatches.length < 2) return null;
+
+	// Split by horizontal rules
+	const blocks = text.split(/^-{3,}\s*$/m);
+	const questions: ExtractedQuestion[] = [];
+
+	// Skip blocks[0] – everything before the first --- is intro text
+	for (let b = 1; b < blocks.length; b++) {
+		const trimmed = blocks[b].trim();
+		if (!trimmed) continue;
+
+		const lines = trimmed.split("\n");
+
+		// First non-empty line = headline
+		let headlineIdx = -1;
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].trim()) {
+				headlineIdx = i;
+				break;
+			}
+		}
+		if (headlineIdx === -1) continue;
+
+		const headline = lines[headlineIdx].trim();
+
+		// Everything after headline (skipping blank lines right after it) = context
+		let contextStart = headlineIdx + 1;
+		while (contextStart < lines.length && !lines[contextStart].trim()) {
+			contextStart++;
+		}
+
+		const context = lines.slice(contextStart).join("\n").trim();
+
+		questions.push({
+			question: headline,
+			context: context || undefined,
+		});
+	}
+
+	return questions.length > 0 ? questions : null;
+}
+
+/**
  * Interactive Q&A component for answering extracted questions
  */
 class QnAComponent implements Component {
@@ -221,9 +284,6 @@ class QnAComponent implements Component {
 			const q = this.questions[i];
 			const a = this.answers[i]?.trim() || "(no answer)";
 			parts.push(`Q: ${q.question}`);
-			if (q.context) {
-				parts.push(`> ${q.context}`);
-			}
 			parts.push(`A: ${a}`);
 			parts.push("");
 		}
@@ -376,13 +436,20 @@ class QnAComponent implements Component {
 			lines.push(padToWidth(boxLine(line)));
 		}
 
-		// Context if present
+		// Context if present (supports multi-line, dimmed text)
 		if (q.context) {
 			lines.push(padToWidth(emptyBoxLine()));
-			const contextText = this.gray(`> ${q.context}`);
-			const wrappedContext = wrapTextWithAnsi(contextText, contentWidth - 2);
-			for (const line of wrappedContext) {
-				lines.push(padToWidth(boxLine(line)));
+			const contextDisplayLines = q.context.split("\n");
+			for (const ctxLine of contextDisplayLines) {
+				const displayLine = ctxLine.trim() === "" ? "" : this.dim(ctxLine);
+				if (displayLine === "") {
+					lines.push(padToWidth(emptyBoxLine()));
+				} else {
+					const wrappedCtx = wrapTextWithAnsi(displayLine, contentWidth);
+					for (const wl of wrappedCtx) {
+						lines.push(padToWidth(boxLine(wl)));
+					}
+				}
 			}
 		}
 
@@ -464,60 +531,66 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Select the best model for extraction (prefer Codex mini, then haiku)
-			const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
+			// Try structured format parsing first (instant, no LLM needed)
+			let extractedQuestions = parseStructuredQuestions(lastAssistantText);
 
-			// Run extraction with loader UI
-			const extractionResult = await ctx.ui.custom<ExtractionResult | null>((tui, theme, _kb, done) => {
-				const loader = new BorderedLoader(tui, theme, `Extracting questions using ${extractionModel.id}...`);
-				loader.onAbort = () => done(null);
+			// Fall back to LLM extraction if structured parsing didn't match
+			if (!extractedQuestions) {
+				const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
 
-				const doExtract = async () => {
-					const apiKey = await ctx.modelRegistry.getApiKey(extractionModel);
-					const userMessage: UserMessage = {
-						role: "user",
-						content: [{ type: "text", text: lastAssistantText! }],
-						timestamp: Date.now(),
+				const extractionResult = await ctx.ui.custom<ExtractionResult | null>((tui, theme, _kb, done) => {
+					const loader = new BorderedLoader(tui, theme, `Extracting questions using ${extractionModel.id}...`);
+					loader.onAbort = () => done(null);
+
+					const doExtract = async () => {
+						const apiKey = await ctx.modelRegistry.getApiKey(extractionModel);
+						const userMessage: UserMessage = {
+							role: "user",
+							content: [{ type: "text", text: lastAssistantText! }],
+							timestamp: Date.now(),
+						};
+
+						const response = await complete(
+							extractionModel,
+							{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
+							{ apiKey, signal: loader.signal },
+						);
+
+						if (response.stopReason === "aborted") {
+							return null;
+						}
+
+						const responseText = response.content
+							.filter((c): c is { type: "text"; text: string } => c.type === "text")
+							.map((c) => c.text)
+							.join("\n");
+
+						return parseExtractionResult(responseText);
 					};
 
-					const response = await complete(
-						extractionModel,
-						{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-						{ apiKey, signal: loader.signal },
-					);
+					doExtract()
+						.then(done)
+						.catch(() => done(null));
 
-					if (response.stopReason === "aborted") {
-						return null;
-					}
+					return loader;
+				});
 
-					const responseText = response.content
-						.filter((c): c is { type: "text"; text: string } => c.type === "text")
-						.map((c) => c.text)
-						.join("\n");
+				if (extractionResult === null) {
+					ctx.ui.notify("Cancelled", "info");
+					return;
+				}
 
-					return parseExtractionResult(responseText);
-				};
-
-				doExtract()
-					.then(done)
-					.catch(() => done(null));
-
-				return loader;
-			});
-
-			if (extractionResult === null) {
-				ctx.ui.notify("Cancelled", "info");
-				return;
+				extractedQuestions = extractionResult.questions;
 			}
 
-			if (extractionResult.questions.length === 0) {
+			if (extractedQuestions.length === 0) {
 				ctx.ui.notify("No questions found in the last message", "info");
 				return;
 			}
 
 			// Show the Q&A component
 			const answersResult = await ctx.ui.custom<string | null>((tui, _theme, _kb, done) => {
-				return new QnAComponent(extractionResult.questions, tui, done);
+				return new QnAComponent(extractedQuestions!, tui, done);
 			});
 
 			if (answersResult === null) {
