@@ -19,8 +19,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
 import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { matchesKey, Key, truncateToWidth, visibleWidth, type TUI } from "@mariozechner/pi-tui";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -245,6 +246,73 @@ export interface SubagentResult {
 	errors: string[];
 	summary: string;
 	usage: SubagentUsage;
+}
+
+/** Activity update from a running subagent. */
+export interface SubagentActivity {
+	/** Type of activity */
+	type: "tool_start" | "tool_end" | "text_delta" | "thinking";
+	/** Tool name (for tool_start/tool_end) */
+	toolName?: string;
+	/** Tool arguments summary (for tool_start) */
+	argsSummary?: string;
+	/** Whether tool succeeded (for tool_end) */
+	toolSuccess?: boolean;
+	/** Text snippet (for text_delta) */
+	text?: string;
+	/** Current turn number */
+	turn: number;
+	/** Preview of tool result (for tool_end) */
+	resultPreview?: string;
+}
+
+/** Structured event from a running subagent, stored for the output viewer. */
+export interface OutputEvent {
+	time: number;
+	kind: "tool_start" | "tool_end" | "text" | "thinking";
+	tool?: string;
+	args?: string;
+	result?: string;
+	error?: boolean;
+	text?: string;
+	turn: number;
+}
+
+/**
+ * Summarize tool arguments into a compact one-line string for display.
+ */
+function summarizeToolArgs(toolName: string, args: any): string {
+	if (!args) return "";
+	switch (toolName) {
+		case "bash":
+			return args.command ? truncateStr(args.command, 60) : "";
+		case "read":
+			return args.path ?? "";
+		case "write":
+			return args.path ?? "";
+		case "edit":
+			return args.path ?? "";
+		case "grep":
+		case "find":
+		case "ls":
+			return args.path ?? args.pattern ?? "";
+		default:
+			// For custom tools, show first string arg
+			for (const v of Object.values(args)) {
+				if (typeof v === "string") return truncateStr(v, 60);
+			}
+			return "";
+	}
+}
+
+/**
+ * Truncate a string to maxLen, appending "…" if truncated.
+ */
+function truncateStr(s: string, maxLen: number): string {
+	// Replace newlines with spaces for display
+	const clean = s.replace(/\n/g, " ").trim();
+	if (clean.length <= maxLen) return clean;
+	return clean.slice(0, maxLen - 1) + "…";
 }
 
 interface AgentDefinition {
