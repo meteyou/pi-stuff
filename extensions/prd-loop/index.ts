@@ -902,6 +902,89 @@ function updateTaskIndexBody(
 	return updatedLines.join("\n");
 }
 
+/**
+ * Sync the PRD Task Index body with the actual todo file statuses.
+ *
+ * Called once at loop start so that tasks completed outside the loop
+ * (e.g. via `/todos`) are reflected in the PRD table before execution begins.
+ *
+ * For each table row referencing a TODO-xxx:
+ * - Closed/done tasks  → "✅ done"
+ * - Open, all blockers resolved → "🔓 ready"
+ * - Open, unresolved blockers   → "⏳ blocked"
+ *
+ * Also updates the "Next up:" / "Start with:" pointer.
+ */
+function syncPrdTaskIndex(body: string, allTasks: TaskInfo[]): string {
+	const taskMap = new Map<string, TaskInfo>();
+	for (const t of allTasks) {
+		taskMap.set(t.id, t);
+	}
+
+	const closedIds = new Set<string>();
+	for (const t of allTasks) {
+		if (isTaskClosed(t.status)) closedIds.add(t.id);
+	}
+
+	const lines = body.split("\n");
+	const updatedLines: string[] = [];
+
+	for (const line of lines) {
+		const todoMatch = line.match(/TODO-[0-9a-f]+/i);
+		// Table data rows have multiple pipes and a TODO reference
+		const pipeCount = (line.match(/\|/g) || []).length;
+		const isTableRow = pipeCount >= 4 && todoMatch;
+
+		if (isTableRow && todoMatch) {
+			const taskId = todoMatch[0];
+			const task = taskMap.get(taskId);
+
+			if (!task) {
+				updatedLines.push(line);
+				continue;
+			}
+
+			// Replace the last meaningful cell (Status column)
+			const cells = line.split("|");
+			const statusCellIndex = cells.length - 2; // last cell before trailing ""
+
+			if (statusCellIndex < 1) {
+				updatedLines.push(line);
+				continue;
+			}
+
+			let newStatus: string;
+			if (isTaskClosed(task.status)) {
+				newStatus = " ✅ done ";
+			} else if (task.blockedBy.every((b) => closedIds.has(b))) {
+				newStatus = " 🔓 ready ";
+			} else {
+				newStatus = " ⏳ blocked ";
+			}
+
+			cells[statusCellIndex] = newStatus;
+			updatedLines.push(cells.join("|"));
+		} else if (/^(Next up|Start with)\s*:/i.test(line)) {
+			// Update the pointer to the next actionable task
+			const nextTask = allTasks
+				.filter((t) => !isTaskClosed(t.status))
+				.find((t) => t.blockedBy.every((b) => closedIds.has(b)));
+
+			if (nextTask) {
+				updatedLines.push(`Next up: **${nextTask.id}** (${nextTask.title})`);
+			} else if (allTasks.every((t) => isTaskClosed(t.status))) {
+				updatedLines.push(`Next up: All tasks completed! 🎉`);
+			} else {
+				updatedLines.push(line);
+			}
+		} else {
+			updatedLines.push(line);
+		}
+	}
+
+	return updatedLines.join("\n");
+}
+
 // --- Orchestrator loop ---
 
 /**
@@ -1204,6 +1287,20 @@ async function runOrchestratorLoop(
 	// Fetch and resolve tasks
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resolution = resolveTaskOrder(tasks);
+
+	// Sync PRD Task Index with actual todo statuses (picks up tasks closed outside the loop)
+	try {
+		const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
+		const syncedBody = syncPrdTaskIndex(currentPrdBody, tasks);
+		if (syncedBody !== currentPrdBody) {
+			await updateTodoFileBody(ctx.cwd, prdId, syncedBody);
+		}
+	} catch (err) {
+		ctx.ui.notify(
+			`⚠️ Failed to sync PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
+			"warning",
+		);
+	}
 
 	// Handle circular dependency
 	if (resolution.error) {
