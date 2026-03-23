@@ -1308,6 +1308,243 @@ function buildSummaryWidget(
 	return lines;
 }
 
+// --- Subagent Output Viewer Overlay ---
+
+/**
+ * Overlay component that shows live subagent output for a running task.
+ *
+ * Renders a bordered, scrollable log of tool calls, results, thinking, and text output.
+ * Auto-scrolls to bottom unless the user manually scrolls up.
+ * Refreshed periodically via an external setInterval + tui.requestRender().
+ */
+class SubagentOutputViewer {
+	private tui: TUI;
+	private theme: Theme;
+	private taskState: LoopTaskState;
+	private onClose: (reason: "escape" | "pause") => void;
+	private scrollOffset = 0;
+	private viewHeight = 0;
+	private totalLines = 0;
+	private autoScroll = true;
+	private prevEventCount = 0;
+
+	constructor(tui: TUI, theme: Theme, taskState: LoopTaskState, onClose: (reason: "escape" | "pause") => void) {
+		this.tui = tui;
+		this.theme = theme;
+		this.taskState = taskState;
+		this.onClose = onClose;
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.onClose("escape");
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("c"))) {
+			this.onClose("pause");
+			return;
+		}
+		if (matchesKey(data, Key.up)) {
+			this.autoScroll = false;
+			this.scrollBy(-1);
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			this.scrollBy(1);
+			// Re-enable auto-scroll if at bottom
+			const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
+			if (this.scrollOffset >= maxScroll) this.autoScroll = true;
+			return;
+		}
+		if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.left)) {
+			this.autoScroll = false;
+			this.scrollBy(-(this.viewHeight || 10));
+			return;
+		}
+		if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.right)) {
+			this.scrollBy(this.viewHeight || 10);
+			const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
+			if (this.scrollOffset >= maxScroll) this.autoScroll = true;
+			return;
+		}
+	}
+
+	render(width: number): string[] {
+		const theme = this.theme;
+		const task = this.taskState;
+		const maxHeight = this.getMaxHeight();
+		const headerLines = 3; // title + meta + blank
+		const footerLines = 2; // blank + hints
+		const borderLines = 2;
+		const innerWidth = Math.max(10, width - 2);
+		const contentHeight = Math.max(1, maxHeight - headerLines - footerLines - borderLines);
+
+		// Format output events as lines
+		const eventLines = this.formatEvents(innerWidth);
+		this.totalLines = eventLines.length;
+		this.viewHeight = contentHeight;
+
+		// Auto-scroll to bottom if new events arrived
+		if (this.autoScroll || task.outputEvents.length !== this.prevEventCount) {
+			if (this.autoScroll) {
+				this.scrollOffset = Math.max(0, this.totalLines - contentHeight);
+			}
+			this.prevEventCount = task.outputEvents.length;
+		}
+
+		const maxScroll = Math.max(0, this.totalLines - contentHeight);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+
+		const visibleLines = eventLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
+
+		const lines: string[] = [];
+
+		// Header
+		lines.push(this.buildTitleLine(innerWidth));
+		lines.push(this.buildMetaLine(innerWidth));
+		lines.push("");
+
+		// Content
+		for (const line of visibleLines) {
+			lines.push(truncateToWidth(line, innerWidth));
+		}
+		// Pad to fill
+		while (lines.length < headerLines + contentHeight) {
+			lines.push("");
+		}
+
+		// Footer
+		lines.push("");
+		lines.push(this.buildHintLine(innerWidth));
+
+		// Frame with border
+		const borderColor = (text: string) => theme.fg("borderMuted", text);
+		const top = borderColor(`┌${"─".repeat(innerWidth)}┐`);
+		const bottom = borderColor(`└${"─".repeat(innerWidth)}┘`);
+		const framedLines = lines.map((line) => {
+			const truncated = truncateToWidth(line, innerWidth);
+			const padding = Math.max(0, innerWidth - visibleWidth(truncated));
+			return borderColor("│") + truncated + " ".repeat(padding) + borderColor("│");
+		});
+
+		return [top, ...framedLines, bottom].map((line) => truncateToWidth(line, width));
+	}
+
+	invalidate(): void {
+		// No caching — always renders fresh from outputEvents
+	}
+
+	private getMaxHeight(): number {
+		const rows = this.tui.terminal.rows || 24;
+		return Math.max(10, Math.floor(rows * 0.85));
+	}
+
+	private formatEvents(maxWidth: number): string[] {
+		const theme = this.theme;
+		const events = this.taskState.outputEvents;
+		if (events.length === 0) {
+			return [theme.fg("muted", "  Waiting for subagent output…")];
+		}
+
+		const lines: string[] = [];
+		for (const ev of events) {
+			const turnLabel = theme.fg("dim", `T${ev.turn}`);
+			switch (ev.kind) {
+				case "tool_start": {
+					const toolName = theme.fg("toolTitle", theme.bold(ev.tool ?? "?"));
+					const args = ev.args ? theme.fg("muted", ` ${ev.args}`) : "";
+					lines.push(truncateToWidth(`  ${turnLabel} ▶ ${toolName}${args}`, maxWidth));
+					break;
+				}
+				case "tool_end": {
+					const icon = ev.error ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					const toolName = ev.error
+						? theme.fg("error", ev.tool ?? "?")
+						: theme.fg("success", ev.tool ?? "?");
+					lines.push(truncateToWidth(`  ${turnLabel} ${icon} ${toolName}`, maxWidth));
+					// Show result preview indented
+					if (ev.result) {
+						const previewLines = ev.result.split("\n").slice(0, 3);
+						for (const pLine of previewLines) {
+							lines.push(truncateToWidth(`       ${theme.fg("dim", pLine)}`, maxWidth));
+						}
+					}
+					break;
+				}
+				case "thinking":
+					lines.push(truncateToWidth(`  ${turnLabel} ${theme.fg("muted", "🧠 thinking…")}`, maxWidth));
+					break;
+				case "text":
+					lines.push(truncateToWidth(`  ${turnLabel} ${theme.fg("muted", "💬 writing response…")}`, maxWidth));
+					break;
+			}
+		}
+		return lines;
+	}
+
+	private buildTitleLine(width: number): string {
+		const theme = this.theme;
+		const task = this.taskState;
+		const titleText = ` Task ${task.sequenceLabel}: ${extractShortTitle(task.title)} `;
+		const titleWidth = visibleWidth(titleText);
+		if (titleWidth >= width) {
+			return truncateToWidth(theme.fg("accent", titleText.trim()), width);
+		}
+		const leftWidth = Math.max(0, Math.floor((width - titleWidth) / 2));
+		const rightWidth = Math.max(0, width - titleWidth - leftWidth);
+		return (
+			theme.fg("borderMuted", "─".repeat(leftWidth)) +
+			theme.fg("accent", titleText) +
+			theme.fg("borderMuted", "─".repeat(rightWidth))
+		);
+	}
+
+	private buildMetaLine(width: number): string {
+		const theme = this.theme;
+		const task = this.taskState;
+		const now = Date.now();
+
+		const icon = task.status === "running" ? "🔄" : task.status === "retrying" ? "🔁" : statusIconFn(task.status);
+		const elapsed = task.startTime ? formatElapsed(now - task.startTime) : "0:00";
+		const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
+		const eventCount = `${task.outputEvents.length} events`;
+
+		const line =
+			theme.fg("accent", `${icon} ${task.status}`) +
+			theme.fg("muted", " • ") +
+			theme.fg("muted", elapsed) +
+			(turnInfo ? theme.fg("muted", ` • ${turnInfo}`) : "") +
+			theme.fg("muted", ` • ${eventCount}`);
+		return truncateToWidth(line, width);
+	}
+
+	private buildHintLine(width: number): string {
+		const theme = this.theme;
+		const nav = theme.fg("dim", "↑/↓ scroll • ←/→ page • Esc close • Ctrl+C pause");
+		let line = nav;
+		if (this.totalLines > this.viewHeight) {
+			const start = Math.min(this.totalLines, this.scrollOffset + 1);
+			const end = Math.min(this.totalLines, this.scrollOffset + this.viewHeight);
+			const scrollInfo = theme.fg("dim", ` ${start}-${end}/${this.totalLines}`);
+			line += scrollInfo;
+		}
+		if (this.autoScroll) {
+			line += theme.fg("muted", " (auto-scroll)");
+		}
+		return truncateToWidth(line, width);
+	}
+
+	private scrollBy(delta: number): void {
+		const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset + delta, maxScroll));
+	}
+}
+
+/** statusIcon wrapper to avoid name collision with the existing function */
+function statusIconFn(status: TaskStatus): string {
+	return statusIcon(status);
+}
+
 // --- Pause menu ---
 
 type PauseAction = "release" | "retry" | "skip" | "abort";
