@@ -1150,6 +1150,28 @@ export function buildRetryPrompt(task: TaskInfo, prdId: string, errors: string[]
 }
 
 /**
+ * Build a continuation prompt after the user paused and resumed.
+ *
+ * The previous subagent was interrupted but its partial changes are still on disk.
+ * Instructs the new subagent to continue from where it left off.
+ */
+export function buildContinuePrompt(task: TaskInfo, prdId: string): string {
+	const basePrompt = buildTaskPrompt(task, prdId);
+
+	return [
+		basePrompt,
+		``,
+		`---`,
+		``,
+		`## ℹ️ Continuation`,
+		``,
+		`A previous attempt was interrupted. The partial changes are still on disk (uncommitted).`,
+		`Run \`git diff\` to see what was already done, then continue from where it left off.`,
+		`Do not redo work that is already complete.`,
+	].join("\n");
+}
+
+/**
  * Extract the short title from a task title (removes "PRD #N - Task M/T: " prefix).
  */
 function extractShortTitle(title: string): string {
@@ -1547,12 +1569,13 @@ function statusIconFn(status: TaskStatus): string {
 
 // --- Pause menu ---
 
-type PauseAction = "release" | "retry" | "skip" | "abort";
+type PauseAction = "resume" | "release" | "retry" | "skip" | "abort";
 
 /**
  * Show an interactive pause menu after Ctrl+C interrupts a running subagent.
  *
  * Options:
+ * - Resume: keep changes on disk, respawn subagent to continue where it left off
  * - Release session: exit the loop, keep changes on disk for manual fixing
  * - Retry task: discard uncommitted changes, retry from scratch
  * - Skip task: discard uncommitted changes, mark as done, continue
@@ -1560,6 +1583,7 @@ type PauseAction = "release" | "retry" | "skip" | "abort";
  */
 async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Promise<PauseAction> {
 	const options = [
+		"▶️  Resume — keep changes, continue where it left off",
 		"🔧 Release session — fix manually, re-run /prd-loop to continue",
 		"🔄 Retry task — discard changes, try again from scratch",
 		"⏭️  Skip task — discard changes, mark done, continue with next",
@@ -1572,11 +1596,12 @@ async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Prom
 	);
 
 	switch (choice) {
-		case options[0]: return "release";
-		case options[1]: return "retry";
-		case options[2]: return "skip";
-		case options[3]: return "abort";
-		default: return "release"; // User cancelled select → treat as release
+		case options[0]: return "resume";
+		case options[1]: return "release";
+		case options[2]: return "retry";
+		case options[3]: return "skip";
+		case options[4]: return "abort";
+		default: return "resume"; // User cancelled select → treat as resume (safest default)
 	}
 }
 
