@@ -1178,6 +1178,41 @@ function buildSummaryWidget(
 	return lines;
 }
 
+// --- Pause menu ---
+
+type PauseAction = "release" | "retry" | "skip" | "abort";
+
+/**
+ * Show an interactive pause menu after Ctrl+C interrupts a running subagent.
+ *
+ * Options:
+ * - Release session: exit the loop, keep changes on disk for manual fixing
+ * - Retry task: discard uncommitted changes, retry from scratch
+ * - Skip task: discard uncommitted changes, mark as done, continue
+ * - Abort loop: stop everything, keep changes on disk
+ */
+async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Promise<PauseAction> {
+	const options = [
+		"🔧 Release session — fix manually, re-run /prd-loop to continue",
+		"🔄 Retry task — discard changes, try again from scratch",
+		"⏭️  Skip task — discard changes, mark done, continue with next",
+		"❌ Abort loop — stop and keep changes on disk",
+	];
+
+	const choice = await ctx.ui.select(
+		`⏸️  Paused — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+		options,
+	);
+
+	switch (choice) {
+		case options[0]: return "release";
+		case options[1]: return "retry";
+		case options[2]: return "skip";
+		case options[3]: return "abort";
+		default: return "release"; // User cancelled select → treat as release
+	}
+}
+
 // --- Smart commits (prd-committer agent) ---
 
 /**
@@ -1353,18 +1388,19 @@ async function runOrchestratorLoop(
 
 	updateWidget();
 
-	// Periodic timer to update elapsed time display
-	const widgetTimer = setInterval(updateWidget, 1000);
+	// Periodic timer to update elapsed time display (mutable: paused/restarted on Ctrl+C menu)
+	let widgetTimer = setInterval(updateWidget, 1000);
 
-	// --- Set up abort controller for Ctrl+C ---
-	const abortController = new AbortController();
+	// --- Set up abort controller for Ctrl+C (pause & menu) ---
+	let currentAbortController = new AbortController();
 	let aborted = false;
+	let pauseRequested = false;
 
 	const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
-		// Ctrl+C is sent as \x03
+		// Ctrl+C is sent as \x03 — pause the loop and show menu
 		if (data === "\x03") {
-			aborted = true;
-			abortController.abort();
+			pauseRequested = true;
+			currentAbortController.abort();
 			return { consume: true };
 		}
 		return undefined;
@@ -1413,18 +1449,80 @@ async function runOrchestratorLoop(
 					thinkingLevel: config.thinkingLevel,
 					cwd: ctx.cwd,
 					agent,
-					signal: abortController.signal,
+					signal: currentAbortController.signal,
 				});
 
 				// Accumulate cost
 				taskState.cost += result.usage.cost;
 				loopState.totalCost += result.usage.cost;
 
-				// Check abort
-				if (aborted) {
-					taskState.status = "aborted";
-					taskState.endTime = Date.now();
-					break;
+				// Check if pause was requested (Ctrl+C)
+				if (pauseRequested) {
+					pauseRequested = false;
+					clearInterval(widgetTimer); // Pause widget updates during menu
+					const pauseAction = await showPauseMenu(ctx, task);
+
+					switch (pauseAction) {
+						case "release":
+							// Exit loop, keep changes on disk for manual fixing
+							cleanup("aborted");
+							ctx.ui.notify(
+								"⏸️ Session released. Uncommitted changes left on disk.\n" +
+								"Fix issues and re-run /prd-loop to continue from where you left off.",
+								"info",
+							);
+							return;
+
+						case "retry":
+							// Discard uncommitted changes and retry task from scratch
+							await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
+							await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+							currentAbortController = new AbortController();
+							currentPrompt = initialPrompt;
+							retriesRemaining = config.retryFixes;
+							attempt = 1;
+							taskState.retries = 0;
+							taskState.status = "running";
+							loopState.currentRetry = 0;
+							// Restart widget timer
+							widgetTimer = setInterval(updateWidget, 1000);
+							updateWidget();
+							continue; // Restart while loop
+
+						case "skip": {
+							// Discard uncommitted changes, mark task as done, continue
+							await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
+							await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+							currentAbortController = new AbortController();
+							taskState.status = "completed";
+							taskState.endTime = Date.now();
+							await updateTodoFileStatus(ctx.cwd, task.id, "closed");
+							task.status = "closed";
+							// Update PRD Task Index
+							try {
+								const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
+								const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
+								await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
+							} catch {
+								// Non-critical
+							}
+							// Restart widget timer
+							widgetTimer = setInterval(updateWidget, 1000);
+							updateWidget();
+							taskSucceeded = false; // Skip post-task actions (already handled)
+							break; // Break switch → will break while loop below
+						}
+
+						case "abort":
+							aborted = true;
+							taskState.status = "aborted";
+							taskState.endTime = Date.now();
+							break; // Break switch → will break while loop below
+					}
+
+					if (aborted) break; // Break while loop
+					if (taskState.status === "completed") break; // Break while loop (skip case)
+					continue; // Safety fallback
 				}
 
 				// Success — break out of retry loop
@@ -1485,7 +1583,7 @@ async function runOrchestratorLoop(
 					prdTag,
 					config.model,
 					config.thinkingLevel,
-					abortController.signal,
+					currentAbortController.signal,
 				);
 
 				loopState.totalCost += committerResult.cost;
