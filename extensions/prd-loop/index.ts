@@ -447,6 +447,9 @@ function getFinalAssistantText(messages: Array<{ role: string; content: Array<{ 
 
 const SIGKILL_TIMEOUT_MS = 5000;
 
+/** Timeout (ms) to wait for process exit after receiving agent_end event. */
+const AGENT_END_EXIT_TIMEOUT_MS = 10000;
+
 /**
  * Spawn a pi subagent process to execute a task.
  *
@@ -476,8 +479,13 @@ export async function spawnSubagent(options: {
 	const promptPath = join(tmpDir, "prd-worker-prompt.md");
 	writeFileSync(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 
-	// Build pi arguments
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	// Build pi arguments — disable extensions and themes to prevent interference
+	// with clean process exit (extensions can register event listeners, hooks, etc.
+	// that block shutdown). Skills and prompt templates are kept — subagents need them.
+	const args: string[] = [
+		"--mode", "json", "-p", "--no-session",
+		"--no-extensions", "--no-themes",
+	];
 
 	// Model: prefer explicit option, fall back to agent definition
 	const effectiveModel = model ?? agent.model;
@@ -508,11 +516,20 @@ export async function spawnSubagent(options: {
 	};
 
 	const messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> = [];
+	/** Authoritative messages from agent_end event (if received). */
+	let agentEndMessages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> | null = null;
 	let stderr = "";
 	let wasAborted = false;
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
+			let resolved = false;
+			const safeResolve = (code: number) => {
+				if (resolved) return;
+				resolved = true;
+				resolve(code);
+			};
+
 			const proc = spawn("pi", args, {
 				cwd,
 				shell: false,
@@ -520,6 +537,7 @@ export async function spawnSubagent(options: {
 			});
 
 			let buffer = "";
+			let agentEndExitTimer: ReturnType<typeof setTimeout> | null = null;
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -531,7 +549,46 @@ export async function spawnSubagent(options: {
 					return;
 				}
 
-				// Track message_end events for usage stats and message content
+				// agent_end is the authoritative completion signal — it contains the
+				// full, definitive message list (survives auto-compaction).
+				if (event.type === "agent_end" && Array.isArray(event.messages)) {
+					agentEndMessages = event.messages;
+
+					// Recalculate usage from the authoritative messages
+					usage.turns = 0;
+					usage.input = 0;
+					usage.output = 0;
+					usage.cacheRead = 0;
+					usage.cacheWrite = 0;
+					usage.cost = 0;
+					usage.contextTokens = 0;
+					for (const msg of event.messages) {
+						if (msg.role === "assistant" && msg.usage) {
+							usage.turns++;
+							usage.input += msg.usage.input || 0;
+							usage.output += msg.usage.output || 0;
+							usage.cacheRead += msg.usage.cacheRead || 0;
+							usage.cacheWrite += msg.usage.cacheWrite || 0;
+							usage.cost += msg.usage.cost?.total || 0;
+							usage.contextTokens = msg.usage.totalTokens || 0;
+						}
+					}
+
+					// Safety: if the process doesn't exit within timeout after
+					// agent_end, force-kill it and resolve (prevents hanging).
+					agentEndExitTimer = setTimeout(() => {
+						if (!resolved) {
+							proc.kill("SIGTERM");
+							setTimeout(() => {
+								if (!proc.killed) proc.kill("SIGKILL");
+							}, SIGKILL_TIMEOUT_MS);
+							safeResolve(0); // Treat as success — agent completed
+						}
+					}, AGENT_END_EXIT_TIMEOUT_MS);
+				}
+
+				// Track message_end events for incremental usage stats and live
+				// activity updates (agent_end will override the final usage).
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message;
 					messages.push(msg);
@@ -548,11 +605,6 @@ export async function spawnSubagent(options: {
 							usage.contextTokens = msgUsage.totalTokens || 0;
 						}
 					}
-				}
-
-				// Also track tool_result_end for the full message history
-				if (event.type === "tool_result_end" && event.message) {
-					messages.push(event.message);
 				}
 
 				// Stream activity events to the caller
@@ -618,11 +670,13 @@ export async function spawnSubagent(options: {
 			proc.on("close", (code: number | null) => {
 				// Process remaining buffer
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				if (agentEndExitTimer) clearTimeout(agentEndExitTimer);
+				safeResolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
-				resolve(1);
+				if (agentEndExitTimer) clearTimeout(agentEndExitTimer);
+				safeResolve(1);
 			});
 
 			// Abort handling
@@ -638,7 +692,12 @@ export async function spawnSubagent(options: {
 				if (signal.aborted) {
 					killProc();
 				} else {
-					signal.addEventListener("abort", killProc, { once: true });
+					const abortHandler = () => killProc();
+					signal.addEventListener("abort", abortHandler, { once: true });
+					// Clean up the listener when the process exits to avoid leaks
+					proc.on("close", () => {
+						signal.removeEventListener("abort", abortHandler);
+					});
 				}
 			}
 		});
@@ -653,8 +712,9 @@ export async function spawnSubagent(options: {
 			};
 		}
 
-		// Handle non-zero exit code
-		if (exitCode !== 0) {
+		// Handle non-zero exit code — but if we received agent_end, the agent
+		// DID complete; the non-zero code is likely from post-agent cleanup.
+		if (exitCode !== 0 && !agentEndMessages) {
 			return {
 				success: false,
 				errors: [`Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`],
@@ -663,8 +723,10 @@ export async function spawnSubagent(options: {
 			};
 		}
 
-		// Extract and parse the structured JSON result from the final assistant message
-		const finalText = getFinalAssistantText(messages);
+		// Prefer authoritative agent_end messages, fall back to incrementally
+		// collected message_end messages.
+		const finalMessages = agentEndMessages ?? messages;
+		const finalText = getFinalAssistantText(finalMessages);
 		const parsed = parseSubagentResult(finalText);
 
 		if (!parsed) {
