@@ -1763,6 +1763,8 @@ async function runOrchestratorLoop(
 			cost: 0,
 			retries: 0,
 			errors: [],
+			currentTurn: 0,
+			outputEvents: [],
 		})),
 		totalCost: 0,
 		totalCommits: 0,
@@ -1788,11 +1790,57 @@ async function runOrchestratorLoop(
 	let aborted = false;
 	let pauseRequested = false;
 
+	let viewerOpen = false;
+
+	/** Open the subagent output viewer overlay for the currently running task. */
+	const openOutputViewer = async () => {
+		if (viewerOpen) return;
+		// Find the currently running task
+		const runningTask = loopState.tasks.find(
+			(t) => t.status === "running" || t.status === "retrying",
+		);
+		if (!runningTask) return;
+
+		viewerOpen = true;
+		try {
+			await ctx.ui.custom<void>(
+				(tui, theme, _kb, done) => {
+					const viewer = new SubagentOutputViewer(tui, theme, runningTask, (reason) => {
+						clearInterval(refreshTimer);
+						if (reason === "pause") {
+							// Trigger pause flow after overlay closes
+							pauseRequested = true;
+							currentAbortController.abort();
+						}
+						done();
+					});
+					// Refresh overlay every 500ms for live updates
+					const refreshTimer = setInterval(() => tui.requestRender(), 500);
+					return viewer;
+				},
+				{
+					overlay: true,
+					overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" },
+				},
+			);
+		} finally {
+			viewerOpen = false;
+		}
+	};
+
 	const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
-		// Ctrl+C is sent as \x03 — pause the loop and show menu
+		// Don't intercept keys when the viewer overlay is active
+		if (viewerOpen) return undefined;
+
+		// Ctrl+C → pause the loop and show menu
 		if (data === "\x03") {
 			pauseRequested = true;
 			currentAbortController.abort();
+			return { consume: true };
+		}
+		// Enter → open the subagent output viewer
+		if (matchesKey(data, Key.enter)) {
+			void openOutputViewer();
 			return { consume: true };
 		}
 		return undefined;
@@ -1818,6 +1866,9 @@ async function runOrchestratorLoop(
 			// Mark task as running
 			taskState.status = "running";
 			taskState.startTime = Date.now();
+			taskState.currentActivity = undefined;
+			taskState.currentTurn = 0;
+			taskState.outputEvents = [];
 			updateWidget();
 
 			// Build the initial subagent prompt
@@ -1834,7 +1885,7 @@ async function runOrchestratorLoop(
 			while (true) {
 				if (aborted) break;
 
-				// Spawn the subagent
+				// Spawn the subagent with activity streaming
 				result = await spawnSubagent({
 					taskPrompt: currentPrompt,
 					model: config.model,
@@ -1842,6 +1893,71 @@ async function runOrchestratorLoop(
 					cwd: ctx.cwd,
 					agent,
 					signal: currentAbortController.signal,
+					onActivity: (activity) => {
+						taskState.currentTurn = activity.turn;
+
+						// Update widget one-liner
+						switch (activity.type) {
+							case "tool_start":
+								taskState.currentActivity = `▶ ${activity.toolName}${activity.argsSummary ? ` ${activity.argsSummary}` : ""}`;
+								break;
+							case "tool_end":
+								taskState.currentActivity = `${activity.toolSuccess ? "✓" : "✗"} ${activity.toolName}`;
+								break;
+							case "text_delta":
+								taskState.currentActivity = "💬 writing response…";
+								break;
+							case "thinking":
+								taskState.currentActivity = "🧠 thinking…";
+								break;
+						}
+
+						// Collect output events for the viewer overlay
+						const now = Date.now();
+						switch (activity.type) {
+							case "tool_start":
+								taskState.outputEvents.push({
+									time: now,
+									kind: "tool_start",
+									tool: activity.toolName,
+									args: activity.argsSummary,
+									turn: activity.turn,
+								});
+								break;
+							case "tool_end":
+								taskState.outputEvents.push({
+									time: now,
+									kind: "tool_end",
+									tool: activity.toolName,
+									error: !activity.toolSuccess,
+									result: activity.resultPreview,
+									turn: activity.turn,
+								});
+								break;
+							case "text_delta":
+								// Deduplicate consecutive text events
+								if (taskState.outputEvents.at(-1)?.kind !== "text") {
+									taskState.outputEvents.push({
+										time: now,
+										kind: "text",
+										turn: activity.turn,
+									});
+								}
+								break;
+							case "thinking":
+								// Deduplicate consecutive thinking events
+								if (taskState.outputEvents.at(-1)?.kind !== "thinking") {
+									taskState.outputEvents.push({
+										time: now,
+										kind: "thinking",
+										turn: activity.turn,
+									});
+								}
+								break;
+						}
+
+						updateWidget();
+					},
 				});
 
 				// Accumulate cost
@@ -1855,6 +1971,17 @@ async function runOrchestratorLoop(
 					const pauseAction = await showPauseMenu(ctx, task);
 
 					switch (pauseAction) {
+						case "resume":
+							// Keep changes on disk, respawn subagent to continue
+							currentAbortController = new AbortController();
+							currentPrompt = buildContinuePrompt(task, prdId);
+							taskState.status = "running";
+							taskState.currentActivity = "▶ resuming…";
+							// Restart widget timer
+							widgetTimer = setInterval(updateWidget, 1000);
+							updateWidget();
+							continue; // Restart while loop → spawns new subagent
+
 						case "release":
 							// Exit loop, keep changes on disk for manual fixing
 							cleanup("aborted");
@@ -1875,6 +2002,9 @@ async function runOrchestratorLoop(
 							attempt = 1;
 							taskState.retries = 0;
 							taskState.status = "running";
+							taskState.currentActivity = undefined;
+							taskState.currentTurn = 0;
+							taskState.outputEvents = [];
 							loopState.currentRetry = 0;
 							// Restart widget timer
 							widgetTimer = setInterval(updateWidget, 1000);
@@ -1888,6 +2018,7 @@ async function runOrchestratorLoop(
 							currentAbortController = new AbortController();
 							taskState.status = "completed";
 							taskState.endTime = Date.now();
+							taskState.currentActivity = undefined;
 							await updateTodoFileStatus(ctx.cwd, task.id, "closed");
 							task.status = "closed";
 							// Update PRD Task Index
@@ -1963,6 +2094,7 @@ async function runOrchestratorLoop(
 			// --- Post-task actions on success ---
 			taskState.status = "completed";
 			taskState.endTime = Date.now();
+			taskState.currentActivity = undefined;
 			updateWidget();
 
 			// 1. Git commit (smart or simple)
