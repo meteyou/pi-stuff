@@ -467,8 +467,9 @@ export async function spawnSubagent(options: {
 	cwd: string;
 	agent: AgentDefinition;
 	signal?: AbortSignal;
+	onActivity?: (activity: SubagentActivity) => void;
 }): Promise<SubagentResult> {
-	const { taskPrompt, model, thinkingLevel, cwd, agent, signal } = options;
+	const { taskPrompt, model, thinkingLevel, cwd, agent, signal, onActivity } = options;
 
 	// Write agent system prompt to temp file
 	const tmpDir = mkdtempSync(join(tmpdir(), "prd-loop-"));
@@ -552,6 +553,54 @@ export async function spawnSubagent(options: {
 				// Also track tool_result_end for the full message history
 				if (event.type === "tool_result_end" && event.message) {
 					messages.push(event.message);
+				}
+
+				// Stream activity events to the caller
+				if (onActivity) {
+					if (event.type === "tool_execution_start") {
+						onActivity({
+							type: "tool_start",
+							toolName: event.toolName,
+							argsSummary: summarizeToolArgs(event.toolName, event.args),
+							turn: usage.turns + 1,
+						});
+					} else if (event.type === "tool_execution_end") {
+						let resultPreview = "";
+						try {
+							const content = event.result?.content;
+							if (Array.isArray(content)) {
+								for (const item of content) {
+									if (item.type === "text" && item.text) {
+										resultPreview = truncateStr(item.text, 200);
+										break;
+									}
+								}
+							} else if (typeof event.result === "string") {
+								resultPreview = truncateStr(event.result, 200);
+							}
+						} catch { /* ignore parse errors */ }
+						onActivity({
+							type: "tool_end",
+							toolName: event.toolName,
+							toolSuccess: !event.isError,
+							resultPreview,
+							turn: usage.turns + 1,
+						});
+					} else if (event.type === "message_update" && event.assistantMessageEvent) {
+						const ame = event.assistantMessageEvent;
+						if (ame.type === "text_delta" && ame.delta) {
+							onActivity({
+								type: "text_delta",
+								text: ame.delta,
+								turn: usage.turns + 1,
+							});
+						} else if (ame.type === "thinking_delta" || ame.type === "thinking") {
+							onActivity({
+								type: "thinking",
+								turn: usage.turns + 1,
+							});
+						}
+					}
 				}
 			};
 
