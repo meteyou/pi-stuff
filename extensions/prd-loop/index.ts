@@ -80,6 +80,14 @@ function parseTodoFile(content: string): TodoItem | null {
 }
 
 /**
+ * Check whether a task status represents a completed/closed state.
+ * Recognises "closed" (set by the loop) and "done" (set manually or by other tools).
+ */
+function isTaskClosed(status: string): boolean {
+	return status === "closed" || status === "done";
+}
+
+/**
  * Read all todo files from .pi/todos/
  */
 async function readAllTodos(cwd: string): Promise<TodoItem[]> {
@@ -123,7 +131,7 @@ async function getActivePrds(cwd: string): Promise<{ prd: TodoItem; openTaskCoun
 
 		// Find all tasks for this PRD
 		const tasks = todos.filter((t) => t.tags.includes("task") && t.tags.includes(prdTag));
-		const openTasks = tasks.filter((t) => t.status === "open");
+		const openTasks = tasks.filter((t) => !isTaskClosed(t.status));
 
 		if (openTasks.length > 0) {
 			result.push({ prd, openTaskCount: openTasks.length, totalTaskCount: tasks.length });
@@ -664,7 +672,7 @@ export function resolveTaskOrder(tasks: TaskInfo[]): TaskResolutionResult {
 	}
 
 	// Filter to open tasks only
-	const openTasks = tasks.filter((t) => t.status !== "closed");
+	const openTasks = tasks.filter((t) => !isTaskClosed(t.status));
 
 	if (openTasks.length === 0) {
 		return { actionable: [], allTasks: tasks };
@@ -685,7 +693,7 @@ export function resolveTaskOrder(tasks: TaskInfo[]): TaskResolutionResult {
 			const blocker = taskMap.get(blockerId);
 
 			// If blocker doesn't exist in this PRD or is closed, it's resolved
-			if (!blocker || blocker.status === "closed") {
+			if (!blocker || isTaskClosed(blocker.status)) {
 				continue;
 			}
 
@@ -845,7 +853,7 @@ function updateTaskIndexBody(
 	// Build the set of all closed task IDs (including the just-completed one)
 	const closedIds = new Set<string>();
 	for (const t of allTasks) {
-		if (t.status === "closed") closedIds.add(t.id);
+		if (isTaskClosed(t.status)) closedIds.add(t.id);
 	}
 	closedIds.add(completedTaskId);
 
@@ -1206,7 +1214,7 @@ async function runOrchestratorLoop(
 	// Handle no open tasks
 	if (resolution.actionable.length === 0) {
 		ctx.ui.notify("All tasks already completed.", "info");
-		if (prd.status !== "closed") {
+		if (!isTaskClosed(prd.status)) {
 			await updateTodoFileStatus(ctx.cwd, prdId, "closed");
 		}
 		return;
