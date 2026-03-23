@@ -1171,6 +1171,12 @@ interface LoopTaskState {
 	cost: number;
 	retries: number;
 	errors: string[];
+	/** Current subagent activity (while running) */
+	currentActivity?: string;
+	/** Current turn of the subagent */
+	currentTurn: number;
+	/** Collected output events for the viewer overlay */
+	outputEvents: OutputEvent[];
 }
 
 interface LoopState {
@@ -1233,6 +1239,12 @@ function buildProgressWidget(state: LoopState, prdTitle: string): string[] {
 		}
 
 		lines.push(`│ ${icon} ${label}${timePart}${retryPart}`);
+
+		// Show current subagent activity for running tasks
+		if ((task.status === "running" || task.status === "retrying") && task.currentActivity) {
+			const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
+			lines.push(`│   └─ ${turnInfo} ${task.currentActivity}`);
+		}
 	}
 
 	lines.push("│");
@@ -1245,6 +1257,7 @@ function buildProgressWidget(state: LoopState, prdTitle: string): string[] {
 	const elapsedStr = `Elapsed: ${formatElapsed(now - state.startTime)}`;
 
 	lines.push(`│ ${retryStr} | ${costStr} | ${elapsedStr}`);
+	lines.push(`│ Enter: view output | Ctrl+C: pause`);
 	lines.push(`└${"─".repeat(54)}┘`);
 
 	return lines;
