@@ -65,7 +65,7 @@ git push
 | `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) | custom |
 | `review` | Flexible code-review workflow (uncommitted/branch/commit/PR/folder/custom) with review loop and auto-fixing. | `/review`, `/end-review` | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `session-breakdown` | Interactive breakdown of session usage (sessions/messages/tokens/cost) with heatmap, model table, and breakdowns by CWD, day of week, and time of day. | `/session-breakdown` | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
-| `todos` | File-based todo manager with claiming, locking, and garbage collection. Includes a visual `/todos` TUI and a `todo` tool for the LLM. | `/todos` | [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
+| `todos` | File-based todo manager with claiming, locking, and garbage collection. Includes a visual `/todos` TUI and a `todo` tool for the LLM. | `/todos` | custom, fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `ghostty` | Ghostty terminal integration — dynamic title bar, progress indicators, and error states. | — | [pi-ghostty](https://github.com/HazAT/pi-ghostty) |
 
 ## Skills
