@@ -1221,13 +1221,21 @@ async function runOrchestratorLoop(
 	}
 
 	// --- Initialize loop state ---
+	// Show ALL tasks in the widget (sorted by sequence label), pre-marking completed ones
+	const allTasksSorted = [...resolution.allTasks].sort((a, b) => {
+		const aNum = parseFloat(a.sequenceLabel.split("/")[0]) || 999;
+		const bNum = parseFloat(b.sequenceLabel.split("/")[0]) || 999;
+		if (aNum !== bNum) return aNum - bNum;
+		return a.title.localeCompare(b.title);
+	});
+
 	const loopState: LoopState = {
 		startTime: Date.now(),
-		tasks: resolution.actionable.map((t) => ({
+		tasks: allTasksSorted.map((t) => ({
 			id: t.id,
 			title: t.title,
 			sequenceLabel: t.sequenceLabel,
-			status: "pending" as TaskStatus,
+			status: isTaskClosed(t.status) ? "completed" as TaskStatus : "pending" as TaskStatus,
 			cost: 0,
 			retries: 0,
 			errors: [],
@@ -1277,8 +1285,9 @@ async function runOrchestratorLoop(
 			if (aborted) break;
 
 			const task = resolution.actionable[i];
-			const taskState = loopState.tasks[i];
-			loopState.currentTaskIndex = i;
+			const taskStateIndex = loopState.tasks.findIndex((ts) => ts.id === task.id);
+			const taskState = loopState.tasks[taskStateIndex];
+			loopState.currentTaskIndex = taskStateIndex;
 			loopState.currentRetry = 0;
 
 			// Mark task as running
