@@ -1777,6 +1777,10 @@ async function runOrchestratorLoop(
 
 	// --- Set up live widget ---
 	const updateWidget = () => {
+		// Skip widget updates while the overlay viewer is open — widget line-count
+		// changes cause a TUI re-layout that shifts the center-anchored overlay,
+		// leaving ghost hint-lines on screen (overlays don't clear the background).
+		if (viewerOpen) return;
 		ctx.ui.setWidget("prd-loop", buildProgressWidget(loopState, prdTitle));
 	};
 
@@ -1825,6 +1829,8 @@ async function runOrchestratorLoop(
 			);
 		} finally {
 			viewerOpen = false;
+			// Immediately sync the widget with latest state now that overlay is gone
+			ctx.ui.setWidget("prd-loop", buildProgressWidget(loopState, prdTitle));
 		}
 	};
 
