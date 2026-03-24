@@ -1302,6 +1302,7 @@ function statusIcon(status: TaskStatus): string {
  */
 function buildProgressWidget(state: LoopState, prdTitle: string): string[] {
 	const now = Date.now();
+	const width = process.stdout.columns || 80;
 	const lines: string[] = [];
 
 	lines.push(`┌─ ${prdTitle} ${"─".repeat(Math.max(0, 50 - prdTitle.length))}┐`);
@@ -1344,7 +1345,7 @@ function buildProgressWidget(state: LoopState, prdTitle: string): string[] {
 	lines.push(`│ Enter: view output | Ctrl+C: pause`);
 	lines.push(`└${"─".repeat(54)}┘`);
 
-	return lines;
+	return lines.map((line) => truncateToWidth(line, width));
 }
 
 /**
@@ -1355,6 +1356,7 @@ function buildSummaryWidget(
 	prdTitle: string,
 	outcome: "completed" | "failed" | "aborted",
 ): string[] {
+	const width = process.stdout.columns || 80;
 	const lines: string[] = [];
 
 	const outcomeIcon = outcome === "completed" ? "✅" : outcome === "failed" ? "❌" : "⚠️";
@@ -1389,7 +1391,7 @@ function buildSummaryWidget(
 	];
 	lines.push(parts.join(" | "));
 
-	return lines;
+	return lines.map((line) => truncateToWidth(line, width));
 }
 
 // --- Subagent Output Viewer Overlay ---
