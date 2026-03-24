@@ -1838,6 +1838,8 @@ async function runOrchestratorLoop(
 	const prdTitle = prd.title;
 
 	// --- Set up live widget ---
+	let viewerOpen = false;
+
 	const updateWidget = () => {
 		// Skip widget updates while the overlay viewer is open — widget line-count
 		// changes cause a TUI re-layout that shifts the center-anchored overlay,
@@ -1855,8 +1857,6 @@ async function runOrchestratorLoop(
 	let currentAbortController = new AbortController();
 	let aborted = false;
 	let pauseRequested = false;
-
-	let viewerOpen = false;
 
 	/** Open the subagent output viewer overlay for the currently running task. */
 	const openOutputViewer = async () => {
