@@ -309,8 +309,8 @@ function summarizeToolArgs(toolName: string, args: any): string {
  * Truncate a string to maxLen, appending "…" if truncated.
  */
 function truncateStr(s: string, maxLen: number): string {
-	// Replace newlines with spaces for display
-	const clean = s.replace(/\n/g, " ").trim();
+	// Replace newlines and tabs with spaces for display
+	const clean = s.replace(/[\n\t\r]/g, " ").trim();
 	if (clean.length <= maxLen) return clean;
 	return clean.slice(0, maxLen - 1) + "…";
 }
@@ -1548,11 +1548,12 @@ class SubagentOutputViewer {
 						? theme.fg("error", ev.tool ?? "?")
 						: theme.fg("success", ev.tool ?? "?");
 					lines.push(truncateToWidth(`  ${turnLabel} ${icon} ${toolName}`, maxWidth));
-					// Show result preview indented
+					// Show result preview indented (sanitize tabs — they expand in terminal but visibleWidth counts them as 1)
 					if (ev.result) {
 						const previewLines = ev.result.split("\n").slice(0, 3);
 						for (const pLine of previewLines) {
-							lines.push(truncateToWidth(`       ${theme.fg("dim", pLine)}`, maxWidth));
+							const sanitized = pLine.replace(/\t/g, " ");
+							lines.push(truncateToWidth(`       ${theme.fg("dim", sanitized)}`, maxWidth));
 						}
 					}
 					break;
