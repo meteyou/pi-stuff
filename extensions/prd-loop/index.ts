@@ -2133,11 +2133,10 @@ async function runOrchestratorLoop(
 		{
 			overlay: true,
 			overlayOptions: {
-				anchor: "right-center",
-				width: "55%",
-				minWidth: 72,
+				anchor: "center",
+				width: "90%",
 				maxHeight: "88%",
-				margin: 1,
+				margin: 0,
 			},
 		},
 	);
