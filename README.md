@@ -59,7 +59,7 @@ git push
 |-----------|-------------|---------|--------|
 | `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. | `/answer` (+ `Ctrl+.`) | custom, based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` | custom |
-| `prd-loop` | Autonomous PRD task orchestrator. Spawns isolated subagents per task, auto-commits, retries on failure, shows live progress widget. Supports `--smart-commits` for granular conventional commits. Part of the [PRD Workflow](docs/prd-workflow.md). | `/prd-loop` (alias: `/ralph`) | custom |
+| `prd-loop` | Autonomous PRD task orchestrator. Spawns isolated subagents per task, auto-commits, retries on failure, shows a live overlay with task navigation/details, and leaves a summary widget afterward. Supports `--smart-commits` for granular conventional commits. Part of the [PRD Workflow](docs/prd-workflow.md). | `/prd-loop` (alias: `/ralph`) | custom |
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` | custom |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` | custom |
 | `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) | custom |

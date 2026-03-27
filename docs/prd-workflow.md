@@ -104,8 +104,10 @@ The extension:
    - Returns structured JSON result (`{success, errors, summary}`)
    - On success: auto-commits, updates task todo to closed, updates PRD Task Index
    - On failure: retries with error context (if retries configured), or stops the loop
-6. **Shows a live progress widget** — per-task status, elapsed time, cost, retries
+6. **Shows a live overlay** — per-task status, elapsed time, cost, retries, with ↑/↓ navigation and expandable task details
 7. **Shows a final summary** — per-task stats, totals
+
+While the loop is running, `Esc` closes the overlay and aborts the loop.
 
 #### Commands
 
