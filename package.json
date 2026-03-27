@@ -12,6 +12,7 @@
     ],
     "skills": [
       "./skills",
+      "./node_modules/agent-stuff/skills/web-browser",
       "./node_modules/agent-stuff/skills/github",
       "./node_modules/agent-stuff/skills/pi-share"
     ],
