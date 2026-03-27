@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
 import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth, visibleWidth, type TUI } from "@mariozechner/pi-tui";
+import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@mariozechner/pi-tui";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1125,7 +1125,7 @@ function syncPrdTaskIndex(body: string, allTasks: TaskInfo[]): string {
 
 			// Replace the last meaningful cell (Status column)
 			const cells = line.split("|");
-			const statusCellIndex = cells.length - 2; // last cell before trailing ""
+			const statusCellIndex = cells.length - 2; // last cell before trailing "\n"
 
 			if (statusCellIndex < 1) {
 				updatedLines.push(line);
@@ -1164,7 +1164,7 @@ function syncPrdTaskIndex(body: string, allTasks: TaskInfo[]): string {
 	return updatedLines.join("\n");
 }
 
-// --- Orchestrator loop ---
+// --- Prompt builders ---
 
 /**
  * Build the subagent prompt for a task.
@@ -1241,7 +1241,7 @@ function extractShortTitle(title: string): string {
 	return match ? match[1].trim() : title;
 }
 
-// --- Loop state and widget ---
+// --- Loop state and UI ---
 
 type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
 
@@ -1255,6 +1255,7 @@ interface LoopTaskState {
 	cost: number;
 	retries: number;
 	errors: string[];
+	summary?: string;
 	/** Current subagent activity (while running) */
 	currentActivity?: string;
 	/** Current turn of the subagent */
@@ -1297,55 +1298,264 @@ function statusIcon(status: TaskStatus): string {
 	}
 }
 
-/**
- * Build the live progress widget lines.
- */
-function buildProgressWidget(state: LoopState, prdTitle: string): string[] {
-	const now = Date.now();
-	const width = process.stdout.columns || 80;
-	const lines: string[] = [];
+function taskStatusColor(status: TaskStatus): "accent" | "dim" | "error" | "success" | "warning" {
+	switch (status) {
+		case "pending": return "dim";
+		case "running": return "accent";
+		case "completed": return "success";
+		case "failed": return "error";
+		case "retrying": return "warning";
+		case "aborted": return "warning";
+	}
+}
 
-	lines.push(`┌─ ${prdTitle} ${"─".repeat(Math.max(0, 50 - prdTitle.length))}┐`);
+function padAnsi(text: string, width: number): string {
+	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
+}
 
-	for (const task of state.tasks) {
-		const icon = statusIcon(task.status);
-		const label = `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`;
+function frameOverlayLines(lines: string[], innerWidth: number, theme: Theme): string[] {
+	const border = (text: string) => theme.fg("borderAccent", text);
+	const top = border(`╭${"─".repeat(innerWidth)}╮`);
+	const bottom = border(`╰${"─".repeat(innerWidth)}╯`);
+	const framed = lines.map((line) => {
+		const truncated = truncateToWidth(line, innerWidth);
+		return border("│") + padAnsi(truncated, innerWidth) + border("│");
+	});
+	return [top, ...framed, bottom];
+}
 
-		let timePart = "";
-		if (task.status === "running" || task.status === "retrying") {
-			timePart = task.startTime ? ` (${formatElapsed(now - task.startTime)})` : "";
-		} else if (task.endTime && task.startTime) {
-			timePart = ` (${formatElapsed(task.endTime - task.startTime)})`;
+type TaskOverlayRow = {
+	taskIndex: number;
+	kind: "header" | "detail";
+	text: string;
+};
+
+class PrdLoopOverlayComponent {
+	private selectedIndex = 0;
+	private expanded = new Set<number>();
+	private scrollOffset = 0;
+
+	constructor(
+		private tui: TUI,
+		private theme: Theme,
+		private state: LoopState,
+		private prdTitle: string,
+		private onAbort: () => void,
+		private onPause: () => void,
+		private onOpenViewer: () => void,
+		private requestRender: () => void,
+	) {
+		if (state.tasks.length > 0) this.expanded.add(0);
+	}
+
+	focusTask(index: number): void {
+		if (this.state.tasks.length === 0) return;
+		this.selectedIndex = Math.max(0, Math.min(index, this.state.tasks.length - 1));
+		this.expanded.add(this.selectedIndex);
+	}
+
+	getSelectedTaskIndex(): number {
+		return this.selectedIndex;
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.onAbort();
+			return;
+		}
+		if (matchesKey(data, Key.ctrl("c"))) {
+			this.onPause();
+			return;
+		}
+		if (data === "o" || data === "O") {
+			this.onOpenViewer();
+			return;
 		}
 
-		let retryPart = "";
-		if (task.status === "retrying") {
-			retryPart = ` [attempt ${state.currentRetry + 1}/${state.maxRetries + 1}]`;
+		if (this.state.tasks.length === 0) return;
+
+		if (matchesKey(data, Key.up)) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.requestRender();
+			return;
 		}
 
-		lines.push(`│ ${icon} ${label}${timePart}${retryPart}`);
+		if (matchesKey(data, Key.down)) {
+			this.selectedIndex = Math.min(this.state.tasks.length - 1, this.selectedIndex + 1);
+			this.requestRender();
+			return;
+		}
 
-		// Show current subagent activity for running tasks
-		if ((task.status === "running" || task.status === "retrying") && task.currentActivity) {
-			const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
-			lines.push(`│   └─ ${turnInfo} ${task.currentActivity}`);
+		if (matchesKey(data, Key.pageUp)) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 5);
+			this.requestRender();
+			return;
+		}
+
+		if (matchesKey(data, Key.pageDown)) {
+			this.selectedIndex = Math.min(this.state.tasks.length - 1, this.selectedIndex + 5);
+			this.requestRender();
+			return;
+		}
+
+		if (matchesKey(data, Key.enter) || matchesKey(data, Key.space) || matchesKey(data, Key.right)) {
+			if (this.expanded.has(this.selectedIndex)) this.expanded.delete(this.selectedIndex);
+			else this.expanded.add(this.selectedIndex);
+			this.requestRender();
+			return;
+		}
+
+		if (matchesKey(data, Key.left)) {
+			this.expanded.delete(this.selectedIndex);
+			this.requestRender();
 		}
 	}
 
-	lines.push("│");
+	render(width: number): string[] {
+		const innerWidth = Math.max(20, width - 2);
+		const maxHeight = Math.max(12, Math.floor((this.tui.terminal.rows || 24) * 0.85));
+		const headerLines = this.buildHeader(innerWidth);
+		const rows = this.buildTaskRows(innerWidth);
+		const footerHeight = 2;
+		const contentHeight = Math.max(3, maxHeight - headerLines.length - footerHeight - 2);
 
-	const currentTask = state.tasks[state.currentTaskIndex];
-	const retryStr = currentTask
-		? `Retry: ${currentTask.retries}/${state.maxRetries}`
-		: `Retry: 0/${state.maxRetries}`;
-	const costStr = `Cost: $${state.totalCost.toFixed(2)}`;
-	const elapsedStr = `Elapsed: ${formatElapsed(now - state.startTime)}`;
+		const selectedRowIndex = rows.findIndex((row) => row.taskIndex === this.selectedIndex && row.kind === "header");
+		if (selectedRowIndex !== -1) {
+			if (selectedRowIndex < this.scrollOffset) this.scrollOffset = selectedRowIndex;
+			if (selectedRowIndex >= this.scrollOffset + contentHeight) {
+				this.scrollOffset = selectedRowIndex - contentHeight + 1;
+			}
+		}
 
-	lines.push(`│ ${retryStr} | ${costStr} | ${elapsedStr}`);
-	lines.push(`│ Enter: view output | Ctrl+C: pause`);
-	lines.push(`└${"─".repeat(54)}┘`);
+		const maxScroll = Math.max(0, rows.length - contentHeight);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
 
-	return lines.map((line) => truncateToWidth(line, width));
+		const visibleRows = rows
+			.slice(this.scrollOffset, this.scrollOffset + contentHeight)
+			.map((row) => truncateToWidth(row.text, innerWidth));
+		while (visibleRows.length < contentHeight) visibleRows.push("");
+
+		const footerLines = this.buildFooter(innerWidth, rows.length, contentHeight);
+		return frameOverlayLines([...headerLines, ...visibleRows, ...footerLines], innerWidth, this.theme)
+			.map((line) => truncateToWidth(line, width));
+	}
+
+	invalidate(): void {}
+
+	private buildHeader(width: number): string[] {
+		const now = Date.now();
+		const total = this.state.tasks.length;
+		const completed = this.state.tasks.filter((task) => task.status === "completed").length;
+		const running = this.state.tasks.filter((task) => task.status === "running" || task.status === "retrying").length;
+		const failed = this.state.tasks.filter((task) => task.status === "failed").length;
+		const currentTask = this.state.tasks[this.state.currentTaskIndex];
+		const currentLabel = currentTask
+			? `Current: ${currentTask.sequenceLabel} ${extractShortTitle(currentTask.title)}`
+			: "Current: —";
+
+		return [
+			truncateToWidth(
+				this.theme.fg("accent", this.theme.bold("PRD Loop")) + this.theme.fg("muted", ` • ${this.prdTitle}`),
+				width,
+			),
+			truncateToWidth(
+				this.theme.fg("muted", `${completed}/${total} done • ${running} active • ${failed} failed • max retries ${this.state.maxRetries}`),
+				width,
+			),
+			truncateToWidth(
+				this.theme.fg("dim", `${currentLabel} • $${this.state.totalCost.toFixed(2)} • ${formatElapsed(now - this.state.startTime)}`),
+				width,
+			),
+			"",
+		];
+	}
+
+	private buildFooter(width: number, totalRows: number, contentHeight: number): string[] {
+		const end = Math.min(totalRows, this.scrollOffset + contentHeight);
+		const hint = this.theme.fg("dim", "↑↓ select • enter expand • o output • ← collapse • ctrl+c pause • esc abort");
+		const scroll = totalRows > contentHeight
+			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
+			: "";
+		return ["", truncateToWidth(hint + scroll, width)];
+	}
+
+	private buildTaskRows(width: number): TaskOverlayRow[] {
+		if (this.state.tasks.length === 0) {
+			return [{ taskIndex: 0, kind: "detail", text: this.theme.fg("dim", "No tasks to display.") }];
+		}
+
+		const rows: TaskOverlayRow[] = [];
+		const now = Date.now();
+
+		for (let i = 0; i < this.state.tasks.length; i++) {
+			const task = this.state.tasks[i]!;
+			const isSelected = i === this.selectedIndex;
+			const isExpanded = this.expanded.has(i);
+			const prefix = isSelected ? this.theme.fg("accent", "▶") : " ";
+			const disclosure = this.theme.fg(isSelected ? "accent" : "dim", isExpanded ? "▾" : "▸");
+			const icon = this.theme.fg(taskStatusColor(task.status), statusIcon(task.status));
+			const titleText = `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`;
+			const title = isSelected
+				? this.theme.fg("accent", this.theme.bold(titleText))
+				: this.theme.fg("text", titleText);
+
+			const meta: string[] = [];
+			if (task.startTime) {
+				const end = task.endTime ?? now;
+				meta.push(formatElapsed(end - task.startTime));
+			}
+			if (task.cost > 0) meta.push(`$${task.cost.toFixed(2)}`);
+			if (task.retries > 0) meta.push(`${task.retries} retry${task.retries === 1 ? "" : "s"}`);
+			const metaText = meta.length > 0 ? this.theme.fg("dim", ` • ${meta.join(" • ")}`) : "";
+
+			rows.push({
+				taskIndex: i,
+				kind: "header",
+				text: truncateToWidth(`${prefix} ${disclosure} ${icon} ${title}${metaText}`, width),
+			});
+
+			if (!isExpanded) continue;
+
+			const attemptText = task.status === "retrying"
+				? ` • attempt ${task.retries + 1}/${this.state.maxRetries + 1}`
+				: "";
+			rows.push({
+				taskIndex: i,
+				kind: "detail",
+				text: truncateToWidth(this.theme.fg("dim", `    Status: ${task.status}${attemptText}`), width),
+			});
+
+			if ((task.status === "running" || task.status === "retrying") && task.currentActivity) {
+				const turnText = task.currentTurn > 0 ? ` [T${task.currentTurn}]` : "";
+				rows.push({
+					taskIndex: i,
+					kind: "detail",
+					text: truncateToWidth(this.theme.fg("muted", `    Activity:${turnText} ${task.currentActivity}`), width),
+				});
+			}
+
+			if (task.summary) {
+				for (const line of wrapTextWithAnsi(this.theme.fg("muted", `    Summary: ${task.summary}`), width)) {
+					rows.push({ taskIndex: i, kind: "detail", text: truncateToWidth(line, width) });
+				}
+			}
+
+			if (task.errors.length > 0) {
+				rows.push({
+					taskIndex: i,
+					kind: "detail",
+					text: truncateToWidth(this.theme.fg("error", "    Errors:"), width),
+				});
+				for (const error of task.errors) {
+					for (const line of wrapTextWithAnsi(this.theme.fg("error", `      • ${error}`), width)) {
+						rows.push({ taskIndex: i, kind: "detail", text: truncateToWidth(line, width) });
+					}
+				}
+			}
+		}
+
+		return rows;
+	}
 }
 
 /**
@@ -1437,7 +1647,6 @@ class SubagentOutputViewer {
 		}
 		if (matchesKey(data, Key.down)) {
 			this.scrollBy(1);
-			// Re-enable auto-scroll if at bottom
 			const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
 			if (this.scrollOffset >= maxScroll) this.autoScroll = true;
 			return;
@@ -1459,18 +1668,16 @@ class SubagentOutputViewer {
 		const theme = this.theme;
 		const task = this.taskState;
 		const maxHeight = this.getMaxHeight();
-		const headerLines = 3; // title + meta + blank
-		const footerLines = 2; // blank + hints
+		const headerLines = 3;
+		const footerLines = 2;
 		const borderLines = 2;
 		const innerWidth = Math.max(10, width - 2);
 		const contentHeight = Math.max(1, maxHeight - headerLines - footerLines - borderLines);
 
-		// Format output events as lines
 		const eventLines = this.formatEvents(innerWidth);
 		this.totalLines = eventLines.length;
 		this.viewHeight = contentHeight;
 
-		// Auto-scroll to bottom if new events arrived
 		if (this.autoScroll || task.outputEvents.length !== this.prevEventCount) {
 			if (this.autoScroll) {
 				this.scrollOffset = Math.max(0, this.totalLines - contentHeight);
@@ -1482,28 +1689,22 @@ class SubagentOutputViewer {
 		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
 
 		const visibleLines = eventLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
-
 		const lines: string[] = [];
 
-		// Header
 		lines.push(this.buildTitleLine(innerWidth));
 		lines.push(this.buildMetaLine(innerWidth));
 		lines.push("");
 
-		// Content
 		for (const line of visibleLines) {
 			lines.push(truncateToWidth(line, innerWidth));
 		}
-		// Pad to fill
 		while (lines.length < headerLines + contentHeight) {
 			lines.push("");
 		}
 
-		// Footer
 		lines.push("");
 		lines.push(this.buildHintLine(innerWidth));
 
-		// Frame with border
 		const borderColor = (text: string) => theme.fg("borderMuted", text);
 		const top = borderColor(`┌${"─".repeat(innerWidth)}┐`);
 		const bottom = borderColor(`└${"─".repeat(innerWidth)}┘`);
@@ -1548,7 +1749,6 @@ class SubagentOutputViewer {
 						? theme.fg("error", ev.tool ?? "?")
 						: theme.fg("success", ev.tool ?? "?");
 					lines.push(truncateToWidth(`  ${turnLabel} ${icon} ${toolName}`, maxWidth));
-					// Show result preview indented (sanitize tabs — they expand in terminal but visibleWidth counts them as 1)
 					if (ev.result) {
 						const previewLines = ev.result.split("\n").slice(0, 3);
 						for (const pLine of previewLines) {
@@ -1638,13 +1838,6 @@ type PauseAction = "resume" | "release" | "retry" | "skip" | "abort";
 
 /**
  * Show an interactive pause menu after Ctrl+C interrupts a running subagent.
- *
- * Options:
- * - Resume: keep changes on disk, respawn subagent to continue where it left off
- * - Release session: exit the loop, keep changes on disk for manual fixing
- * - Retry task: discard uncommitted changes, retry from scratch
- * - Skip task: discard uncommitted changes, mark as done, continue
- * - Abort loop: stop everything, keep changes on disk
  */
 async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Promise<PauseAction> {
 	const options = [
@@ -1666,7 +1859,7 @@ async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Prom
 		case options[2]: return "retry";
 		case options[3]: return "skip";
 		case options[4]: return "abort";
-		default: return "resume"; // User cancelled select → treat as resume (safest default)
+		default: return "resume";
 	}
 }
 
@@ -1687,7 +1880,6 @@ async function loadPrdCommitterAgent(extensionDir: string): Promise<AgentDefinit
 
 /**
  * Spawn a committer subagent that creates granular conventional commits.
- * Returns the number of commits created, or -1 on failure.
  */
 async function spawnCommitterSubagent(
 	cwd: string,
@@ -1715,7 +1907,6 @@ async function spawnCommitterSubagent(
 		});
 
 		if (result.success) {
-			// Try to extract commitCount from the summary or result
 			const commitCountMatch = result.summary.match(/(\d+)\s*commit/i);
 			const commitCount = commitCountMatch ? parseInt(commitCountMatch[1], 10) : 1;
 			return { success: true, commitCount, cost: result.usage.cost };
@@ -1757,9 +1948,9 @@ async function simpleAutoCommit(
  * Run the orchestrator loop: resolve tasks, spawn subagents, commit, update todos.
  *
  * Features:
- * - Live progress widget via ctx.ui.setWidget()
- * - AbortController for Ctrl+C handling
- * - Periodic timer for elapsed time updates
+ * - Live overlay with task navigation and expandable details
+ * - Output viewer overlay for the currently selected task
+ * - Ctrl+C pauses the current subagent and opens the pause menu
  * - Smart commits via prd-committer subagent
  * - Final summary widget on completion/failure/abort
  */
@@ -1770,13 +1961,8 @@ async function runOrchestratorLoop(
 	prdTag: string,
 	config: LoopConfig,
 ): Promise<void> {
-	// Load the prd-worker agent definition
 	const agent = await loadPrdWorkerAgent(EXTENSION_DIR);
-
-	// Normalize PRD id to include TODO- prefix
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
-
-	// Fetch and resolve tasks
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resolution = resolveTaskOrder(tasks);
 
@@ -1794,13 +1980,11 @@ async function runOrchestratorLoop(
 		);
 	}
 
-	// Handle circular dependency
 	if (resolution.error) {
 		ctx.ui.notify(resolution.error, "error");
 		return;
 	}
 
-	// Handle no open tasks
 	if (resolution.actionable.length === 0) {
 		ctx.ui.notify("All tasks already completed.", "info");
 		if (!isTaskClosed(prd.status)) {
@@ -1809,8 +1993,6 @@ async function runOrchestratorLoop(
 		return;
 	}
 
-	// --- Initialize loop state ---
-	// Show ALL tasks in the widget (sorted by sequence label), pre-marking completed ones
 	const allTasksSorted = [...resolution.allTasks].sort((a, b) => {
 		const aNum = parseFloat(a.sequenceLabel.split("/")[0]) || 999;
 		const bNum = parseFloat(b.sequenceLabel.split("/")[0]) || 999;
@@ -1820,14 +2002,16 @@ async function runOrchestratorLoop(
 
 	const loopState: LoopState = {
 		startTime: Date.now(),
-		tasks: allTasksSorted.map((t) => ({
-			id: t.id,
-			title: t.title,
-			sequenceLabel: t.sequenceLabel,
-			status: isTaskClosed(t.status) ? "completed" as TaskStatus : "pending" as TaskStatus,
+		tasks: allTasksSorted.map((task) => ({
+			id: task.id,
+			title: task.title,
+			sequenceLabel: task.sequenceLabel,
+			status: isTaskClosed(task.status) ? "completed" as TaskStatus : "pending" as TaskStatus,
 			cost: 0,
 			retries: 0,
 			errors: [],
+			summary: undefined,
+			currentActivity: undefined,
 			currentTurn: 0,
 			outputEvents: [],
 		})),
@@ -1839,52 +2023,51 @@ async function runOrchestratorLoop(
 	};
 
 	const prdTitle = prd.title;
-
-	// --- Set up live widget ---
-	let viewerOpen = false;
-
-	const updateWidget = () => {
-		// Skip widget updates while the overlay viewer is open — widget line-count
-		// changes cause a TUI re-layout that shifts the center-anchored overlay,
-		// leaving ghost hint-lines on screen (overlays don't clear the background).
-		if (viewerOpen) return;
-		ctx.ui.setWidget("prd-loop", buildProgressWidget(loopState, prdTitle));
-	};
-
-	updateWidget();
-
-	// Periodic timer to update elapsed time display (mutable: paused/restarted on Ctrl+C menu)
-	let widgetTimer = setInterval(updateWidget, 1000);
-
-	// --- Set up abort controller for Ctrl+C (pause & menu) ---
 	let currentAbortController = new AbortController();
 	let aborted = false;
 	let pauseRequested = false;
+	let viewerOpen = false;
+	let overlayClosed = false;
+	let overlayDone: ((reason: "finished" | "user-abort") => void) | undefined;
+	let overlayRequestRender = () => {};
+	let overlayComponent: PrdLoopOverlayComponent | undefined;
+	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 
-	/** Open the subagent output viewer overlay for the currently running task. */
+	const requestOverlayRender = () => {
+		if (!overlayClosed && !viewerOpen) overlayRequestRender();
+	};
+	const closeOverlay = (reason: "finished" | "user-abort") => {
+		if (overlayClosed) return;
+		overlayClosed = true;
+		overlayDone?.(reason);
+	};
+	const updateStatus = () => {
+		const currentTask = loopState.tasks[loopState.currentTaskIndex];
+		const statusText = currentTask
+			? `Ralph: ${currentTask.sequenceLabel} ${extractShortTitle(currentTask.title)}`
+			: "Ralph running";
+		ctx.ui.setStatus("prd-loop", statusText);
+	};
+
 	const openOutputViewer = async () => {
 		if (viewerOpen) return;
-		// Find the currently running task
-		const runningTask = loopState.tasks.find(
-			(t) => t.status === "running" || t.status === "retrying",
-		);
-		if (!runningTask) return;
+		const selectedTaskIndex = overlayComponent?.getSelectedTaskIndex() ?? loopState.currentTaskIndex;
+		const selectedTask = loopState.tasks[selectedTaskIndex] ?? loopState.tasks[loopState.currentTaskIndex];
+		if (!selectedTask) return;
 
 		viewerOpen = true;
 		try {
 			await ctx.ui.custom<void>(
 				(tui, theme, _kb, done) => {
-					const viewer = new SubagentOutputViewer(tui, theme, runningTask, (reason) => {
+					const refreshTimer = setInterval(() => tui.requestRender(), 500);
+					const viewer = new SubagentOutputViewer(tui, theme, selectedTask, (reason) => {
 						clearInterval(refreshTimer);
 						if (reason === "pause") {
-							// Trigger pause flow after overlay closes
 							pauseRequested = true;
 							currentAbortController.abort();
 						}
 						done();
 					});
-					// Refresh overlay every 500ms for live updates
-					const refreshTimer = setInterval(() => tui.requestRender(), 500);
 					return viewer;
 				},
 				{
@@ -1894,358 +2077,406 @@ async function runOrchestratorLoop(
 			);
 		} finally {
 			viewerOpen = false;
-			// Immediately sync the widget with latest state now that overlay is gone
-			ctx.ui.setWidget("prd-loop", buildProgressWidget(loopState, prdTitle));
+			requestOverlayRender();
 		}
 	};
 
-	const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
-		// Don't intercept keys when the viewer overlay is active
-		if (viewerOpen) return undefined;
+	ctx.ui.setWidget("prd-loop", undefined);
+	updateStatus();
 
-		// Ctrl+C → pause the loop and show menu
-		if (data === "\x03") {
-			pauseRequested = true;
-			currentAbortController.abort();
-			return { consume: true };
-		}
-		// Enter → open the subagent output viewer
-		if (matchesKey(data, Key.enter)) {
-			void openOutputViewer();
-			return { consume: true };
-		}
-		return undefined;
-	});
+	const overlayPromise = ctx.ui.custom<"finished" | "user-abort" | undefined>(
+		(tui, theme, _keybindings, done) => {
+			overlayDone = done;
+			overlayRequestRender = () => tui.requestRender();
+			overlayComponent = new PrdLoopOverlayComponent(
+				tui,
+				theme,
+				loopState,
+				prdTitle,
+				() => {
+					if (!aborted) {
+						aborted = true;
+						currentAbortController.abort();
+					}
+					if (widgetTimer) clearInterval(widgetTimer);
+					closeOverlay("user-abort");
+				},
+				() => {
+					pauseRequested = true;
+					currentAbortController.abort();
+				},
+				() => {
+					void openOutputViewer();
+				},
+				() => {
+					if (!overlayClosed && !viewerOpen) tui.requestRender();
+				},
+			);
+			return overlayComponent;
+		},
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "right-center",
+				width: "55%",
+				minWidth: 72,
+				maxHeight: "88%",
+				margin: 1,
+			},
+		},
+	);
 
-	// --- Helper to show summary and clean up ---
-	const cleanup = (outcome: "completed" | "failed" | "aborted") => {
-		clearInterval(widgetTimer);
-		unsubscribeInput();
-		ctx.ui.setWidget("prd-loop", buildSummaryWidget(loopState, prdTitle, outcome));
+	type LoopRunResult = {
+		outcome: "completed" | "failed" | "aborted";
+		notification?: { message: string; level: "info" | "warning" | "error" };
+		unexpectedError?: unknown;
 	};
 
-	try {
-		for (let i = 0; i < resolution.actionable.length; i++) {
-			if (aborted) break;
+	const runPromise = (async (): Promise<LoopRunResult> => {
+		widgetTimer = setInterval(requestOverlayRender, 1000);
 
-			const task = resolution.actionable[i];
-			const taskStateIndex = loopState.tasks.findIndex((ts) => ts.id === task.id);
-			const taskState = loopState.tasks[taskStateIndex];
-			loopState.currentTaskIndex = taskStateIndex;
-			loopState.currentRetry = 0;
-
-			// Mark task as running
-			taskState.status = "running";
-			taskState.startTime = Date.now();
-			taskState.currentActivity = undefined;
-			taskState.currentTurn = 0;
-			taskState.outputEvents = [];
-			updateWidget();
-
-			// Build the initial subagent prompt
-			const initialPrompt = buildTaskPrompt(task, prdId);
-
-			// Retry loop: 1 initial attempt + config.retryFixes retries
-			let retriesRemaining = config.retryFixes;
-			let attempt = 1;
-			let result: SubagentResult;
-			let currentPrompt = initialPrompt;
-			let taskSucceeded = false;
-
-			// eslint-disable-next-line no-constant-condition
-			while (true) {
+		try {
+			for (let i = 0; i < resolution.actionable.length; i++) {
 				if (aborted) break;
 
-				// Spawn the subagent with activity streaming
-				result = await spawnSubagent({
-					taskPrompt: currentPrompt,
-					model: config.model,
-					thinkingLevel: config.thinkingLevel,
-					cwd: ctx.cwd,
-					agent,
-					signal: currentAbortController.signal,
-					onActivity: (activity) => {
-						taskState.currentTurn = activity.turn;
+				const task = resolution.actionable[i]!;
+				const taskStateIndex = loopState.tasks.findIndex((ts) => ts.id === task.id);
+				if (taskStateIndex === -1) continue;
+				const taskState = loopState.tasks[taskStateIndex]!;
+				loopState.currentTaskIndex = taskStateIndex;
+				loopState.currentRetry = 0;
+				overlayComponent?.focusTask(taskStateIndex);
+				updateStatus();
 
-						// Update widget one-liner
-						switch (activity.type) {
-							case "tool_start":
-								taskState.currentActivity = `▶ ${activity.toolName}${activity.argsSummary ? ` ${activity.argsSummary}` : ""}`;
-								break;
-							case "tool_end":
-								taskState.currentActivity = `${activity.toolSuccess ? "✓" : "✗"} ${activity.toolName}`;
-								break;
-							case "text_delta":
-								taskState.currentActivity = "💬 writing response…";
-								break;
-							case "thinking":
-								taskState.currentActivity = "🧠 thinking…";
-								break;
-						}
+				taskState.status = "running";
+				taskState.startTime = Date.now();
+				taskState.endTime = undefined;
+				taskState.errors = [];
+				taskState.summary = undefined;
+				taskState.currentActivity = undefined;
+				taskState.currentTurn = 0;
+				taskState.outputEvents = [];
+				requestOverlayRender();
 
-						// Collect output events for the viewer overlay
-						const now = Date.now();
-						switch (activity.type) {
-							case "tool_start":
-								taskState.outputEvents.push({
-									time: now,
-									kind: "tool_start",
-									tool: activity.toolName,
-									args: activity.argsSummary,
-									turn: activity.turn,
-								});
-								break;
-							case "tool_end":
-								taskState.outputEvents.push({
-									time: now,
-									kind: "tool_end",
-									tool: activity.toolName,
-									error: !activity.toolSuccess,
-									result: activity.resultPreview,
-									turn: activity.turn,
-								});
-								break;
-							case "text_delta":
-								// Deduplicate consecutive text events
-								if (taskState.outputEvents.at(-1)?.kind !== "text") {
-									taskState.outputEvents.push({
-										time: now,
-										kind: "text",
-										turn: activity.turn,
-									});
-								}
-								break;
-							case "thinking":
-								// Deduplicate consecutive thinking events
-								if (taskState.outputEvents.at(-1)?.kind !== "thinking") {
-									taskState.outputEvents.push({
-										time: now,
-										kind: "thinking",
-										turn: activity.turn,
-									});
-								}
-								break;
-						}
+				const initialPrompt = buildTaskPrompt(task, prdId);
+				let retriesRemaining = config.retryFixes;
+				let attempt = 1;
+				let result: SubagentResult | undefined;
+				let currentPrompt = initialPrompt;
+				let taskSucceeded = false;
 
-						updateWidget();
-					},
-				});
+				while (true) {
+					if (aborted) break;
 
-				// Accumulate cost
-				taskState.cost += result.usage.cost;
-				loopState.totalCost += result.usage.cost;
+					result = await spawnSubagent({
+						taskPrompt: currentPrompt,
+						model: config.model,
+						thinkingLevel: config.thinkingLevel,
+						cwd: ctx.cwd,
+						agent,
+						signal: currentAbortController.signal,
+						onActivity: (activity) => {
+							taskState.currentTurn = activity.turn;
 
-				// Check if pause was requested (Ctrl+C)
-				if (pauseRequested) {
-					pauseRequested = false;
-					clearInterval(widgetTimer); // Pause widget updates during menu
-					const pauseAction = await showPauseMenu(ctx, task);
-
-					switch (pauseAction) {
-						case "resume":
-							// Keep changes on disk, respawn subagent to continue
-							currentAbortController = new AbortController();
-							currentPrompt = buildContinuePrompt(task, prdId);
-							taskState.status = "running";
-							taskState.currentActivity = "▶ resuming…";
-							// Restart widget timer
-							widgetTimer = setInterval(updateWidget, 1000);
-							updateWidget();
-							continue; // Restart while loop → spawns new subagent
-
-						case "release":
-							// Exit loop, keep changes on disk for manual fixing
-							cleanup("aborted");
-							ctx.ui.notify(
-								"⏸️ Session released. Uncommitted changes left on disk.\n" +
-								"Fix issues and re-run /prd-loop to continue from where you left off.",
-								"info",
-							);
-							return;
-
-						case "retry":
-							// Discard uncommitted changes and retry task from scratch
-							await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-							await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
-							currentAbortController = new AbortController();
-							currentPrompt = initialPrompt;
-							retriesRemaining = config.retryFixes;
-							attempt = 1;
-							taskState.retries = 0;
-							taskState.status = "running";
-							taskState.currentActivity = undefined;
-							taskState.currentTurn = 0;
-							taskState.outputEvents = [];
-							loopState.currentRetry = 0;
-							// Restart widget timer
-							widgetTimer = setInterval(updateWidget, 1000);
-							updateWidget();
-							continue; // Restart while loop
-
-						case "skip": {
-							// Discard uncommitted changes, mark task as done, continue
-							await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-							await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
-							currentAbortController = new AbortController();
-							taskState.status = "completed";
-							taskState.endTime = Date.now();
-							taskState.currentActivity = undefined;
-							await updateTodoFileStatus(ctx.cwd, task.id, "closed");
-							task.status = "closed";
-							// Update PRD Task Index
-							try {
-								const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-								const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-								await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
-							} catch {
-								// Non-critical
+							switch (activity.type) {
+								case "tool_start":
+									taskState.currentActivity = `▶ ${activity.toolName}${activity.argsSummary ? ` ${activity.argsSummary}` : ""}`;
+									break;
+								case "tool_end":
+									taskState.currentActivity = `${activity.toolSuccess ? "✓" : "✗"} ${activity.toolName}`;
+									break;
+								case "text_delta":
+									taskState.currentActivity = "💬 writing response…";
+									break;
+								case "thinking":
+									taskState.currentActivity = "🧠 thinking…";
+									break;
 							}
-							// Restart widget timer
-							widgetTimer = setInterval(updateWidget, 1000);
-							updateWidget();
-							taskSucceeded = false; // Skip post-task actions (already handled)
-							break; // Break switch → will break while loop below
+
+							const now = Date.now();
+							switch (activity.type) {
+								case "tool_start":
+									taskState.outputEvents.push({
+										time: now,
+										kind: "tool_start",
+										tool: activity.toolName,
+										args: activity.argsSummary,
+										turn: activity.turn,
+									});
+									break;
+								case "tool_end":
+									taskState.outputEvents.push({
+										time: now,
+										kind: "tool_end",
+										tool: activity.toolName,
+										error: !activity.toolSuccess,
+										result: activity.resultPreview,
+										turn: activity.turn,
+									});
+									break;
+								case "text_delta":
+									if (taskState.outputEvents.at(-1)?.kind !== "text") {
+										taskState.outputEvents.push({
+											time: now,
+											kind: "text",
+											turn: activity.turn,
+										});
+									}
+									break;
+								case "thinking":
+									if (taskState.outputEvents.at(-1)?.kind !== "thinking") {
+										taskState.outputEvents.push({
+											time: now,
+											kind: "thinking",
+											turn: activity.turn,
+										});
+									}
+									break;
+							}
+
+							requestOverlayRender();
+						},
+					});
+
+					taskState.cost += result.usage.cost;
+					loopState.totalCost += result.usage.cost;
+					taskState.summary = result.summary;
+					requestOverlayRender();
+
+					if (pauseRequested) {
+						pauseRequested = false;
+						if (widgetTimer) clearInterval(widgetTimer);
+						const pauseAction = await showPauseMenu(ctx, task);
+
+						switch (pauseAction) {
+							case "resume":
+								currentAbortController = new AbortController();
+								currentPrompt = buildContinuePrompt(task, prdId);
+								taskState.status = "running";
+								taskState.currentActivity = "▶ resuming…";
+								widgetTimer = setInterval(requestOverlayRender, 1000);
+								requestOverlayRender();
+								continue;
+
+							case "release":
+								return {
+									outcome: "aborted",
+									notification: {
+										message:
+											"⏸️ Session released. Uncommitted changes left on disk.\n" +
+										"Fix issues and re-run /prd-loop to continue from where you left off.",
+										level: "info",
+									},
+								};
+
+							case "retry":
+								await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
+								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+								currentAbortController = new AbortController();
+								currentPrompt = initialPrompt;
+								retriesRemaining = config.retryFixes;
+								attempt = 1;
+								taskState.retries = 0;
+								taskState.errors = [];
+								taskState.summary = undefined;
+								taskState.status = "running";
+								taskState.currentActivity = undefined;
+								taskState.currentTurn = 0;
+								taskState.outputEvents = [];
+								taskState.endTime = undefined;
+								loopState.currentRetry = 0;
+								widgetTimer = setInterval(requestOverlayRender, 1000);
+								requestOverlayRender();
+								continue;
+
+							case "skip": {
+								await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
+								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+								currentAbortController = new AbortController();
+								taskState.status = "completed";
+								taskState.endTime = Date.now();
+								taskState.currentActivity = undefined;
+								taskState.summary = "Skipped after manual pause.";
+								taskState.errors = [];
+								await updateTodoFileStatus(ctx.cwd, task.id, "closed");
+								task.status = "closed";
+								try {
+									const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
+									const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
+									await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
+								} catch {
+									// Non-critical
+								}
+								widgetTimer = setInterval(requestOverlayRender, 1000);
+								requestOverlayRender();
+								taskSucceeded = false;
+								break;
+							}
+
+							case "abort":
+								aborted = true;
+								taskState.status = "aborted";
+								taskState.summary = "Task execution was cancelled.";
+								taskState.endTime = Date.now();
+								break;
 						}
 
-						case "abort":
-							aborted = true;
-							taskState.status = "aborted";
-							taskState.endTime = Date.now();
-							break; // Break switch → will break while loop below
+						if (aborted) break;
+						if (taskState.status === "completed") break;
+						continue;
 					}
 
-					if (aborted) break; // Break while loop
-					if (taskState.status === "completed") break; // Break while loop (skip case)
-					continue; // Safety fallback
+					if (aborted) {
+						taskState.status = "aborted";
+						taskState.summary = "Task execution was cancelled.";
+						taskState.endTime = Date.now();
+						break;
+					}
+
+					if (result.success) {
+						taskSucceeded = true;
+						taskState.errors = [];
+						break;
+					}
+
+					taskState.errors = result.errors;
+					if (retriesRemaining <= 0) {
+						taskState.status = "failed";
+						taskState.endTime = Date.now();
+						requestOverlayRender();
+						return {
+							outcome: "failed",
+							notification: {
+								message: `❌ Task failed: ${task.title} (after ${attempt} attempt${attempt > 1 ? "s" : ""})
+Errors: ${result.errors.join("; ")}`,
+								level: "error",
+							},
+						};
+					}
+
+					retriesRemaining--;
+					attempt++;
+					taskState.retries++;
+					taskState.status = "retrying";
+					loopState.currentRetry = attempt - 1;
+					currentPrompt = buildRetryPrompt(task, prdId, result.errors);
+					requestOverlayRender();
 				}
 
-				// Success — break out of retry loop
-				if (result.success) {
-					taskSucceeded = true;
+				if (aborted) {
+					if (taskState.status !== "aborted") {
+						taskState.status = "aborted";
+						taskState.summary = "Task execution was cancelled.";
+						taskState.endTime = Date.now();
+					}
 					break;
 				}
 
-				// Failure — check if retries are available
-				taskState.errors = result.errors;
-				if (retriesRemaining <= 0) {
-					// No retries left — mark failed and stop the loop
-					taskState.status = "failed";
-					taskState.endTime = Date.now();
-					updateWidget();
+				if (!taskSucceeded) continue;
 
-					cleanup("failed");
-					ctx.ui.notify(
-						`❌ Task failed: ${task.title} (after ${attempt} attempt${attempt > 1 ? "s" : ""})\nErrors: ${result.errors.join("; ")}`,
-						"error",
+				taskState.status = "completed";
+				taskState.summary = result?.summary;
+				taskState.endTime = Date.now();
+				taskState.currentActivity = undefined;
+				requestOverlayRender();
+
+				const shortTitle = extractShortTitle(task.title);
+
+				if (config.smartCommits) {
+					const committerResult = await spawnCommitterSubagent(
+						ctx.cwd,
+						prdTag,
+						config.model,
+						config.thinkingLevel,
+						currentAbortController.signal,
 					);
-					return;
+
+					loopState.totalCost += committerResult.cost;
+					taskState.cost += committerResult.cost;
+					requestOverlayRender();
+
+					if (aborted) {
+						taskState.status = "aborted";
+						taskState.summary = "Task execution was cancelled during commit.";
+						if (!taskState.endTime) taskState.endTime = Date.now();
+						break;
+					}
+
+					if (committerResult.success) {
+						loopState.totalCommits += committerResult.commitCount;
+					} else {
+						const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
+						if (fallback.committed) {
+							loopState.totalCommits++;
+						} else if (fallback.error) {
+							ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
+						}
+					}
+				} else {
+					const commitResult = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
+					if (commitResult.committed) {
+						loopState.totalCommits++;
+					} else if (commitResult.error) {
+						ctx.ui.notify(`⚠️ Git commit warning: ${commitResult.error}`, "warning");
+					}
 				}
 
-				// Retry: build augmented prompt with error context
-				retriesRemaining--;
-				attempt++;
-				taskState.retries++;
-				taskState.status = "retrying";
-				loopState.currentRetry = attempt - 1;
-				updateWidget();
+				if (aborted) {
+					taskState.status = "aborted";
+					taskState.summary = "Task execution was cancelled after changes were created.";
+					if (!taskState.endTime) taskState.endTime = Date.now();
+					break;
+				}
 
-				currentPrompt = buildRetryPrompt(task, prdId, result.errors);
+				await updateTodoFileStatus(ctx.cwd, task.id, "closed");
+				task.status = "closed";
+
+				try {
+					const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
+					const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
+					await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
+				} catch (err) {
+					ctx.ui.notify(
+						`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
+						"warning",
+					);
+				}
+
+				requestOverlayRender();
 			}
 
 			if (aborted) {
-				if (taskState.status !== "aborted") {
-					taskState.status = "aborted";
-					taskState.endTime = Date.now();
-				}
-				break;
+				return {
+					outcome: "aborted",
+					notification: {
+						message: "⚠️ Loop aborted. Uncommitted code left on disk.",
+						level: "warning",
+					},
+				};
 			}
 
-			if (!taskSucceeded) continue;
-
-			// --- Post-task actions on success ---
-			taskState.status = "completed";
-			taskState.endTime = Date.now();
-			taskState.currentActivity = undefined;
-			updateWidget();
-
-			// 1. Git commit (smart or simple)
-			const shortTitle = extractShortTitle(task.title);
-
-			if (config.smartCommits) {
-				// Spawn prd-committer subagent
-				const committerResult = await spawnCommitterSubagent(
-					ctx.cwd,
-					prdTag,
-					config.model,
-					config.thinkingLevel,
-					currentAbortController.signal,
-				);
-
-				loopState.totalCost += committerResult.cost;
-				taskState.cost += committerResult.cost;
-
-				if (committerResult.success) {
-					loopState.totalCommits += committerResult.commitCount;
-				} else {
-					// Fallback to simple auto-commit
-					const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-					if (fallback.committed) {
-						loopState.totalCommits++;
-					} else if (fallback.error) {
-						ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
-					}
-				}
-			} else {
-				// Simple auto-commit
-				const commitResult = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-				if (commitResult.committed) {
-					loopState.totalCommits++;
-				} else if (commitResult.error) {
-					ctx.ui.notify(`⚠️ Git commit warning: ${commitResult.error}`, "warning");
-				}
-			}
-
-			// 2. Update task todo status to closed
-			await updateTodoFileStatus(ctx.cwd, task.id, "closed");
-
-			// 3. Update the task's in-memory status for subsequent index updates
-			task.status = "closed";
-
-			// 4. Update PRD Task Index
-			try {
-				const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-				const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-				await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
-			} catch (err) {
-				ctx.ui.notify(
-					`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
-					"warning",
-				);
-			}
-
-			updateWidget();
+			await updateTodoFileStatus(ctx.cwd, prdId, "closed");
+			return {
+				outcome: "completed",
+				notification: {
+					message: `🎉 PRD Loop complete! All ${resolution.actionable.length} task(s) executed successfully.`,
+					level: "info",
+				},
+			};
+		} catch (err) {
+			return { outcome: "failed", unexpectedError: err };
+		} finally {
+			if (widgetTimer) clearInterval(widgetTimer);
+			closeOverlay("finished");
 		}
+	})();
 
-		// --- Loop finished ---
-		if (aborted) {
-			cleanup("aborted");
-			ctx.ui.notify("⚠️ Loop aborted. Uncommitted code left on disk.", "warning");
-			return;
-		}
+	const [result] = await Promise.all([runPromise, overlayPromise]);
 
-		// All tasks complete — close PRD todo
-		await updateTodoFileStatus(ctx.cwd, prdId, "closed");
-
-		cleanup("completed");
-		ctx.ui.notify(
-			`🎉 PRD Loop complete! All ${resolution.actionable.length} task(s) executed successfully.`,
-			"info",
-		);
-	} catch (err) {
-		// Unexpected error — clean up
-		cleanup("failed");
-		throw err;
-	}
+	ctx.ui.setStatus("prd-loop", undefined);
+	ctx.ui.setWidget("prd-loop", buildSummaryWidget(loopState, prdTitle, result.outcome));
+	if (result.notification) ctx.ui.notify(result.notification.message, result.notification.level);
+	if (result.unexpectedError) throw result.unexpectedError;
 }
 
 // --- Main command handler ---
