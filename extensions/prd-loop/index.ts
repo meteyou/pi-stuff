@@ -1335,6 +1335,8 @@ class PrdLoopOverlayComponent {
 	private expanded = new Set<number>();
 	private scrollOffset = 0;
 
+	private confirmingAbort = false;
+
 	constructor(
 		private tui: TUI,
 		private theme: Theme,
@@ -1360,7 +1362,19 @@ class PrdLoopOverlayComponent {
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape)) {
-			this.onAbort();
+			if (this.confirmingAbort) {
+				this.confirmingAbort = false;
+				this.onAbort();
+				return;
+			}
+			this.confirmingAbort = true;
+			this.requestRender();
+			return;
+		}
+		if (this.confirmingAbort) {
+			// Any other key cancels the abort confirmation
+			this.confirmingAbort = false;
+			this.requestRender();
 			return;
 		}
 		if (matchesKey(data, Key.ctrl("c"))) {
@@ -1472,7 +1486,9 @@ class PrdLoopOverlayComponent {
 
 	private buildFooter(width: number, totalRows: number, contentHeight: number): string[] {
 		const end = Math.min(totalRows, this.scrollOffset + contentHeight);
-		const hint = this.theme.fg("dim", "↑↓ select • enter expand • o output • ← collapse • ctrl+c pause • esc abort");
+		const hint = this.confirmingAbort
+			? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
+			: this.theme.fg("dim", "↑↓ select • enter expand • o output • ← collapse • ctrl+c pause • esc abort");
 		const scroll = totalRows > contentHeight
 			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
 			: "";
