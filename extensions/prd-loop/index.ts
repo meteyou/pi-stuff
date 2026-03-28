@@ -1620,67 +1620,17 @@ function buildSummaryWidget(
 	return lines.map((line) => truncateToWidth(line, width));
 }
 
-// --- Summary Overlay (dismissible with ESC) ---
-
-class SummaryOverlayComponent {
-	private tui: TUI;
-	private theme: Theme;
-	private summaryLines: string[];
-	private onClose: () => void;
-
-	constructor(tui: TUI, theme: Theme, summaryLines: string[], onClose: () => void) {
-		this.tui = tui;
-		this.theme = theme;
-		this.summaryLines = summaryLines;
-		this.onClose = onClose;
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter) || matchesKey(data, Key.ctrl("c"))) {
-			this.onClose();
-		}
-	}
-
-	render(width: number): string[] {
-		const innerWidth = Math.max(20, width - 2);
-		const lines: string[] = [];
-
-		for (const line of this.summaryLines) {
-			lines.push(truncateToWidth(line, innerWidth));
-		}
-
-		lines.push("");
-		lines.push(this.theme.fg("dim", "Press Esc to close"));
-
-		return frameOverlayLines(lines, innerWidth, this.theme)
-			.map((line) => truncateToWidth(line, width));
-	}
-
-	invalidate(): void {}
-}
-
-async function showSummaryOverlay(
+/**
+ * Print the final summary as static text to the session output.
+ */
+function printSummary(
 	ctx: ExtensionCommandContext,
 	state: LoopState,
 	prdTitle: string,
 	outcome: "completed" | "failed" | "aborted",
-): Promise<void> {
-	const summaryLines = buildSummaryWidget(state, prdTitle, outcome);
-
-	await ctx.ui.custom<void>(
-		(tui, theme, _kb, done) => {
-			return new SummaryOverlayComponent(tui, theme, summaryLines, done);
-		},
-		{
-			overlay: true,
-			overlayOptions: {
-				anchor: "center",
-				width: "90%",
-				maxHeight: "60%",
-				margin: 0,
-			},
-		},
-	);
+): void {
+	const lines = buildSummaryWidget(state, prdTitle, outcome);
+	ctx.ui.setWidget("prd-loop-summary", lines.join("\n"));
 }
 
 // --- Subagent Output Viewer Overlay ---
@@ -2553,8 +2503,8 @@ Errors: ${result.errors.join("; ")}`,
 
 	ctx.ui.setStatus("prd-loop", undefined);
 
-	// Show summary as a dismissible overlay instead of a persistent widget
-	await showSummaryOverlay(ctx, loopState, prdTitle, result.outcome);
+	// Print summary as static text widget
+	printSummary(ctx, loopState, prdTitle, result.outcome);
 
 	if (result.notification) ctx.ui.notify(result.notification.message, result.notification.level);
 	if (result.unexpectedError) throw result.unexpectedError;
