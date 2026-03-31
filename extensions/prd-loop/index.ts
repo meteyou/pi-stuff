@@ -1630,7 +1630,7 @@ function printSummary(
 	outcome: "completed" | "failed" | "aborted",
 ): void {
 	const lines = buildSummaryWidget(state, prdTitle, outcome);
-	ctx.ui.setWidget("prd-loop-summary", lines.join("\n"));
+	ctx.ui.setWidget("prd-loop-summary", lines);
 }
 
 // --- Subagent Output Viewer Overlay ---
