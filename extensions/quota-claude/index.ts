@@ -2,20 +2,26 @@
  * Claude Usage Extension
  *
  * Displays Claude Code / Claude Max usage in the footer.
- * Reads the OAuth token from pi's auth.json (~/.pi/agent/auth.json).
+ * Uses pi's built-in AuthStorage for OAuth token management,
+ * which handles token refresh with file locking.
+ *
  * Requires /login with Anthropic OAuth.
  *
  * Based on: https://codelynx.dev/posts/claude-code-usage-limits-statusline
- * Auth logic from: https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/providers/anthropic.ts
+ * Auth approach: Uses ctx.modelRegistry (pi's AuthStorage) for token refresh,
+ *   matching ClaudeCode's oauth/client.ts refresh flow.
+ * Header format: Aligned with ClaudeCode's services/api/usage.ts
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
-// Version must match Claude Code
-const claudeCodeVersion = "2.1.2";
+// OAuth beta header (matches ClaudeCode constants/oauth.ts OAUTH_BETA_HEADER)
+const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+
+// Must match the version in @mariozechner/pi-ai providers/anthropic.js (claudeCodeVersion const).
+// pi uses this user-agent for all OAuth Anthropic requests. Not exported, so we hardcode it.
+// Source: node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js line ~35
+const CLAUDE_CLI_VERSION = "2.1.75";
 
 // Fetch at most once every 10 minutes
 const MIN_FETCH_INTERVAL_MS = 10 * 60 * 1000;
@@ -48,34 +54,98 @@ interface UsageLimits {
   iguana_necktie: null;
 }
 
-interface PiAuthFile {
-  anthropic?: {
-    type: "oauth" | "api_key";
-    access?: string;
-    refresh?: string;
-    expires?: number;
-    key?: string;
-  };
+// ---------------------------------------------------------------------------
+// Auth helpers — delegate to pi's built-in AuthStorage
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if the Anthropic credential is OAuth-based.
+ * The /api/oauth/usage endpoint only works with OAuth (subscriber) tokens,
+ * matching ClaudeCode's isClaudeAISubscriber() guard in fetchUtilization().
+ */
+function isAnthropicOAuth(ctx: ExtensionContext): boolean {
+  const cred = ctx.modelRegistry.authStorage.get("anthropic");
+  return cred?.type === "oauth";
 }
 
 /**
- * Retrieves the OAuth access token from pi's auth.json file.
- * Pi stores OAuth credentials in ~/.pi/agent/auth.json after /login.
+ * Get a valid OAuth access token using pi's built-in AuthStorage.
+ *
+ * AuthStorage.getApiKey("anthropic") checks:
+ *   1. whether the stored token is expired (pi bakes in a 5-min buffer at save time)
+ *   2. if expired, refreshes via refreshOAuthTokenWithLock() (file-locked, multi-process safe)
+ *   3. persists the new credentials to auth.json
+ *
+ * This mirrors ClaudeCode's checkAndRefreshOAuthTokenIfNeeded() flow.
  */
-function getAccessTokenFromPiAuth(): string | null {
+async function getAccessToken(ctx: ExtensionContext): Promise<string | null> {
   try {
-    const authPath = join(homedir(), ".pi", "agent", "auth.json");
-    const authData = JSON.parse(readFileSync(authPath, "utf-8")) as PiAuthFile;
-    
-    if (authData.anthropic?.type === "oauth" && authData.anthropic.access) {
-      return authData.anthropic.access;
-    }
-    
-    return null;
+    const token = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
+    return token ?? null;
   } catch (error) {
     return null;
   }
 }
+
+/**
+ * Handle a 401 response by attempting token recovery.
+ *
+ * Mirrors ClaudeCode's handleOAuth401Error() strategy:
+ *   1. Reload from disk (another pi/CC instance may have refreshed already)
+ *   2. If the stored token differs from failedToken → use it (race resolved)
+ *   3. Otherwise, force a refresh by invalidating the local expiry, then let
+ *      pi's built-in refreshOAuthTokenWithLock() do the actual refresh
+ *
+ * Returns a new valid token, or null if recovery failed.
+ */
+async function handleUnauthorized(
+  ctx: ExtensionContext,
+  failedToken: string
+): Promise<string | null> {
+  const authStorage = ctx.modelRegistry.authStorage;
+
+  // Step 1: Reload from disk — another process may have written fresh tokens
+  authStorage.reload();
+  const reloadedToken = await getAccessToken(ctx);
+
+  // Step 2: Different token after reload → another instance already refreshed
+  if (reloadedToken && reloadedToken !== failedToken) {
+    return reloadedToken;
+  }
+
+  // Step 3: Same token — server disagrees with local expiry (clock drift, revocation).
+  //         Force refresh by setting expires=0, then let getApiKeyForProvider trigger
+  //         pi's locked refresh. This is safe: if refresh fails the user must /login anyway.
+  const cred = authStorage.get("anthropic");
+  if (!cred || cred.type !== "oauth") {
+    return null;
+  }
+
+  const oauthCred = cred as { type: "oauth"; access: string; refresh: string; expires: number };
+  if (!oauthCred.refresh) {
+    console.error("Claude Usage: no refresh token available — re-login with /login");
+    return null;
+  }
+
+  // Invalidate local expiry to trigger pi's built-in OAuth refresh
+  authStorage.set("anthropic", { ...oauthCred, expires: 0 });
+
+  try {
+    const refreshedToken = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
+    if (refreshedToken && refreshedToken !== failedToken) {
+      return refreshedToken;
+    }
+    console.error("Claude Usage: token refresh did not produce a new token");
+    return null;
+  } catch (error) {
+    console.error("Claude Usage: forced token refresh failed:", error);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Usage API
+// ---------------------------------------------------------------------------
 
 function parseRetryAfterMs(retryAfterHeader: string | null): number | undefined {
   if (!retryAfterHeader) return undefined;
@@ -95,7 +165,19 @@ function parseRetryAfterMs(retryAfterHeader: string | null): number | undefined 
 }
 
 /**
- * Fetches usage data from the Anthropic API.
+ * Fetch usage data from the Anthropic API.
+ *
+ * Headers match exactly what pi's Anthropic provider sends for OAuth requests
+ * (see @mariozechner/pi-ai providers/anthropic.js createClient → isOAuthToken branch):
+ *   - accept: application/json
+ *   - User-Agent: claude-cli/{version}
+ *   - Authorization: Bearer TOKEN
+ *   - anthropic-beta: oauth-2025-04-20
+ *   - anthropic-dangerous-direct-browser-access: true
+ *   - x-app: cli
+ *
+ * This ensures the usage request appears as the same agent identity that pi
+ * uses for token refresh and inference — one consistent caller for Anthropic.
  */
 async function fetchUsageLimits(
   accessToken: string
@@ -104,18 +186,17 @@ async function fetchUsageLimits(
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
       method: "GET",
       headers: {
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": `claude-cli/${claudeCodeVersion} (external, cli)`,
+        "User-Agent": `claude-cli/${CLAUDE_CLI_VERSION}`,
         "Authorization": `Bearer ${accessToken}`,
-        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-beta": OAUTH_BETA_HEADER,
         "anthropic-dangerous-direct-browser-access": "true",
         "x-app": "cli",
       },
     });
 
     if (!response.ok) {
-      console.error(`Claude Usage API error: ${response.status} ${response.statusText}`);
       return {
         usage: null,
         status: response.status,
@@ -131,11 +212,15 @@ async function fetchUsageLimits(
     if (code === "ENETUNREACH" || code === "ENOTFOUND" || code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ECONNRESET") {
       // Silently ignore transient network errors
     } else {
-      console.error("Claude Usage fetch error:", error);
+      console.error("Claude Usage: fetch error:", error);
     }
     return { usage: null };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Formatting / rendering helpers (unchanged)
+// ---------------------------------------------------------------------------
 
 function formatResetTime(resetAt: string | null): string {
   if (!resetAt) return "";
@@ -210,10 +295,13 @@ function formatResetTimeNice(resetAt: string, showTimezone: boolean = false): st
   return `${string} (${timezone})`;
 }
 
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
+
 export default function (pi: ExtensionAPI) {
   let lastUsage: UsageLimits | null = null;
   let updateInterval: ReturnType<typeof setInterval> | null = null;
-  let accessToken: string | null = null;
   let isAnthropicModel = false;
   let hasAnthropicTurn = false;
   let lastFetchAt = 0;
@@ -245,6 +333,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Check if the Anthropic credential is OAuth-based.
+    // API key users can't use /api/oauth/usage (matches ClaudeCode's isClaudeAISubscriber guard).
+    if (!isAnthropicOAuth(ctx)) {
+      ctx.ui.setStatus("claude-usage", undefined);
+      return;
+    }
+
     const theme = ctx.ui.theme;
     const now = Date.now();
 
@@ -263,15 +358,14 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Guard 2: Min interval not reached → show cached, don't fetch
-      // NOTE: No `&& lastUsage` — always enforce the interval!
       if (now - lastFetchAt < MIN_FETCH_INTERVAL_MS) {
         if (lastUsage) renderStatus(ctx);
         return;
       }
     }
 
-    // --- Fetch ---
-    accessToken = getAccessTokenFromPiAuth();
+    // --- Get access token (pi's AuthStorage handles expiry + refresh) ---
+    const accessToken = await getAccessToken(ctx);
     if (!accessToken) {
       ctx.ui.setStatus(
         "claude-usage",
@@ -286,14 +380,23 @@ export default function (pi: ExtensionAPI) {
     let status = firstAttempt.status;
     let retryAfterMs = firstAttempt.retryAfterMs;
 
-    // Retry once on 401 (token may have been refreshed on disk)
+    // --- 401 handling: reload + force-refresh + single retry ---
     if (!usage && status === 401) {
-      accessToken = getAccessTokenFromPiAuth();
-      if (accessToken) {
-        const retryAttempt = await fetchUsageLimits(accessToken);
+      const recoveredToken = await handleUnauthorized(ctx, accessToken);
+      if (recoveredToken) {
+        const retryAttempt = await fetchUsageLimits(recoveredToken);
         usage = retryAttempt.usage;
         status = retryAttempt.status ?? status;
         retryAfterMs = retryAttempt.retryAfterMs ?? retryAfterMs;
+      }
+
+      // If still failing after recovery attempt, show specific message
+      if (!usage && status === 401) {
+        ctx.ui.setStatus(
+          "claude-usage",
+          theme.fg("error", "✗ Token invalid/revoked — try /login")
+        );
+        return;
       }
     }
 
@@ -319,7 +422,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const statusSuffix = status ? ` (${status})` : "";
+      if (status === 403) {
+        ctx.ui.setStatus(
+          "claude-usage",
+          theme.fg("error", "✗ Usage API forbidden (403) — check subscription")
+        );
+        return;
+      }
+
+      const statusSuffix = status ? ` (${status})` : " (network error)";
       ctx.ui.setStatus(
         "claude-usage",
         theme.fg("error", `✗ Failed to fetch usage${statusSuffix}`)
@@ -420,7 +531,6 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("quota-claude", {
     description: "Show/refresh Claude usage",
     handler: async (_args, ctx) => {
-      accessToken = getAccessTokenFromPiAuth();
       await updateUsageStatus(ctx, { force: true });
 
       if (!lastUsage) {
