@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getModels } from "@mariozechner/pi-ai";
 
-const CLAUDE_CODE_VERSION = "2.1.96";
+export const CLAUDE_CODE_VERSION = "2.1.96";
 
 export default function ccSupportExtension(pi: ExtensionAPI) {
 	// Override user-agent to advertise Claude Code CLI version

@@ -14,14 +14,10 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { CLAUDE_CODE_VERSION } from "../cc-support/index.ts";
 
 // OAuth beta header (matches ClaudeCode constants/oauth.ts OAUTH_BETA_HEADER)
 const OAUTH_BETA_HEADER = "oauth-2025-04-20";
-
-// Must match the Anthropic user-agent override used by this package's
-// Claude Code version extension so the usage endpoint is queried with the
-// same advertised CLI version as normal Anthropic OAuth requests.
-const CLAUDE_CLI_VERSION = "2.1.94";
 
 // Fetch at most once every 10 minutes
 const MIN_FETCH_INTERVAL_MS = 10 * 60 * 1000;
@@ -188,7 +184,7 @@ async function fetchUsageLimits(
       headers: {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": `claude-cli/${CLAUDE_CLI_VERSION}`,
+        "User-Agent": `claude-cli/${CLAUDE_CODE_VERSION}`,
         "Authorization": `Bearer ${accessToken}`,
         "anthropic-beta": OAUTH_BETA_HEADER,
         "anthropic-dangerous-direct-browser-access": "true",
