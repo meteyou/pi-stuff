@@ -18,10 +18,10 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 // OAuth beta header (matches ClaudeCode constants/oauth.ts OAUTH_BETA_HEADER)
 const OAUTH_BETA_HEADER = "oauth-2025-04-20";
 
-// Must match the version in @mariozechner/pi-ai providers/anthropic.js (claudeCodeVersion const).
-// pi uses this user-agent for all OAuth Anthropic requests. Not exported, so we hardcode it.
-// Source: node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js line ~35
-const CLAUDE_CLI_VERSION = "2.1.75";
+// Must match the Anthropic user-agent override used by this package's
+// Claude Code version extension so the usage endpoint is queried with the
+// same advertised CLI version as normal Anthropic OAuth requests.
+const CLAUDE_CLI_VERSION = "2.1.94";
 
 // Fetch at most once every 10 minutes
 const MIN_FETCH_INTERVAL_MS = 10 * 60 * 1000;
