@@ -58,7 +58,6 @@ git push
 | Extension | Description | Command | Source |
 |-----------|-------------|---------|--------|
 | `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. | `/answer` (+ `Ctrl+.`) | custom, based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
-| `claude-code-version` | Overrides Pi's Anthropic `user-agent` header so OAuth Anthropic requests advertise Claude Code `2.1.94` without patching `pi-ai`. | — | custom |
 | `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` | custom |
 | `prd-loop` | Autonomous PRD task orchestrator. Spawns isolated subagents per task, auto-commits, retries on failure, shows a live overlay with task navigation/details, and leaves a summary widget afterward. Supports `--smart-commits` for granular conventional commits. Part of the [PRD Workflow](docs/prd-workflow.md). | `/prd-loop` (alias: `/ralph`) | custom |
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` | custom |
