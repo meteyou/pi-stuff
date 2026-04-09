@@ -15,7 +15,7 @@
 
 import { spawn } from "node:child_process";
 import { readdir, readFile } from "node:fs/promises";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -479,13 +479,19 @@ export async function spawnSubagent(options: {
 	const promptPath = join(tmpDir, "prd-worker-prompt.md");
 	writeFileSync(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 
-	// Build pi arguments — disable extensions and themes to prevent interference
-	// with clean process exit (extensions can register event listeners, hooks, etc.
-	// that block shutdown). Skills and prompt templates are kept — subagents need them.
+	// Build pi arguments — disable extension/theme discovery to keep the subagent
+	// isolated and avoid unrelated hooks interfering with clean shutdown. We still
+	// explicitly load cc-support so Anthropic subagents get the same Claude Code
+	// user-agent + system-prompt rewrite as the parent agent.
 	const args: string[] = [
 		"--mode", "json", "-p", "--no-session",
 		"--no-extensions", "--no-themes",
 	];
+
+	const ccSupportExtensionPath = join(EXTENSION_DIR, "..", "cc-support", "index.ts");
+	if (existsSync(ccSupportExtensionPath)) {
+		args.push("--extension", ccSupportExtensionPath);
+	}
 
 	// Model: prefer explicit option, fall back to agent definition
 	const effectiveModel = model ?? agent.model;
