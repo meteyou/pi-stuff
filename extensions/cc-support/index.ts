@@ -17,8 +17,10 @@ export default function ccSupportExtension(pi: ExtensionAPI) {
 
 	// Replace "pi" with "claude code" in the system prompt
 	pi.on("before_agent_start", async (event) => {
+		// Replace standalone "pi" / "Pi" but preserve file paths and partial words
+		// Match "pi" only when it's a whole word (not inside paths, URLs, or other words)
 		const transformedSystemPrompt = event.systemPrompt.replace(
-			/pi/gi,
+			/(?<![\w\/.\-@])pi(?![\w\/.\-])/gi,
 			"claude code",
 		);
 
