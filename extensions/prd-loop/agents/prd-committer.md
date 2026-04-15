@@ -33,10 +33,13 @@ You are a git commit specialist. Your job is to analyze uncommitted changes and 
 
 ## Scope Convention
 
-The scope MUST include the PRD identifier passed in the task. For example:
-- `feat(prd-1): add cache storage module`
-- `test(prd-1): add cache TTL unit tests`
-- `refactor(prd-1): extract helper function`
+Use a meaningful scope that reflects the changed module/area (not the PRD id), for example:
+- `feat(chat-ui): add push-to-talk button`
+- `test(cache): add TTL unit tests`
+- `refactor(todo-parser): extract helper function`
+
+Also include the PRD reference in the commit body footer:
+- `Refs: prd-1`
 
 ## Output Format
 
