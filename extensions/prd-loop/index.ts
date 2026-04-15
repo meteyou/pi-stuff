@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
-import { parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { parseFrontmatter, SettingsManager } from "@mariozechner/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@mariozechner/pi-tui";
 
 /** Extension directory for locating agent definition files. */
@@ -149,6 +149,7 @@ export interface LoopConfig {
 	retryFixes: number;
 	smartCommits: boolean;
 	model: string; // "provider/model-id" format
+	commitModel?: string; // Optional dedicated model for smart commits
 	thinkingLevel?: string; // "minimal" | "low" | "medium" | "high" | "xhigh" | undefined
 }
 
@@ -158,6 +159,7 @@ interface ParsedFlags {
 	retryFixes: number | null;
 	smartCommits: boolean | null;
 	model: string | null;
+	commitModel: string | null;
 	thinkingLevel: string | null;
 	error: string | null;
 }
@@ -165,7 +167,7 @@ interface ParsedFlags {
 /**
  * Parse command args string for the prd-N argument and flags.
  *
- * Format: /prd-loop [prd-N] [--retry-fixes=N] [--smart-commits] [--model=<id>]
+ * Format: /prd-loop [prd-N] [--retry-fixes=N] [--smart-commits] [--model=<id>] [--commit-model=<id>]
  */
 export function parseCommandArgs(args: string): ParsedFlags {
 	const result: ParsedFlags = {
@@ -173,6 +175,7 @@ export function parseCommandArgs(args: string): ParsedFlags {
 		retryFixes: null,
 		smartCommits: null,
 		model: null,
+		commitModel: null,
 		thinkingLevel: null,
 		error: null,
 	};
@@ -201,6 +204,13 @@ export function parseCommandArgs(args: string): ParsedFlags {
 				return result;
 			}
 			result.model = value;
+		} else if (token.startsWith("--commit-model=")) {
+			const value = token.slice("--commit-model=".length);
+			if (!value) {
+				result.error = `Invalid --commit-model value: empty string`;
+				return result;
+			}
+			result.commitModel = value;
 		} else if (token.startsWith("--thinking=")) {
 			const value = token.slice("--thinking=".length);
 			const validLevels = ["minimal", "low", "medium", "high", "xhigh"];
@@ -1247,6 +1257,41 @@ function extractShortTitle(title: string): string {
 	return match ? match[1].trim() : title;
 }
 
+const COMMIT_SCOPE_STOP_WORDS = new Set([
+	"a", "an", "and", "the", "to", "in", "on", "for", "from", "of", "with", "by", "at", "into", "as",
+	"add", "adds", "added", "implement", "implements", "implemented", "integrate", "integrates", "integrated",
+	"create", "creates", "created", "update", "updates", "updated", "improve", "improves", "improved",
+	"fix", "fixes", "fixed", "refactor", "refactors", "refactored", "support", "supports", "supported",
+	"enable", "enables", "enabled",
+]);
+
+function normalizeCommitDescription(shortTitle: string): string {
+	const trimmed = shortTitle.trim();
+	if (!trimmed) return "apply task changes";
+	return trimmed[0].toLowerCase() + trimmed.slice(1);
+}
+
+function deriveCommitScopeFromTitle(shortTitle: string, fallbackScope: string): string {
+	const tokens = shortTitle
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.split(/\s+/)
+		.filter(Boolean)
+		.filter((t) => !COMMIT_SCOPE_STOP_WORDS.has(t));
+
+	if (tokens.length === 0) return fallbackScope;
+
+	const preferredSuffixes = new Set(["ui", "api", "auth", "db", "tests", "test"]);
+	for (let i = tokens.length - 1; i >= 1; i--) {
+		if (preferredSuffixes.has(tokens[i])) {
+			return `${tokens[i - 1]}-${tokens[i] === "test" ? "tests" : tokens[i]}`;
+		}
+	}
+
+	if (tokens.length >= 2) return `${tokens[0]}-${tokens[1]}`;
+	return tokens[0];
+}
+
 // --- Loop state and UI ---
 
 type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
@@ -1928,8 +1973,10 @@ async function spawnCommitterSubagent(
 		const prompt = [
 			`Analyze all uncommitted changes and create granular conventional commits.`,
 			``,
-			`The PRD scope is: ${prdTag}`,
-			`Use "${prdTag}" as the scope in all commit messages (e.g., feat(${prdTag}): ...).`,
+			`PRD reference: ${prdTag}`,
+			`Use meaningful scopes based on the changed module or area (e.g., chat-ui, auth, api, docs).`,
+			`Do NOT use "${prdTag}" as the scope unless there is truly no better module scope.`,
+			`Add "Refs: ${prdTag}" as a footer line in each commit message body.`,
 		].join("\n");
 
 		const result = await spawnSubagent({
@@ -1963,10 +2010,13 @@ async function simpleAutoCommit(
 	sequenceLabel: string,
 	shortTitle: string,
 ): Promise<{ committed: boolean; error?: string }> {
-	const commitMsg = `feat(${prdTag}): task ${sequenceLabel} - ${shortTitle}`;
+	const scope = deriveCommitScopeFromTitle(shortTitle, prdTag);
+	const description = normalizeCommitDescription(shortTitle);
+	const commitHeader = `feat(${scope}): ${description}`;
+	const commitFooter = `Refs: ${prdTag}\nTask: ${sequenceLabel}`;
 
 	await pi.exec("git", ["add", "-A"], { cwd });
-	const commitResult = await pi.exec("git", ["commit", "-m", commitMsg], { cwd });
+	const commitResult = await pi.exec("git", ["commit", "-m", commitHeader, "-m", commitFooter], { cwd });
 
 	if (commitResult.code !== 0) {
 		if (commitResult.stdout.includes("nothing to commit")) {
@@ -2420,7 +2470,7 @@ Errors: ${result.errors.join("; ")}`,
 					const committerResult = await spawnCommitterSubagent(
 						ctx.cwd,
 						prdTag,
-						config.model,
+						config.commitModel ?? config.model,
 						config.thinkingLevel,
 						currentAbortController.signal,
 					);
@@ -2525,6 +2575,49 @@ function modelDisplayId(model: { provider: string; id: string }): string {
 	return `${model.provider}/${model.id}`;
 }
 
+type AvailableModelOption = { provider: string; id: string; name: string; reasoning: boolean };
+
+function stripThinkingSuffix(modelPattern: string): string {
+	const validThinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+	const trimmed = modelPattern.trim();
+	const lastColon = trimmed.lastIndexOf(":");
+	if (lastColon === -1) return trimmed;
+	const suffix = trimmed.slice(lastColon + 1).toLowerCase();
+	if (!validThinkingLevels.has(suffix)) return trimmed;
+	return trimmed.slice(0, lastColon);
+}
+
+function wildcardToRegex(pattern: string): RegExp {
+	const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+	return new RegExp(`^${escaped}$`, "i");
+}
+
+function matchesModelPattern(pattern: string, model: AvailableModelOption): boolean {
+	const normalized = stripThinkingSuffix(pattern);
+	if (!normalized) return false;
+
+	const fullId = modelDisplayId(model);
+	const matcher = wildcardToRegex(normalized);
+	if (matcher.test(fullId)) return true;
+	if (!normalized.includes("/")) {
+		if (matcher.test(model.id)) return true;
+		if (matcher.test(model.name)) return true;
+	}
+	return false;
+}
+
+function getScopedModelsFromSettings(cwd: string, availableModels: AvailableModelOption[]): AvailableModelOption[] {
+	try {
+		const settings = SettingsManager.create(cwd);
+		const patterns = settings.getEnabledModels();
+		if (!patterns || patterns.length === 0) return [];
+		const scoped = availableModels.filter((model) => patterns.some((pattern) => matchesModelPattern(pattern, model)));
+		return scoped;
+	} catch {
+		return [];
+	}
+}
+
 async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
 	// Step 0: Parse flags
 	const flags = parseCommandArgs(args);
@@ -2602,17 +2695,33 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		smartCommits = await ctx.ui.confirm("Smart commits", "Use a subagent for granular conventional commits?");
 	}
 
-	// 3c. Model selection (filtered to current provider)
+	// 3c. Model selection (prefer scoped models from settings, fallback to current provider)
 	let selectedModelId: string;
-	let selectedModelObj: { provider: string; id: string; name: string; reasoning: boolean } | undefined;
+	let selectedModelObj: AvailableModelOption | undefined;
+	let commitModelId: string | undefined;
 	const currentModel = ctx.model;
 	const currentModelId = currentModel ? modelDisplayId(currentModel) : undefined;
 	const currentProvider = currentModel?.provider;
 
+	const allAvailableModels = ctx.modelRegistry.getAvailable() as AvailableModelOption[];
+	if (allAvailableModels.length === 0) {
+		ctx.ui.notify("No models available. Please configure an API key.", "error");
+		return;
+	}
+
+	const scopedModels = getScopedModelsFromSettings(ctx.cwd, allAvailableModels);
+	const providerModels = currentProvider
+		? allAvailableModels.filter((m) => m.provider === currentProvider)
+		: allAvailableModels;
+	const preferredModels = scopedModels.length > 0 ? scopedModels : providerModels;
+
+	if (preferredModels.length === 0) {
+		ctx.ui.notify(`No models available for provider "${currentProvider}".`, "error");
+		return;
+	}
+
 	if (flags.model !== null) {
-		// Validate that the specified model exists
-		const allModels = ctx.modelRegistry.getAvailable();
-		const match = allModels.find((m) => modelDisplayId(m) === flags.model || m.id === flags.model);
+		const match = allAvailableModels.find((m) => modelDisplayId(m) === flags.model || m.id === flags.model);
 		if (!match) {
 			ctx.ui.notify(`Model not found: "${flags.model}"`, "error");
 			return;
@@ -2620,34 +2729,21 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		selectedModelId = modelDisplayId(match);
 		selectedModelObj = match;
 	} else {
-		const allAvailableModels = ctx.modelRegistry.getAvailable();
-		if (allAvailableModels.length === 0) {
-			ctx.ui.notify("No models available. Please configure an API key.", "error");
-			return;
-		}
-
-		// Filter to models from the current provider only
-		const providerModels = currentProvider
-			? allAvailableModels.filter((m) => m.provider === currentProvider)
-			: allAvailableModels;
-
-		if (providerModels.length === 0) {
-			ctx.ui.notify(`No models available for provider "${currentProvider}".`, "error");
-			return;
-		}
-
-		const modelOptions = providerModels.map((m) => {
+		const modelOptions = preferredModels.map((m) => {
 			const id = modelDisplayId(m);
 			return currentModelId === id ? `${m.name} (${id}) ★` : `${m.name} (${id})`;
 		});
 
-		const modelChoice = await ctx.ui.select(`Model (${currentProvider})`, modelOptions);
+		const title = scopedModels.length > 0
+			? `Model (scoped, ${scopedModels.length})`
+			: `Model (${currentProvider ?? "all providers"})`;
+		const modelChoice = await ctx.ui.select(title, modelOptions);
 		if (modelChoice === undefined) return; // User cancelled
 
 		const modelIndex = modelOptions.indexOf(modelChoice);
 		if (modelIndex === -1) return;
-		selectedModelId = modelDisplayId(providerModels[modelIndex]);
-		selectedModelObj = providerModels[modelIndex];
+		selectedModelId = modelDisplayId(preferredModels[modelIndex]);
+		selectedModelObj = preferredModels[modelIndex];
 	}
 
 	// 3d. Thinking level selection (only for reasoning models)
@@ -2670,11 +2766,39 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		thinkingLevel = thinkingLevels[thinkingIndex];
 	}
 
+	// 3e. Optional dedicated model for smart commits
+	if (smartCommits) {
+		if (flags.commitModel !== null) {
+			const match = allAvailableModels.find((m) => modelDisplayId(m) === flags.commitModel || m.id === flags.commitModel);
+			if (!match) {
+				ctx.ui.notify(`Commit model not found: "${flags.commitModel}"`, "error");
+				return;
+			}
+			commitModelId = modelDisplayId(match);
+		} else {
+			const commitSelectionModels = preferredModels.some((m) => modelDisplayId(m) === selectedModelId)
+				? preferredModels
+				: (selectedModelObj ? [selectedModelObj, ...preferredModels] : preferredModels);
+
+			const commitOptions = commitSelectionModels.map((m) => {
+				const id = modelDisplayId(m);
+				return id === selectedModelId ? `${m.name} (${id}) ★` : `${m.name} (${id})`;
+			});
+
+			const commitChoice = await ctx.ui.select("Commit model", commitOptions);
+			if (commitChoice === undefined) return; // User cancelled
+			const commitIndex = commitOptions.indexOf(commitChoice);
+			if (commitIndex === -1) return;
+			commitModelId = modelDisplayId(commitSelectionModels[commitIndex]);
+		}
+	}
+
 	// Build the config object
 	const config: LoopConfig = {
 		retryFixes,
 		smartCommits,
 		model: selectedModelId,
+		commitModel: commitModelId,
 		thinkingLevel,
 	};
 
@@ -2686,7 +2810,8 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		`   Tasks:         ${selectedPrd.openTaskCount} open, ${completedCount} completed`,
 		`   Retry Fixes:   ${config.retryFixes}`,
 		`   Smart Commits: ${config.smartCommits ? "Yes" : "No"}`,
-		`   Model:         ${config.model}`,
+		`   Task Model:    ${config.model}`,
+		`   Commit Model:  ${config.smartCommits ? (config.commitModel ?? config.model) : "-"}`,
 		`   Thinking:      ${config.thinkingLevel ?? "off"}`,
 		``,
 		`Start loop?`,
