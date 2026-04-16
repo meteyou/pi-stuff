@@ -151,6 +151,7 @@ export interface LoopConfig {
 	model: string; // "provider/model-id" format
 	commitModel?: string; // Optional dedicated model for smart commits
 	thinkingLevel?: string; // "minimal" | "low" | "medium" | "high" | "xhigh" | undefined
+	commitThinkingLevel?: string; // Optional separate thinking level for smart commits
 }
 
 /** Parsed flags from the command args string. */
@@ -161,6 +162,7 @@ interface ParsedFlags {
 	model: string | null;
 	commitModel: string | null;
 	thinkingLevel: string | null;
+	commitThinkingLevel: string | null;
 	error: string | null;
 }
 
@@ -177,6 +179,7 @@ export function parseCommandArgs(args: string): ParsedFlags {
 		model: null,
 		commitModel: null,
 		thinkingLevel: null,
+		commitThinkingLevel: null,
 		error: null,
 	};
 
@@ -219,6 +222,14 @@ export function parseCommandArgs(args: string): ParsedFlags {
 				return result;
 			}
 			result.thinkingLevel = value;
+		} else if (token.startsWith("--commit-thinking=")) {
+			const value = token.slice("--commit-thinking=".length);
+			const validLevels = ["minimal", "low", "medium", "high", "xhigh"];
+			if (!validLevels.includes(value)) {
+				result.error = `Invalid --commit-thinking value: "${value}" (must be one of: ${validLevels.join(", ")})`;
+				return result;
+			}
+			result.commitThinkingLevel = value;
 		} else if (token.startsWith("--")) {
 			result.error = `Unknown flag: "${token}"`;
 			return result;
@@ -2471,7 +2482,7 @@ Errors: ${result.errors.join("; ")}`,
 						ctx.cwd,
 						prdTag,
 						config.commitModel ?? config.model,
-						config.thinkingLevel,
+						config.commitThinkingLevel ?? config.thinkingLevel,
 						currentAbortController.signal,
 					);
 
@@ -2804,15 +2815,19 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 
 	// Step 4: Confirmation dialog
 	const completedCount = selectedPrd.totalTaskCount - selectedPrd.openTaskCount;
+	const taskThinking = config.thinkingLevel ?? "off";
+	const commitModelDisplay = config.smartCommits ? (config.commitModel ?? config.model) : "-";
+	const commitThinkingDisplay = config.smartCommits
+		? (config.commitThinkingLevel ?? config.thinkingLevel ?? "off")
+		: "-";
 	const confirmMessage = [
 		`🚀 Loop Configuration:`,
 		`   PRD:           ${selectedPrd.prd.title}`,
 		`   Tasks:         ${selectedPrd.openTaskCount} open, ${completedCount} completed`,
 		`   Retry Fixes:   ${config.retryFixes}`,
 		`   Smart Commits: ${config.smartCommits ? "Yes" : "No"}`,
-		`   Task Model:    ${config.model}`,
-		`   Commit Model:  ${config.smartCommits ? (config.commitModel ?? config.model) : "-"}`,
-		`   Thinking:      ${config.thinkingLevel ?? "off"}`,
+		`   Task Model:    ${config.model} - ${taskThinking}`,
+		`   Commit Model:  ${commitModelDisplay} - ${commitThinkingDisplay}`,
 		``,
 		`Start loop?`,
 	].join("\n");
