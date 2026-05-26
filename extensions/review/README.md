@@ -1,6 +1,6 @@
 # Review Extension
 
-Code review extension that prompts the agent to review code changes. Fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/review.ts) with compatibility fixes for the current `@mariozechner/pi-tui` API.
+Code review extension that prompts the agent to review code changes. Fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/review.ts) with compatibility fixes for the current `@earendil-works/pi-tui` API.
 
 ## Why this fork?
 

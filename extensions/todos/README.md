@@ -4,7 +4,7 @@ File-based todo manager with claiming, locking, and garbage collection. Fork of 
 
 ## Changes from Upstream
 
-- Removed dependency on `getEditorKeybindings()` from `@mariozechner/pi-tui` (caused `TypeError: is not a function` due to ESM/CJS interop when the extension resolves an older peer dependency version)
+- Removed dependency on `getEditorKeybindings()` from `@earendil-works/pi-tui` (caused `TypeError: is not a function` due to ESM/CJS interop when the extension resolves an older peer dependency version)
 - Replaced with a local `matchesAction()` helper that uses `matchesKey()` and `Key.*` constants directly
 
 ## Concept

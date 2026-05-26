@@ -19,9 +19,9 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@mariozechner/pi-coding-agent";
-import { parseFrontmatter, SettingsManager } from "@mariozechner/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));

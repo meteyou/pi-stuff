@@ -13,7 +13,7 @@
  * Header format: Aligned with ClaudeCode's services/api/usage.ts
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CLAUDE_CODE_VERSION } from "../cc-support/index.ts";
 
 // OAuth beta header (matches ClaudeCode constants/oauth.ts OAUTH_BETA_HEADER)
@@ -164,7 +164,7 @@ function parseRetryAfterMs(retryAfterHeader: string | null): number | undefined 
  * Fetch usage data from the Anthropic API.
  *
  * Headers match exactly what pi's Anthropic provider sends for OAuth requests
- * (see @mariozechner/pi-ai providers/anthropic.js createClient → isOAuthToken branch):
+ * (see @earendil-works/pi-ai providers/anthropic.js createClient → isOAuthToken branch):
  *   - accept: application/json
  *   - User-Agent: claude-cli/{version}
  *   - Authorization: Bearer TOKEN

@@ -14,8 +14,8 @@
  *        then: /context
  */
 
-import { type ExtensionAPI, type ExtensionContext, SettingsManager, getAgentDir } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { type ExtensionAPI, type ExtensionContext, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 

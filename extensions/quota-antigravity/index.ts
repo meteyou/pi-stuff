@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as https from "node:https";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -548,7 +548,7 @@ function createProgressBar(percentage: number, width: number): string {
 
 // Pad string to target width accounting for wide characters (emojis)
 function padEndVisible(str: string, targetWidth: number, padChar: string = " "): string {
-    const { visibleWidth } = require("@mariozechner/pi-tui");
+    const { visibleWidth } = require("@earendil-works/pi-tui");
     const currentWidth = visibleWidth(str);
     if (currentWidth >= targetWidth) return str;
     return str + padChar.repeat(targetWidth - currentWidth);
@@ -750,7 +750,7 @@ export default function(pi: ExtensionAPI) {
 
         // Show in custom UI (full screen, no truncation)
         await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-            const { Text, matchesKey, Key } = require("@mariozechner/pi-tui");
+            const { Text, matchesKey, Key } = require("@earendil-works/pi-tui");
             const content = lines.join("\n");
             const text = new Text(theme.fg("accent", content), 1, 1);
             
