@@ -13,13 +13,15 @@
       "./skills",
       "./node_modules/agent-stuff/skills/web-browser",
       "./node_modules/agent-stuff/skills/github",
-      "./node_modules/agent-stuff/skills/pi-share"
+      "./node_modules/agent-stuff/skills/pi-share",
+      "./node_modules/mattpocock-skills/skills/productivity/handoff"
     ],
     "prompts": ["./prompts"],
     "themes": ["./themes"]
   },
   "dependencies": {
     "agent-stuff": "github:mitsuhiko/agent-stuff",
+    "mattpocock-skills": "github:mattpocock/skills",
     "pi-ghostty": "^1.0.0"
   },
   "peerDependencies": {
