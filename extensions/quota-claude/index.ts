@@ -2,14 +2,12 @@
  * Claude Usage Extension
  *
  * Displays Claude Code / Claude Max usage in the footer.
- * Uses pi's built-in AuthStorage for OAuth token management,
- * which handles token refresh with file locking.
+ * Uses pi's public model registry for OAuth token management.
  *
  * Requires /login with Anthropic OAuth.
  *
  * Based on: https://codelynx.dev/posts/claude-code-usage-limits-statusline
- * Auth approach: Uses ctx.modelRegistry (pi's AuthStorage) for token refresh,
- *   matching ClaudeCode's oauth/client.ts refresh flow.
+ * Auth approach: Uses ctx.modelRegistry for OAuth detection and token refresh.
  * Header format: Aligned with ClaudeCode's services/api/usage.ts
  */
 
@@ -51,7 +49,7 @@ interface UsageLimits {
 }
 
 // ---------------------------------------------------------------------------
-// Auth helpers — delegate to pi's built-in AuthStorage
+// Auth helpers — delegate to pi's public model registry
 // ---------------------------------------------------------------------------
 
 /**
@@ -60,81 +58,18 @@ interface UsageLimits {
  * matching ClaudeCode's isClaudeAISubscriber() guard in fetchUtilization().
  */
 function isAnthropicOAuth(ctx: ExtensionContext): boolean {
-  const cred = ctx.modelRegistry.authStorage.get("anthropic");
-  return cred?.type === "oauth";
+  return !!ctx.model && ctx.modelRegistry.isUsingOAuth(ctx.model);
 }
 
 /**
- * Get a valid OAuth access token using pi's built-in AuthStorage.
- *
- * AuthStorage.getApiKey("anthropic") checks:
- *   1. whether the stored token is expired (pi bakes in a 5-min buffer at save time)
- *   2. if expired, refreshes via refreshOAuthTokenWithLock() (file-locked, multi-process safe)
- *   3. persists the new credentials to auth.json
- *
- * This mirrors ClaudeCode's checkAndRefreshOAuthTokenIfNeeded() flow.
+ * Get a valid OAuth access token using pi's public model registry.
+ * Token expiry and refresh are handled by pi's provider auth runtime.
  */
 async function getAccessToken(ctx: ExtensionContext): Promise<string | null> {
   try {
     const token = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
     return token ?? null;
   } catch (error) {
-    return null;
-  }
-}
-
-/**
- * Handle a 401 response by attempting token recovery.
- *
- * Mirrors ClaudeCode's handleOAuth401Error() strategy:
- *   1. Reload from disk (another pi/CC instance may have refreshed already)
- *   2. If the stored token differs from failedToken → use it (race resolved)
- *   3. Otherwise, force a refresh by invalidating the local expiry, then let
- *      pi's built-in refreshOAuthTokenWithLock() do the actual refresh
- *
- * Returns a new valid token, or null if recovery failed.
- */
-async function handleUnauthorized(
-  ctx: ExtensionContext,
-  failedToken: string
-): Promise<string | null> {
-  const authStorage = ctx.modelRegistry.authStorage;
-
-  // Step 1: Reload from disk — another process may have written fresh tokens
-  authStorage.reload();
-  const reloadedToken = await getAccessToken(ctx);
-
-  // Step 2: Different token after reload → another instance already refreshed
-  if (reloadedToken && reloadedToken !== failedToken) {
-    return reloadedToken;
-  }
-
-  // Step 3: Same token — server disagrees with local expiry (clock drift, revocation).
-  //         Force refresh by setting expires=0, then let getApiKeyForProvider trigger
-  //         pi's locked refresh. This is safe: if refresh fails the user must /login anyway.
-  const cred = authStorage.get("anthropic");
-  if (!cred || cred.type !== "oauth") {
-    return null;
-  }
-
-  const oauthCred = cred as { type: "oauth"; access: string; refresh: string; expires: number };
-  if (!oauthCred.refresh) {
-    console.error("Claude Usage: no refresh token available — re-login with /login");
-    return null;
-  }
-
-  // Invalidate local expiry to trigger pi's built-in OAuth refresh
-  authStorage.set("anthropic", { ...oauthCred, expires: 0 });
-
-  try {
-    const refreshedToken = await ctx.modelRegistry.getApiKeyForProvider("anthropic");
-    if (refreshedToken && refreshedToken !== failedToken) {
-      return refreshedToken;
-    }
-    console.error("Claude Usage: token refresh did not produce a new token");
-    return null;
-  } catch (error) {
-    console.error("Claude Usage: forced token refresh failed:", error);
     return null;
   }
 }
@@ -371,29 +306,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     lastFetchAt = Date.now();
-    const firstAttempt = await fetchUsageLimits(accessToken);
-    let usage = firstAttempt.usage;
-    let status = firstAttempt.status;
-    let retryAfterMs = firstAttempt.retryAfterMs;
+    const { usage, status, retryAfterMs } = await fetchUsageLimits(accessToken);
 
-    // --- 401 handling: reload + force-refresh + single retry ---
     if (!usage && status === 401) {
-      const recoveredToken = await handleUnauthorized(ctx, accessToken);
-      if (recoveredToken) {
-        const retryAttempt = await fetchUsageLimits(recoveredToken);
-        usage = retryAttempt.usage;
-        status = retryAttempt.status ?? status;
-        retryAfterMs = retryAttempt.retryAfterMs ?? retryAfterMs;
-      }
-
-      // If still failing after recovery attempt, show specific message
-      if (!usage && status === 401) {
-        ctx.ui.setStatus(
-          "claude-usage",
-          theme.fg("error", "✗ Token invalid/revoked — try /login")
-        );
-        return;
-      }
+      ctx.ui.setStatus(
+        "claude-usage",
+        theme.fg("error", "✗ Token invalid/revoked — try /login")
+      );
+      return;
     }
 
     if (!usage) {
