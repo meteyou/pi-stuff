@@ -233,6 +233,11 @@ function formatResetTimeNice(resetAt: string, showTimezone: boolean = false): st
 export default function (pi: ExtensionAPI) {
   let lastUsage: UsageLimits | null = null;
   let updateInterval: ReturnType<typeof setInterval> | null = null;
+  let firstTurnTimeout: ReturnType<typeof setTimeout> | null = null;
+  // Always points to the ctx of the currently active session. Timers must use
+  // this instead of a captured ctx, which becomes stale after newSession/fork/
+  // switchSession/reload and throws when accessed.
+  let currentCtx: ExtensionContext | null = null;
   let isAnthropicModel = false;
   let hasAnthropicTurn = false;
   let lastFetchAt = 0;
@@ -241,6 +246,35 @@ export default function (pi: ExtensionAPI) {
 
   function checkIsAnthropicModel(ctx: ExtensionContext): boolean {
     return ctx.model?.provider === "anthropic";
+  }
+
+  function clearTimers() {
+    if (updateInterval) {
+      clearInterval(updateInterval);
+      updateInterval = null;
+    }
+    if (firstTurnTimeout) {
+      clearTimeout(firstTurnTimeout);
+      firstTurnTimeout = null;
+    }
+  }
+
+  /**
+   * Run an update from a timer using the current session ctx.
+   * Never throws: a stale ctx (e.g. after reload) must not crash pi.
+   */
+  async function backgroundUpdate() {
+    const ctx = currentCtx;
+    if (!ctx) return;
+    try {
+      await updateUsageStatus(ctx);
+    } catch {
+      // ctx became stale (session replaced/reloaded) — stop using it
+      if (currentCtx === ctx) {
+        currentCtx = null;
+        clearTimers();
+      }
+    }
   }
 
   /**
@@ -397,6 +431,8 @@ export default function (pi: ExtensionAPI) {
   // --- Event handlers ---
 
   pi.on("session_start", async (_event, ctx) => {
+    clearTimers();
+    currentCtx = ctx;
     isAnthropicModel = checkIsAnthropicModel(ctx);
     hasAnthropicTurn = false;
 
@@ -406,8 +442,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Background poll every 15 minutes
-    if (updateInterval) clearInterval(updateInterval);
-    updateInterval = setInterval(() => updateUsageStatus(ctx), POLL_INTERVAL_MS);
+    updateInterval = setInterval(backgroundUpdate, POLL_INTERVAL_MS);
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -421,6 +456,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (_event, ctx) => {
+    currentCtx = ctx;
     if (!isAnthropicModel) return;
 
     const wasFirstTurn = !hasAnthropicTurn;
@@ -428,7 +464,11 @@ export default function (pi: ExtensionAPI) {
 
     if (wasFirstTurn) {
       // First turn in session: fetch after a short delay (respects all guards)
-      setTimeout(() => updateUsageStatus(ctx), 5000);
+      if (firstTurnTimeout) clearTimeout(firstTurnTimeout);
+      firstTurnTimeout = setTimeout(() => {
+        firstTurnTimeout = null;
+        void backgroundUpdate();
+      }, 5000);
     } else {
       // Subsequent turns: just re-render cached status
       renderStatus(ctx);
@@ -436,10 +476,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    if (updateInterval) {
-      clearInterval(updateInterval);
-      updateInterval = null;
-    }
+    clearTimers();
+    currentCtx = null;
   });
 
   // --- Manual refresh command ---
