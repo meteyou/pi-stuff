@@ -544,6 +544,17 @@ async function getMergeBase(
 			return mergeBase.trim();
 		}
 
+		// Fall back to the remote-tracked branch (e.g. the base branch of a
+		// checked-out PR/MR that doesn't exist locally)
+		const { stdout: remoteMergeBase, code: remoteCode } = await pi.exec("git", [
+			"merge-base",
+			"HEAD",
+			`origin/${branch}`,
+		]);
+		if (remoteCode === 0 && remoteMergeBase.trim()) {
+			return remoteMergeBase.trim();
+		}
+
 		return null;
 	} catch {
 		return null;
