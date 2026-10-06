@@ -11,8 +11,10 @@
  *
  * Usage:
  * - `/review` - show interactive selector
- * - `/review pr 123` - review PR #123 (checks out locally)
- * - `/review pr https://github.com/owner/repo/pull/123` - review PR from URL
+ * - `/review pr 123` - review PR #123 (GitHub) / MR !123 (GitLab), checked out locally
+ * - `/review pr https://github.com/owner/repo/pull/123` - review PR from GitHub URL
+ * - `/review pr https://gitlab.com/group/project/-/merge_requests/123` - review MR from GitLab URL
+ * - `/review mr 123` - alias for `/review pr` (GitLab-style)
  * - `/review uncommitted` - review uncommitted changes directly
  * - `/review branch main` - review against main branch
  * - `/review commit abc123` - review specific commit
@@ -346,13 +348,15 @@ function hasBlockingReviewFindings(messageText: string): boolean {
 	return hasNeedsAttentionVerdict(messageText);
 }
 
+type ReviewProvider = "github" | "gitlab";
+
 // Review target types (matching Codex's approach)
 type ReviewTarget =
 	| { type: "uncommitted" }
 	| { type: "baseBranch"; branch: string }
 	| { type: "commit"; sha: string; title?: string }
 	| { type: "custom"; instructions: string }
-	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
+	| { type: "pullRequest"; provider: ReviewProvider; prNumber: number; baseBranch: string; title: string }
 	| { type: "folder"; paths: string[] };
 
 // Prompts (adapted from Codex)
@@ -374,10 +378,10 @@ const COMMIT_PROMPT_WITH_TITLE =
 const COMMIT_PROMPT = "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.";
 
 const PULL_REQUEST_PROMPT =
-	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
+	'Review {requestLabel} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
 
 const PULL_REQUEST_PROMPT_FALLBACK =
-	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.';
+	'Review {requestLabel} ("{title}") against the base branch \'{baseBranch}\'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.';
 
 const FOLDER_REVIEW_PROMPT =
 	"Review the code in the following paths: {paths}. This is a snapshot review (not a diff). Read the files directly in these paths and provide prioritized, actionable findings.";
@@ -614,26 +618,87 @@ async function hasPendingChanges(pi: ExtensionAPI): Promise<boolean> {
 }
 
 /**
- * Parse a PR reference (URL or number) and return the PR number
+ * Parse a PR/MR reference (URL or number) and return the number plus, for
+ * URLs, the provider implied by the URL
  */
-function parsePrReference(ref: string): number | null {
+function parsePrReference(ref: string): { number: number; provider?: ReviewProvider } | null {
 	const trimmed = ref.trim();
 
-	// Try as a number first
+	// Try as a number first (provider is resolved later from the git remotes)
 	const num = parseInt(trimmed, 10);
 	if (!isNaN(num) && num > 0) {
-		return num;
+		return { number: num };
 	}
 
-	// Try to extract from GitHub URL
+	// Try to extract from a GitHub URL
 	// Formats: https://github.com/owner/repo/pull/123
 	//          github.com/owner/repo/pull/123
-	const urlMatch = trimmed.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/);
-	if (urlMatch) {
-		return parseInt(urlMatch[1], 10);
+	const githubMatch = trimmed.match(/github\.com\/[^/]+\/[^/]+\/pulls?\/(\d+)/);
+	if (githubMatch) {
+		return { number: parseInt(githubMatch[1], 10), provider: "github" };
+	}
+
+	// Try to extract from a GitLab URL
+	// Formats: https://gitlab.com/group/project/-/merge_requests/123
+	//          https://gitlab.example.com/group/project/-/merge_requests/123
+	//          https://gitlab.com/group/project/merge_requests/123 (legacy path)
+	const gitlabMatch = trimmed.match(/\/\-\/merge_requests\/(\d+)/) ?? trimmed.match(/\/merge_requests\/(\d+)/);
+	if (gitlabMatch) {
+		return { number: parseInt(gitlabMatch[1], 10), provider: "gitlab" };
 	}
 
 	return null;
+}
+
+/**
+ * Detect the review provider (GitHub vs GitLab) from the configured git remotes
+ */
+async function detectProviderFromRemotes(pi: ExtensionAPI): Promise<ReviewProvider | null> {
+	const { stdout, code } = await pi.exec("git", ["remote", "-v"]);
+	if (code !== 0) return null;
+
+	for (const line of stdout.split("\n")) {
+		// Line format: <name>\t<url> (fetch|push) - the URL is the second field
+		const url = line.split("\t")[1]?.trim();
+		if (!url) continue;
+		if (/gitlab/i.test(url)) return "gitlab";
+		if (/github/i.test(url)) return "github";
+	}
+
+	return null;
+}
+
+/**
+ * Check whether a CLI binary is available
+ */
+async function isCliAvailable(pi: ExtensionAPI, command: string): Promise<boolean> {
+	try {
+		const { code } = await pi.exec(command, ["--version"]);
+		return code === 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Resolve the review provider for a PR/MR reference. URL-based references carry
+ * their provider; bare numbers are resolved from the git remotes, falling back
+ * to whichever CLI is installed (defaulting to GitHub).
+ */
+async function resolveReviewProvider(
+	pi: ExtensionAPI,
+	providerFromUrl: ReviewProvider | undefined,
+): Promise<ReviewProvider> {
+	if (providerFromUrl) return providerFromUrl;
+
+	const fromRemotes = await detectProviderFromRemotes(pi);
+	if (fromRemotes) return fromRemotes;
+
+	if ((await isCliAvailable(pi, "glab")) && !(await isCliAvailable(pi, "gh"))) {
+		return "gitlab";
+	}
+
+	return "github";
 }
 
 /**
@@ -659,10 +724,12 @@ async function getPrInfo(pi: ExtensionAPI, prNumber: number): Promise<{ baseBran
 	}
 }
 
+type ReviewRequestCheckoutResult = { success: boolean; error?: string; warning?: string };
+
 /**
  * Checkout a PR using GitHub CLI
  */
-async function checkoutPr(pi: ExtensionAPI, prNumber: number): Promise<{ success: boolean; error?: string }> {
+async function checkoutPr(pi: ExtensionAPI, prNumber: number): Promise<ReviewRequestCheckoutResult> {
 	const { stdout, stderr, code } = await pi.exec("gh", ["pr", "checkout", String(prNumber)]);
 
 	if (code !== 0) {
@@ -670,6 +737,75 @@ async function checkoutPr(pi: ExtensionAPI, prNumber: number): Promise<{ success
 	}
 
 	return { success: true };
+}
+
+/**
+ * Get MR information from GitLab CLI
+ */
+async function getMrInfo(pi: ExtensionAPI, mrIid: number): Promise<{ baseBranch: string; title: string; headBranch: string } | null> {
+	const { stdout, code } = await pi.exec("glab", ["mr", "view", String(mrIid), "--output", "json"]);
+
+	if (code !== 0) return null;
+
+	try {
+		const data = JSON.parse(stdout);
+		if (!data?.base_ref || !data?.head_ref) return null;
+		return {
+			baseBranch: data.base_ref,
+			title: data.title ?? "",
+			headBranch: data.head_ref,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Checkout a GitLab MR using its merge-request ref (works without `glab` and
+ * also for MRs from forks)
+ */
+async function checkoutMr(
+	pi: ExtensionAPI,
+	mrIid: number,
+	headBranch: string,
+	baseBranch: string,
+): Promise<ReviewRequestCheckoutResult> {
+	// Fetch the MR head into a dedicated ref (force, so it matches the MR even
+	// if a local copy of the branch exists)
+	const mrHeadRef = `refs/remotes/origin/merge-requests/${mrIid}/head`;
+	const { code, stderr } = await pi.exec("git", [
+		"fetch",
+		"origin",
+		`+refs/merge-requests/${mrIid}/head:${mrHeadRef}`,
+	]);
+	if (code !== 0) {
+		return { success: false, error: stderr || `Failed to fetch MR !${mrIid} head ref` };
+	}
+
+	// Make sure the base branch ref exists locally for merge-base calculation
+	const { code: baseFetchCode, stderr: baseFetchStderr } = await pi.exec("git", [
+		"fetch",
+		"origin",
+		baseBranch,
+	]);
+	const warning =
+		baseFetchCode !== 0
+			? `Could not fetch base branch '${baseBranch}' from origin (${
+					baseFetchStderr.trim() || `exit code ${baseFetchCode}`
+			  }); the merge base for the review may be missing or stale.`
+			: undefined;
+
+	const { code: checkoutCode, stderr: checkoutStderr } = await pi.exec("git", [
+		"checkout",
+		"-B",
+		headBranch,
+		mrHeadRef,
+	]);
+	if (checkoutCode !== 0) {
+		return { success: false, error: checkoutStderr || `Failed to checkout ${headBranch}` };
+	}
+
+	return { success: true, warning };
 }
 
 /**
@@ -734,16 +870,16 @@ async function buildReviewPrompt(
 
 		case "pullRequest": {
 			const mergeBase = await getMergeBase(pi, target.baseBranch);
-			const basePrompt = mergeBase
-				? PULL_REQUEST_PROMPT
-						.replace(/{prNumber}/g, String(target.prNumber))
-						.replace(/{title}/g, target.title)
-						.replace(/{baseBranch}/g, target.baseBranch)
-						.replace(/{mergeBaseSha}/g, mergeBase)
-				: PULL_REQUEST_PROMPT_FALLBACK
-						.replace(/{prNumber}/g, String(target.prNumber))
-						.replace(/{title}/g, target.title)
-						.replace(/{baseBranch}/g, target.baseBranch);
+			const requestLabel =
+				target.provider === "gitlab"
+					? `merge request !${target.prNumber}`
+					: `pull request #${target.prNumber}`;
+			const template = mergeBase ? PULL_REQUEST_PROMPT : PULL_REQUEST_PROMPT_FALLBACK;
+			const basePrompt = template
+				.replace(/{requestLabel}/g, requestLabel)
+				.replace(/{title}/g, target.title)
+				.replace(/{baseBranch}/g, target.baseBranch)
+				.replace(/{mergeBaseSha}/g, mergeBase ?? "");
 			return includeLocalChanges ? `${basePrompt} ${LOCAL_CHANGES_REVIEW_INSTRUCTIONS}` : basePrompt;
 		}
 
@@ -770,7 +906,8 @@ function getUserFacingHint(target: ReviewTarget): string {
 
 		case "pullRequest": {
 			const shortTitle = target.title.length > 30 ? target.title.slice(0, 27) + "..." : target.title;
-			return `PR #${target.prNumber}: ${shortTitle}`;
+			const label = target.provider === "gitlab" ? `MR !${target.prNumber}` : `PR #${target.prNumber}`;
+			return `${label}: ${shortTitle}`;
 		}
 
 		case "folder": {
@@ -846,7 +983,7 @@ const REVIEW_PRESETS = [
 	{ value: "uncommitted", label: "Review uncommitted changes", description: "" },
 	{ value: "baseBranch", label: "Review against a base branch", description: "(local)" },
 	{ value: "commit", label: "Review a commit", description: "" },
-	{ value: "pullRequest", label: "Review a pull request", description: "(GitHub PR)" },
+	{ value: "pullRequest", label: "Review a pull request / merge request", description: "(GitHub PR / GitLab MR)" },
 	{ value: "folder", label: "Review a folder (or more)", description: "(snapshot, not diff)" },
 	{ value: "custom", label: "Custom review instructions", description: "" },
 ] as const;
@@ -1270,61 +1407,88 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Show PR input and handle checkout
+	 * Resolve a PR/MR reference (number or URL), fetch its metadata, check it
+	 * out locally, and build the review target
 	 */
-	async function showPrInput(ctx: ExtensionContext): Promise<ReviewTarget | null> {
+	async function resolveReviewRequestTarget(ctx: ExtensionContext, ref: string): Promise<ReviewTarget | null> {
 		// First check for pending changes that would prevent branch switching
 		if (await hasPendingChanges(pi)) {
-			ctx.ui.notify("Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.", "error");
+			ctx.ui.notify("Cannot checkout PR/MR: you have uncommitted changes. Please commit or stash them first.", "error");
 			return null;
 		}
 
-		// Get PR reference from user
-		const prRef = await ctx.ui.editor(
-			"Enter PR number or URL (e.g. 123 or https://github.com/owner/repo/pull/123):",
-			"",
-		);
-
-		if (!prRef?.trim()) return null;
-
-		const prNumber = parsePrReference(prRef);
-		if (!prNumber) {
-			ctx.ui.notify("Invalid PR reference. Enter a number or GitHub PR URL.", "error");
+		const parsedRef = parsePrReference(ref);
+		if (!parsedRef) {
+			ctx.ui.notify("Invalid PR/MR reference. Enter a number, a GitHub PR URL, or a GitLab MR URL.", "error");
 			return null;
 		}
 
-		// Get PR info from GitHub
-		ctx.ui.notify(`Fetching PR #${prNumber} info...`, "info");
-		const prInfo = await getPrInfo(pi, prNumber);
+		const provider = await resolveReviewProvider(pi, parsedRef.provider);
+		const kindLabel = provider === "gitlab" ? "MR" : "PR";
+		const kindRef = provider === "gitlab" ? `!${parsedRef.number}` : `#${parsedRef.number}`;
 
-		if (!prInfo) {
-			ctx.ui.notify(`Could not find PR #${prNumber}. Make sure gh is authenticated and the PR exists.`, "error");
+		// Get PR/MR info
+		ctx.ui.notify(`Fetching ${kindLabel} ${kindRef} info...`, "info");
+		const requestInfo =
+			provider === "gitlab"
+				? await getMrInfo(pi, parsedRef.number)
+				: await getPrInfo(pi, parsedRef.number);
+
+		if (!requestInfo) {
+			const cli = provider === "gitlab" ? "glab" : "gh";
+			ctx.ui.notify(
+				`Could not find ${kindLabel} ${kindRef}. Make sure ${cli} is installed, authenticated, and the ${kindLabel} exists.`,
+				"error",
+			);
 			return null;
 		}
 
 		// Check again for pending changes (in case something changed)
 		if (await hasPendingChanges(pi)) {
-			ctx.ui.notify("Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.", "error");
+			ctx.ui.notify("Cannot checkout PR/MR: you have uncommitted changes. Please commit or stash them first.", "error");
 			return null;
 		}
 
-		// Checkout the PR
-		ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
-		const checkoutResult = await checkoutPr(pi, prNumber);
+		// Checkout the PR/MR
+		ctx.ui.notify(`Checking out ${kindLabel} ${kindRef}...`, "info");
+		const checkoutResult =
+			provider === "gitlab"
+				? await checkoutMr(pi, parsedRef.number, requestInfo.headBranch, requestInfo.baseBranch)
+				: await checkoutPr(pi, parsedRef.number);
 
 		if (!checkoutResult.success) {
-			ctx.ui.notify(`Failed to checkout PR: ${checkoutResult.error}`, "error");
+			ctx.ui.notify(`Failed to checkout ${kindLabel} ${kindRef}: ${checkoutResult.error}`, "error");
 			return null;
 		}
 
-		ctx.ui.notify(`Checked out PR #${prNumber} (${prInfo.headBranch})`, "info");
+		if (checkoutResult.warning) {
+			ctx.ui.notify(checkoutResult.warning, "warning");
+		}
+
+		ctx.ui.notify(`Checked out ${kindLabel} ${kindRef} (${requestInfo.headBranch})`, "info");
 
 		return {
 			type: "pullRequest",
-			prNumber,
-			baseBranch: prInfo.baseBranch,
-			title: prInfo.title,
+			provider,
+			prNumber: parsedRef.number,
+			baseBranch: requestInfo.baseBranch,
+			title: requestInfo.title,
 		};
+	}
+
+	/**
+	 * Show PR/MR input and handle checkout
+	 */
+	async function showPrInput(ctx: ExtensionContext): Promise<ReviewTarget | null> {
+		// Get PR/MR reference from user
+		const prRef = await ctx.ui.editor(
+			"Enter PR/MR number or URL (e.g. 123, https://github.com/owner/repo/pull/123, or https://gitlab.com/group/project/-/merge_requests/123):",
+			"",
+		);
+
+		if (!prRef?.trim()) return null;
+
+		return resolveReviewRequestTarget(ctx, prRef);
 	}
 
 	/**
@@ -1457,7 +1621,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				return { type: "folder", paths };
 			}
 
-			case "pr": {
+			case "pr":
+			case "mr": {
 				const ref = parts[1];
 				if (!ref) return null;
 				return { type: "pr", ref };
@@ -1469,47 +1634,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Handle PR checkout and return a ReviewTarget (or null on failure)
+	 * Handle PR/MR checkout and return a ReviewTarget (or null on failure)
 	 */
 	async function handlePrCheckout(ctx: ExtensionContext, ref: string): Promise<ReviewTarget | null> {
-		// First check for pending changes
-		if (await hasPendingChanges(pi)) {
-			ctx.ui.notify("Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.", "error");
-			return null;
-		}
-
-		const prNumber = parsePrReference(ref);
-		if (!prNumber) {
-			ctx.ui.notify("Invalid PR reference. Enter a number or GitHub PR URL.", "error");
-			return null;
-		}
-
-		// Get PR info
-		ctx.ui.notify(`Fetching PR #${prNumber} info...`, "info");
-		const prInfo = await getPrInfo(pi, prNumber);
-
-		if (!prInfo) {
-			ctx.ui.notify(`Could not find PR #${prNumber}. Make sure gh is authenticated and the PR exists.`, "error");
-			return null;
-		}
-
-		// Checkout the PR
-		ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
-		const checkoutResult = await checkoutPr(pi, prNumber);
-
-		if (!checkoutResult.success) {
-			ctx.ui.notify(`Failed to checkout PR: ${checkoutResult.error}`, "error");
-			return null;
-		}
-
-		ctx.ui.notify(`Checked out PR #${prNumber} (${prInfo.headBranch})`, "info");
-
-		return {
-			type: "pullRequest",
-			prNumber,
-			baseBranch: prInfo.baseBranch,
-			title: prInfo.title,
-		};
+		return resolveReviewRequestTarget(ctx, ref);
 	}
 
 	function isLoopCompatibleTarget(target: ReviewTarget): boolean {
@@ -1634,7 +1762,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 	// Register the /review command
 	pi.registerCommand("review", {
-		description: "Review code changes (PR, uncommitted, branch, commit, folder, or custom)",
+		description: "Review code changes (PR/MR, uncommitted, branch, commit, folder, or custom)",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Review requires interactive mode", "error");
