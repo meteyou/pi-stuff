@@ -1006,10 +1006,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		applyAllReviewState(ctx);
 	});
 
-	pi.on("session_switch", (_event, ctx) => {
-		applyAllReviewState(ctx);
-	});
-
 	pi.on("session_tree", (_event, ctx) => {
 		applyAllReviewState(ctx);
 	});
@@ -1764,7 +1760,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	pi.registerCommand("review", {
 		description: "Review code changes (PR/MR, uncommitted, branch, commit, folder, or custom)",
 		handler: async (args, ctx) => {
-			if (!ctx.hasUI) {
+			if (ctx.mode !== "tui") {
 				ctx.ui.notify("Review requires interactive mode", "error");
 				return;
 			}
@@ -1958,7 +1954,7 @@ Instructions:
 		originId: string,
 		showLoader: boolean,
 	): Promise<{ cancelled: boolean; error?: string } | null> {
-		if (showLoader && ctx.hasUI) {
+		if (showLoader && ctx.mode === "tui") {
 			return ctx.ui.custom<{ cancelled: boolean; error?: string } | null>((tui, theme, _kb, done) => {
 				const loader = new BorderedLoader(tui, theme, "Returning and summarizing review branch...");
 				loader.onAbort = () => done(null);
