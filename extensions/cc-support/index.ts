@@ -1,15 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getModels } from "@earendil-works/pi-ai";
 
 export const CLAUDE_CODE_VERSION = "2.1.280";
 
 export default function ccSupportExtension(pi: ExtensionAPI) {
-	// Override user-agent to advertise Claude Code CLI version
-	const anthropicBaseUrl =
-		getModels("anthropic")[0]?.baseUrl ?? "https://api.anthropic.com";
-
+	// Override user-agent to advertise Claude Code CLI version.
+	// No baseUrl: the built-in (or models.json) base URL stays in effect.
 	pi.registerProvider("anthropic", {
-		baseUrl: anthropicBaseUrl,
 		headers: {
 			"user-agent": `claude-cli/${CLAUDE_CODE_VERSION}`,
 		},
