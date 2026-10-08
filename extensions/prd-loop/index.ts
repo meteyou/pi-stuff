@@ -468,7 +468,7 @@ function getFinalAssistantText(messages: Array<{ role: string; content: Array<{ 
 
 const SIGKILL_TIMEOUT_MS = 5000;
 
-/** Timeout (ms) to wait for process exit after receiving agent_end event. */
+/** Timeout (ms) to wait for process exit after receiving the agent_settled event. */
 const AGENT_END_EXIT_TIMEOUT_MS = 10000;
 
 /**
@@ -543,8 +543,10 @@ export async function spawnSubagent(options: {
 	};
 
 	const messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> = [];
-	/** Authoritative messages from agent_end event (if received). */
+	/** Messages from the most recent agent_end event (one low-level run; retries/recovery can emit several). */
 	let agentEndMessages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> | null = null;
+	/** True once agent_settled was received: pi has no remaining automatic work. */
+	let settled = false;
 	let stderr = "";
 	let wasAborted = false;
 
@@ -576,33 +578,21 @@ export async function spawnSubagent(options: {
 					return;
 				}
 
-				// agent_end is the authoritative completion signal — it contains the
-				// full, definitive message list (survives auto-compaction).
+				// agent_end closes one low-level run. Automatic retries, overflow
+				// recovery or compaction can still continue afterwards, so keep only
+				// the latest run's messages (they contain the final assistant answer).
+				// Usage is accumulated from message_end events across all runs.
 				if (event.type === "agent_end" && Array.isArray(event.messages)) {
 					agentEndMessages = event.messages;
+				}
 
-					// Recalculate usage from the authoritative messages
-					usage.turns = 0;
-					usage.input = 0;
-					usage.output = 0;
-					usage.cacheRead = 0;
-					usage.cacheWrite = 0;
-					usage.cost = 0;
-					usage.contextTokens = 0;
-					for (const msg of event.messages) {
-						if (msg.role === "assistant" && msg.usage) {
-							usage.turns++;
-							usage.input += msg.usage.input || 0;
-							usage.output += msg.usage.output || 0;
-							usage.cacheRead += msg.usage.cacheRead || 0;
-							usage.cacheWrite += msg.usage.cacheWrite || 0;
-							usage.cost += msg.usage.cost?.total || 0;
-							usage.contextTokens = msg.usage.totalTokens || 0;
-						}
-					}
+				// agent_settled is the authoritative completion signal: pi will not
+				// continue automatically anymore.
+				if (event.type === "agent_settled" && !settled) {
+					settled = true;
 
 					// Safety: if the process doesn't exit within timeout after
-					// agent_end, force-kill it and resolve (prevents hanging).
+					// agent_settled, force-kill it and resolve (prevents hanging).
 					agentEndExitTimer = setTimeout(() => {
 						if (!resolved) {
 							proc.kill("SIGTERM");
@@ -614,8 +604,7 @@ export async function spawnSubagent(options: {
 					}, AGENT_END_EXIT_TIMEOUT_MS);
 				}
 
-				// Track message_end events for incremental usage stats and live
-				// activity updates (agent_end will override the final usage).
+				// Track message_end events for usage stats and live activity updates.
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message;
 					messages.push(msg);
@@ -739,9 +728,9 @@ export async function spawnSubagent(options: {
 			};
 		}
 
-		// Handle non-zero exit code — but if we received agent_end, the agent
+		// Handle non-zero exit code — but if we received agent_settled, the agent
 		// DID complete; the non-zero code is likely from post-agent cleanup.
-		if (exitCode !== 0 && !agentEndMessages) {
+		if (exitCode !== 0 && !settled) {
 			return {
 				success: false,
 				errors: [`Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`],
@@ -750,7 +739,7 @@ export async function spawnSubagent(options: {
 			};
 		}
 
-		// Prefer authoritative agent_end messages, fall back to incrementally
+		// Prefer the last run's agent_end messages, fall back to incrementally
 		// collected message_end messages.
 		const finalMessages = agentEndMessages ?? messages;
 		const finalText = getFinalAssistantText(finalMessages);
