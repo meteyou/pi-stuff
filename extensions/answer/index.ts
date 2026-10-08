@@ -73,9 +73,9 @@ Example output:
  * Uses the same provider as the current model to reuse the active subscription/API key.
  */
 const EXTRACTION_MODELS: Record<string, string> = {
-	"anthropic": "claude-haiku-4-5",
-	"openai": "gpt-5.4-mini",
-	"openai-codex": "gpt-5.4-mini",
+	"anthropic": "claude-haiku-5-5",
+	"openai": "gpt-6-luna",
+	"openai-codex": "gpt-6-luna",
 	"google": "gemini-3-flash-preview",
 	"google-gemini-cli": "gemini-3-flash-preview",
 	"google-antigravity": "gemini-3-flash",
