@@ -33,10 +33,19 @@ This extension helps you quickly respond when the assistant asks multiple questi
 
 ## Extraction Model Selection
 
-Preferred model order:
-1. `openai-codex/gpt-5.1-codex-mini` (if API key is available)
-2. `anthropic/claude-haiku-4-5` (if API key is available)
-3. Current active model (fallback)
+If the last message doesn't use the structured `Q:`/`A:` format, questions are extracted by an LLM.
+A cheap model from the **same provider** as the current model is used (reuses the active subscription/API key):
+
+| Provider | Extraction model |
+|----------|------------------|
+| `anthropic` | `claude-haiku-5-5` |
+| `openai` | `gpt-6-luna` |
+| `openai-codex` | `gpt-6-luna` |
+
+Fallbacks:
+- Provider not listed, model unknown, or no auth configured → current active model is used.
+- Request with the cheap model fails (API error, no access, unparsable response) → retried once with the current active model.
+- If both fail, an error notification with the reason is shown.
 
 ## Interactive Controls
 

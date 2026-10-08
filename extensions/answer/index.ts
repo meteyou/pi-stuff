@@ -10,8 +10,8 @@
  * 4. Submits the compiled answers when done
  */
 
-import { complete, type Model, type Api, type UserMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, TextContent, UserMessage } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
@@ -76,24 +76,13 @@ const EXTRACTION_MODELS: Record<string, string> = {
 	"anthropic": "claude-haiku-5-5",
 	"openai": "gpt-6-luna",
 	"openai-codex": "gpt-6-luna",
-	"google": "gemini-3-flash-preview",
-	"google-gemini-cli": "gemini-3-flash-preview",
-	"google-antigravity": "gemini-3-flash",
-	"google-vertex": "gemini-3-flash-preview",
-	"github-copilot": "gpt-5.4-mini",
 };
 
 /**
  * Select the cheapest/fastest model from the same provider as the current model.
  * Falls back to the current model if no mapping exists or the model isn't available.
  */
-async function selectExtractionModel(
-	currentModel: Model<Api>,
-	modelRegistry: {
-		find: (provider: string, modelId: string) => Model<Api> | undefined;
-		getApiKeyAndHeaders: (model: Model<Api>) => Promise<{ ok: true; apiKey?: string; headers?: Record<string, string> } | { ok: false; error: string }>;
-	},
-): Promise<Model<Api>> {
+function selectExtractionModel(currentModel: Model<Api>, modelRegistry: ModelRegistry): Model<Api> {
 	const cheapModelId = EXTRACTION_MODELS[currentModel.provider];
 	if (!cheapModelId) {
 		return currentModel;
@@ -109,8 +98,7 @@ async function selectExtractionModel(
 		return currentModel;
 	}
 
-	const auth = await modelRegistry.getApiKeyAndHeaders(cheapModel);
-	if (!auth.ok || !auth.apiKey) {
+	if (!modelRegistry.hasConfiguredAuth(cheapModel)) {
 		return currentModel;
 	}
 
@@ -242,9 +230,11 @@ class QnAComponent implements Component {
 		const editorTheme: EditorTheme = {
 			borderColor: this.dim,
 			selectList: {
-				selectedBg: (s: string) => `\x1b[44m${s}\x1b[0m`,
-				matchHighlight: this.cyan,
-				itemSecondary: this.gray,
+				selectedPrefix: this.cyan,
+				selectedText: this.cyan,
+				description: this.gray,
+				scrollInfo: this.dim,
+				noMatch: this.yellow,
 			},
 		};
 
@@ -492,7 +482,7 @@ class QnAComponent implements Component {
 
 export default function (pi: ExtensionAPI) {
 	const answerHandler = async (ctx: ExtensionContext) => {
-			if (!ctx.hasUI) {
+			if (ctx.mode !== "tui") {
 				ctx.ui.notify("answer requires interactive mode", "error");
 				return;
 			}
@@ -536,53 +526,90 @@ export default function (pi: ExtensionAPI) {
 
 			// Fall back to LLM extraction if structured parsing didn't match
 			if (!extractedQuestions) {
-				const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
+				const currentModel = ctx.model;
+				const extractionModel = selectExtractionModel(currentModel, ctx.modelRegistry);
 
-				const extractionResult = await ctx.ui.custom<ExtractionResult | null>((tui, theme, _kb, done) => {
+				type ExtractionOutcome =
+					| { kind: "ok"; result: ExtractionResult }
+					| { kind: "aborted" }
+					| { kind: "error"; message: string };
+
+				// Try the cheap model first, then fall back to the current model on failure
+				const candidates = [extractionModel];
+				if (extractionModel !== currentModel) {
+					candidates.push(currentModel);
+				}
+
+				const outcome = await ctx.ui.custom<ExtractionOutcome>((tui, theme, _kb, done) => {
 					const loader = new BorderedLoader(tui, theme, `Extracting questions using ${extractionModel.id}...`);
-					loader.onAbort = () => done(null);
+					loader.onAbort = () => done({ kind: "aborted" });
 
-					const doExtract = async () => {
-						const auth = await ctx.modelRegistry.getApiKeyAndHeaders(extractionModel);
-						const apiKey = auth.ok ? auth.apiKey : undefined;
-						const headers = auth.ok ? auth.headers : undefined;
+					const tryExtract = async (model: Model<Api>): Promise<ExtractionOutcome> => {
 						const userMessage: UserMessage = {
 							role: "user",
 							content: [{ type: "text", text: lastAssistantText! }],
 							timestamp: Date.now(),
 						};
 
-						const response = await complete(
-							extractionModel,
-							{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-							{ apiKey, headers, signal: loader.signal },
-						);
+						let response;
+						try {
+							// modelRegistry.complete resolves auth (API key, OAuth, headers) at request time
+							response = await ctx.modelRegistry.complete(
+								model,
+								{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
+								{ signal: loader.signal },
+							);
+						} catch (err) {
+							if (loader.signal.aborted) return { kind: "aborted" };
+							return { kind: "error", message: `${model.id}: ${err instanceof Error ? err.message : String(err)}` };
+						}
 
-						if (response.stopReason === "aborted") {
-							return null;
+						if (response.stopReason === "aborted" || loader.signal.aborted) {
+							return { kind: "aborted" };
+						}
+						if (response.stopReason === "error") {
+							return { kind: "error", message: `${model.id}: ${response.errorMessage ?? "unknown error"}` };
 						}
 
 						const responseText = response.content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
+							.filter((c): c is TextContent => c.type === "text")
 							.map((c) => c.text)
 							.join("\n");
 
-						return parseExtractionResult(responseText);
+						const result = parseExtractionResult(responseText);
+						if (!result) {
+							return { kind: "error", message: `${model.id}: could not parse extraction response` };
+						}
+						return { kind: "ok", result };
+					};
+
+					const doExtract = async (): Promise<ExtractionOutcome> => {
+						const errors: string[] = [];
+						for (const model of candidates) {
+							const res = await tryExtract(model);
+							if (res.kind !== "error") return res;
+							errors.push(res.message);
+						}
+						return { kind: "error", message: errors.join("; ") };
 					};
 
 					doExtract()
 						.then(done)
-						.catch(() => done(null));
+						.catch((err) => done({ kind: "error", message: err instanceof Error ? err.message : String(err) }));
 
 					return loader;
 				});
 
-				if (extractionResult === null) {
+				if (outcome.kind === "aborted") {
 					ctx.ui.notify("Cancelled", "info");
 					return;
 				}
+				if (outcome.kind === "error") {
+					ctx.ui.notify(`Question extraction failed: ${outcome.message}`, "error");
+					return;
+				}
 
-				extractedQuestions = extractionResult.questions;
+				extractedQuestions = outcome.result.questions;
 			}
 
 			if (extractedQuestions.length === 0) {
