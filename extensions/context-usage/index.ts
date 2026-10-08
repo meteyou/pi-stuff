@@ -15,7 +15,7 @@
  */
 
 import { type ExtensionAPI, type ExtensionContext, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { type Component, Text } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 
@@ -164,7 +164,10 @@ function shortenPath(path: string, maxLen: number = 40): string {
 
 function getUsageBreakdown(ctx: ExtensionContext, pi: ExtensionAPI): UsageBreakdown | null {
 	const usage = ctx.getContextUsage();
-	if (!usage) return null;
+	// tokens/percent are null when unknown (e.g. right after compaction, before the next response)
+	if (!usage || usage.tokens === null || usage.percent === null) return null;
+	const usedTokens = usage.tokens;
+	const usedPercent = usage.percent;
 
 	const model = ctx.model;
 	if (!model) return null;
@@ -196,7 +199,7 @@ function getUsageBreakdown(ctx: ExtensionContext, pi: ExtensionAPI): UsageBreakd
 	const reserveTokens = settingsManager.getCompactionReserveTokens();
 
 	// Messages = Total - System - Tools
-	const messagesTotal = Math.max(0, usage.tokens - systemPromptTotal - systemTools);
+	const messagesTotal = Math.max(0, usedTokens - systemPromptTotal - systemTools);
 
 	// Loaded skills tokens
 	const sortedLoadedSkills = Array.from(loadedSkills.values()).sort((a, b) => b.tokens - a.tokens);
@@ -204,7 +207,7 @@ function getUsageBreakdown(ctx: ExtensionContext, pi: ExtensionAPI): UsageBreakd
 	const otherMessages = Math.max(0, messagesTotal - loadedSkillsTokens);
 
 	// Free space = Context Window - Used - Reserve
-	const freeSpace = Math.max(0, usage.contextWindow - usage.tokens - reserveTokens);
+	const freeSpace = Math.max(0, usage.contextWindow - usedTokens - reserveTokens);
 
 	// Sort read files by tokens (largest first)
 	const sortedReadFiles = Array.from(readFiles.values()).sort((a, b) => b.tokens - a.tokens);
@@ -220,9 +223,9 @@ function getUsageBreakdown(ctx: ExtensionContext, pi: ExtensionAPI): UsageBreakd
 		otherMessages,
 		freeSpace,
 		reserveTokens,
-		total: usage.tokens,
+		total: usedTokens,
 		contextWindow: usage.contextWindow,
-		percent: usage.percent,
+		percent: usedPercent,
 		model: `${model.provider}/${model.id}`,
 		readFiles: sortedReadFiles,
 		agentsFiles,
@@ -393,17 +396,10 @@ function renderLoadedSkills(breakdown: UsageBreakdown, theme: any): string[] {
 }
 
 export default function (pi: ExtensionAPI) {
-	// Reset on new session
+	// Reset on every session start (startup, reload, new, resume, fork)
 	pi.on("session_start", async () => {
 		readFiles = new Map();
 		loadedSkills = new Map();
-	});
-
-	pi.on("session_switch", async (event) => {
-		if (event.reason === "new") {
-			readFiles = new Map();
-			loadedSkills = new Map();
-		}
 	});
 
 	// Track read tool calls
@@ -469,6 +465,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("context", {
 		description: "Display context window usage visually",
 		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/context requires interactive mode", "error");
+				return;
+			}
+
 			const breakdown = getUsageBreakdown(ctx, pi);
 			if (!breakdown) {
 				ctx.ui.notify("No context information available", "warning");
@@ -521,13 +522,12 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-				const component = new Text(content.join("\n"), 1, 1);
-
-				component.handleInput = (data) => {
-					done();
-					return true;
+				const text = new Text(content.join("\n"), 1, 1);
+				const component: Component = {
+					render: (width) => text.render(width),
+					invalidate: () => text.invalidate(),
+					handleInput: () => done(),
 				};
-
 				return component;
 			});
 		},
