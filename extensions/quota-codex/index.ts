@@ -6,7 +6,7 @@
  * Requires /login with OpenAI Codex OAuth.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -233,7 +233,7 @@ function formatResetTimeNice(unixSeconds: number, showTimezone: boolean = false)
 function renderProgressBar(
   pct: number,
   width: number,
-  theme: { fg: (color: string, text: string) => string }
+  theme: Pick<Theme, "fg">
 ): string {
   const safePct = normalizePct(pct);
   const filled = (safePct / 100) * width;
@@ -262,9 +262,45 @@ function limitLabel(seconds: number): string {
   return `${Math.round(seconds / 60)}m`;
 }
 
+/** pi throws this when a ctx captured before session replacement/reload is used. */
+function isStaleCtxError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("ctx is stale");
+}
+
 export default function (pi: ExtensionAPI) {
   let lastUsage: CodexUsage | null = null;
   let updateInterval: ReturnType<typeof setInterval> | null = null;
+  let firstTurnTimeout: ReturnType<typeof setTimeout> | null = null;
+  // Always points to the ctx of the currently active session. Timers must use
+  // this instead of a captured ctx, which becomes stale after newSession/fork/
+  // switchSession/reload and throws when accessed.
+  let currentCtx: ExtensionContext | null = null;
+
+  function clearTimers() {
+    if (updateInterval) {
+      clearInterval(updateInterval);
+      updateInterval = null;
+    }
+    if (firstTurnTimeout) {
+      clearTimeout(firstTurnTimeout);
+      firstTurnTimeout = null;
+    }
+  }
+
+  async function backgroundUpdate() {
+    const ctx = currentCtx;
+    if (!ctx) return;
+    try {
+      await updateUsageStatus(ctx);
+    } catch (err) {
+      // ctx became stale (session replaced/reloaded) — stop using it.
+      // Other errors (network etc.) are ignored; the next poll retries.
+      if (isStaleCtxError(err) && currentCtx === ctx) {
+        currentCtx = null;
+        clearTimers();
+      }
+    }
+  }
   let isCodexModel = false;
   let hasCodexTurn = false;
   let lastFetchAt = 0;
@@ -429,6 +465,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    clearTimers();
+    currentCtx = ctx;
     isCodexModel = checkIsCodexModel(ctx);
     hasCodexTurn = false;
 
@@ -438,8 +476,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Background poll every 15 minutes
-    if (updateInterval) clearInterval(updateInterval);
-    updateInterval = setInterval(() => updateUsageStatus(ctx), POLL_INTERVAL_MS);
+    updateInterval = setInterval(backgroundUpdate, POLL_INTERVAL_MS);
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -453,6 +490,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (_event, ctx) => {
+    currentCtx = ctx;
     if (!isCodexModel) return;
 
     const wasFirstTurn = !hasCodexTurn;
@@ -460,7 +498,11 @@ export default function (pi: ExtensionAPI) {
 
     if (wasFirstTurn) {
       // First turn in session: fetch after a short delay (respects all guards)
-      setTimeout(() => updateUsageStatus(ctx), 5000);
+      if (firstTurnTimeout) clearTimeout(firstTurnTimeout);
+      firstTurnTimeout = setTimeout(() => {
+        firstTurnTimeout = null;
+        void backgroundUpdate();
+      }, 5000);
     } else {
       // Subsequent turns: just re-render cached status
       renderStatus(ctx);
@@ -468,13 +510,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    if (updateInterval) {
-      clearInterval(updateInterval);
-      updateInterval = null;
-    }
+    clearTimers();
+    currentCtx = null;
   });
 
-  const showQuotaHandler = async (_args: string[], ctx: ExtensionContext) => {
+  const showQuotaHandler = async (_args: string, ctx: ExtensionContext) => {
     await updateUsageStatus(ctx, { force: true });
 
     if (!lastUsage) {

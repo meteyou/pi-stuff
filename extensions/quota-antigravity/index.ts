@@ -606,8 +606,39 @@ async function getQuotaManager(): Promise<{ manager: QuotaManager; source: strin
     return null;
 }
 
+/** pi throws this when a ctx captured before session replacement/reload is used. */
+function isStaleCtxError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("ctx is stale");
+}
+
 export default function(pi: ExtensionAPI) {
-  let pollingInterval: NodeJS.Timeout | undefined;
+  let pollingInterval: ReturnType<typeof setInterval> | undefined;
+  // Always points to the ctx of the currently active session. The polling timer
+  // must use this instead of a captured ctx, which becomes stale after
+  // newSession/fork/switchSession/reload and throws when accessed.
+  let currentCtx: ExtensionContext | null = null;
+
+  function stopPolling() {
+    if (pollingInterval) {
+      clearInterval(pollingInterval);
+      pollingInterval = undefined;
+    }
+  }
+
+  async function backgroundUpdate() {
+    const ctx = currentCtx;
+    if (!ctx) return;
+    try {
+      await updateStatus(ctx);
+    } catch (err) {
+      // ctx became stale (session replaced/reloaded) — stop using it.
+      // Other errors (network etc.) are ignored; the next poll retries.
+      if (isStaleCtxError(err) && currentCtx === ctx) {
+        currentCtx = null;
+        stopPolling();
+      }
+    }
+  }
   let lastSnapshot: QuotaSnapshot | undefined;
 
   function findCurrentModel(snapshot: QuotaSnapshot, ctx: ExtensionContext): ModelQuotaInfo | undefined {
@@ -666,15 +697,19 @@ export default function(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    stopPolling();
+    currentCtx = ctx;
+
     // Initial check
-    updateStatus(ctx);
-    
+    void backgroundUpdate();
+
     // Poll every 2 minutes
-    pollingInterval = setInterval(() => updateStatus(ctx), 120000);
+    pollingInterval = setInterval(backgroundUpdate, 120000);
   });
 
   pi.on("session_shutdown", async () => {
-    if (pollingInterval) clearInterval(pollingInterval);
+    stopPolling();
+    currentCtx = null;
   });
 
   // Update status when model changes
@@ -685,7 +720,7 @@ export default function(pi: ExtensionAPI) {
   pi.registerCommand("quota-antigravity", {
     description: "Show Antigravity quota usage",
     handler: async (args, ctx) => {
-        if (!ctx.hasUI) {
+        if (ctx.mode !== "tui") {
             return;
         }
 
@@ -728,7 +763,7 @@ export default function(pi: ExtensionAPI) {
         }
         
         for (const model of sortedModels) {
-            const pctNum = Math.round(model.remaining_percentage);
+            const pctNum = Math.round(model.remaining_percentage ?? 100);
             const pctStr = `${pctNum}%`.padStart(4);
             
             let status = "🟢";

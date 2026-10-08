@@ -11,7 +11,7 @@
  * Header format: Aligned with ClaudeCode's services/api/usage.ts
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { CLAUDE_CODE_VERSION } from "../cc-support/index.ts";
 
 // OAuth beta header (matches ClaudeCode constants/oauth.ts OAUTH_BETA_HEADER)
@@ -183,7 +183,7 @@ function getUsageColor(pct: number): "success" | "warning" | "error" {
 function renderProgressBar(
   pct: number,
   width: number,
-  theme: { fg: (color: string, text: string) => string }
+  theme: Pick<Theme, "fg">
 ): string {
   const filled = (pct / 100) * width;
   const fullBlocks = Math.floor(filled);
@@ -203,7 +203,8 @@ function capitalizeFirstLetter(val: string) {
   return String(val).charAt(0).toUpperCase() + String(val).slice(1);
 }
 
-function formatResetTimeNice(resetAt: string, showTimezone: boolean = false): string {
+function formatResetTimeNice(resetAt: string | null, showTimezone: boolean = false): string {
+  if (!resetAt) return "";
   const reset = new Date(resetAt);
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
@@ -229,6 +230,11 @@ function formatResetTimeNice(resetAt: string, showTimezone: boolean = false): st
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
+
+/** pi throws this when a ctx captured before session replacement/reload is used. */
+function isStaleCtxError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("ctx is stale");
+}
 
 export default function (pi: ExtensionAPI) {
   let lastUsage: UsageLimits | null = null;
@@ -268,9 +274,10 @@ export default function (pi: ExtensionAPI) {
     if (!ctx) return;
     try {
       await updateUsageStatus(ctx);
-    } catch {
-      // ctx became stale (session replaced/reloaded) — stop using it
-      if (currentCtx === ctx) {
+    } catch (err) {
+      // ctx became stale (session replaced/reloaded) — stop using it.
+      // Other errors (network etc.) are ignored; the next poll retries.
+      if (isStaleCtxError(err) && currentCtx === ctx) {
         currentCtx = null;
         clearTimers();
       }
