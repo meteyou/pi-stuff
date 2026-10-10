@@ -3,8 +3,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export const CLAUDE_CODE_VERSION = "2.1.280";
 
 // Replace standalone "pi" / "Pi" but preserve file paths and partial words
-// Match "pi" only when it's a whole word (not inside paths, URLs, or other words)
-const PI_WORD = /(?<![\w\/.\-@])pi(?![\w\/.\-])/gi;
+// Match "pi" only when it's a whole word (not inside paths, URLs, or other words).
+// A trailing "." is allowed (end of sentence) unless followed by a word char (e.g. "pi.dev").
+const PI_WORD = /(?<![\w\/.\-@])pi(?![\w\/\-]|\.\w)/gi;
 
 function rewrite(text: string): string {
 	return text.replace(PI_WORD, "claude code");
