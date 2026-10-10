@@ -244,23 +244,40 @@ export const REVIEWER_RESULT_SCHEMA: ResultSchema<ReviewerResult> = {
 	},
 };
 
-export interface FixerResult {
+/** Fixer result for one finding of the batch (`id` = 1-based finding number from the prompt). */
+export interface FixerFindingResult {
+	id: number;
 	status: "fixed" | "rejected";
 	reason: string;
 	summary: string;
+}
+
+export interface FixerResult {
+	results: FixerFindingResult[];
+	/** Checks run once after all fixes (shared by all findings of the batch). */
 	verification: string;
 }
 
-/** prd-fixer: `{ status, reason, summary, verification }`. */
+/** prd-fixer: `{ results: [{ id, status, reason, summary }], verification }` (one entry per finding). */
 export const FIXER_RESULT_SCHEMA: ResultSchema<FixerResult> = {
 	name: "prd-fixer",
 	schema: {
 		type: "object",
 		properties: {
-			status: { type: "string", enum: ["fixed", "rejected"] },
-			reason: { type: "string", optional: true, default: "" },
-			summary: { type: "string", optional: true, default: "" },
-			verification: { type: "string", optional: true, default: "" },
+			results: {
+				type: "array",
+				description: "one entry per finding",
+				items: {
+					type: "object",
+					properties: {
+						id: { type: "number", integer: true, min: 1, description: "1-based finding number from the prompt" },
+						status: { type: "string", enum: ["fixed", "rejected"] },
+						reason: { type: "string", optional: true, default: "" },
+						summary: { type: "string", optional: true, default: "" },
+					},
+				},
+			},
+			verification: { type: "string", optional: true, default: "", description: "checks run once after all fixes" },
 		},
 	},
 };

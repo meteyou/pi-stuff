@@ -3,12 +3,13 @@
  *
  * Drives the per-task loop between the review and fix phases:
  *
- *   review → findings ≥ threshold? → fix each (P0 first) → ≥1 fixed? → review …
+ *   review → findings ≥ threshold? → fix all (one batch) → ≥1 fixed? → review …
  *
  * `nextStep(state)` tells the orchestrator what to do next:
  *
  * - `review`  — run review round `round` (fresh reviewer subagent).
- * - `fix`     — run one fixer subagent for exactly one finding.
+ * - `fix`     — run one fixer subagent for all open findings of the round
+ *               (batch; the checks run once after all fixes).
  * - `commit`  — the cycle converged (no findings at/above the threshold,
  *               no finding fixed in the last round — e.g. all rejected or
  *               unresolved — or the user chose "Commit as-is").
@@ -19,8 +20,9 @@
  * - Findings are split by the fix threshold (inclusive: `P1` = fix P0 + P1).
  *   Findings below the threshold are recorded as deferred (deduplicated
  *   across rounds) and never fixed.
- * - Findings at/above the threshold are fixed sequentially in priority order
- *   (P0 → P3, input order kept within a priority).
+ * - Findings at/above the threshold are fixed together by one fixer, listed
+ *   in priority order (P0 → P3, input order kept within a priority). The
+ *   fixer reports one outcome per finding (`applyFixOutcomes`).
  * - A re-review happens only if at least one finding of the round was fixed.
  * - Fixes are only applied if a re-review can verify them: when review round
  *   `roundLimit` still reports findings at/above the threshold, the cycle
@@ -30,14 +32,15 @@
  *   unresolved and moves to commit.
  * - Rejected findings (with the fixer's reason) are accumulated across rounds
  *   and passed to the next review prompt (`rejectedForNextReview`).
- * - Unresolved findings (fixer crashed / returned no valid result) of the last
- *   round are reported; earlier rounds are superseded by the re-review.
+ * - Unresolved findings (the fixer returned no result for them, or the fix
+ *   phase was skipped) of the last round are reported; earlier rounds are
+ *   superseded by the re-review.
  *
  * All functions are pure: they never mutate the given state and return a new
  * one. Only erasable TypeScript syntax is used (`node --test` type stripping).
  */
 
-import type { FindingPriority, ReviewerResult, ReviewFinding } from "./subagent-result.ts";
+import type { FindingPriority, FixerFindingResult, FixerResult, ReviewerResult, ReviewFinding } from "./subagent-result.ts";
 import type { FixedFinding, RejectedFinding, UnresolvedFinding } from "./execution-report.ts";
 
 export const PRIORITY_ORDER: readonly FindingPriority[] = ["P0", "P1", "P2", "P3"];
@@ -68,7 +71,7 @@ export function splitFindings(
 	return { actionable, deferred };
 }
 
-/** Outcome of one fixer run. `unresolved` = fixer crashed or returned no valid result. */
+/** Fixer outcome for one finding. `unresolved` = the fixer returned no result for it or the fix was skipped. */
 export type FixOutcome =
 	| { status: "fixed"; summary: string; verification?: string }
 	| { status: "rejected"; reason: string; summary?: string }
@@ -108,12 +111,9 @@ export type CycleStep =
 	| { kind: "review"; round: number; roundLimit: number }
 	| {
 		kind: "fix";
-		finding: ReviewFinding;
+		/** All open findings of the round (P0 → P3), fixed by one fixer. */
+		findings: ReviewFinding[];
 		round: number;
-		/** 1-based position of the finding within the round's actionable findings. */
-		index: number;
-		/** Number of actionable findings in the round. */
-		total: number;
 	}
 	| { kind: "commit" }
 	| { kind: "pause"; reason: "round-limit"; round: number; roundLimit: number; openFindings: ReviewFinding[] };
@@ -164,13 +164,7 @@ export function nextStep(state: ReviewCycleState): CycleStep {
 				openFindings: [...last.actionable],
 			};
 		}
-		return {
-			kind: "fix",
-			finding: last.actionable[processed]!,
-			round: last.round,
-			index: processed + 1,
-			total: last.actionable.length,
-		};
+		return { kind: "fix", findings: last.actionable.slice(processed), round: last.round };
 	}
 
 	if (last.outcomes.some((outcome) => outcome.status === "fixed")) {
@@ -215,27 +209,67 @@ export function applyReview(
 	};
 }
 
-/** Record the outcome of the fixer for the finding returned by `nextStep`. Throws if no fix is due. */
-export function applyFixOutcome(state: ReviewCycleState, outcome: FixOutcome): ReviewCycleState {
+/**
+ * Record the fixer outcomes for the findings returned by `nextStep`, one per
+ * finding in the same order. Throws if no fix is due or the count differs.
+ */
+export function applyFixOutcomes(state: ReviewCycleState, outcomes: readonly FixOutcome[]): ReviewCycleState {
 	const step = nextStep(state);
 	if (step.kind !== "fix") throw new Error(`Unexpected fix result (next step is "${step.kind}")`);
+	if (outcomes.length !== step.findings.length) {
+		throw new Error(`Expected ${step.findings.length} fix outcome(s), got ${outcomes.length}`);
+	}
 
 	const rounds = state.rounds.slice(0, -1);
 	const last = state.rounds.at(-1)!;
-	const next: ReviewCycleState = {
+	const fixed = [...state.fixed];
+	const rejected = [...state.rejected];
+	outcomes.forEach((outcome, index) => {
+		const finding = step.findings[index]!;
+		if (outcome.status === "fixed") {
+			fixed.push({ finding, summary: outcome.summary, round: step.round });
+		} else if (outcome.status === "rejected") {
+			rejected.push({ finding, reason: outcome.reason.trim() || "(no reason given)", round: step.round });
+		}
+	});
+	return {
 		...state,
-		rounds: [...rounds, { ...last, outcomes: [...last.outcomes, outcome] }],
+		rounds: [...rounds, { ...last, outcomes: [...last.outcomes, ...outcomes] }],
+		fixed,
+		rejected,
 	};
+}
 
-	if (outcome.status === "fixed") {
-		next.fixed = [...state.fixed, { finding: step.finding, summary: outcome.summary, round: step.round }];
-	} else if (outcome.status === "rejected") {
-		next.rejected = [
-			...state.rejected,
-			{ finding: step.finding, reason: outcome.reason.trim() || "(no reason given)", round: step.round },
-		];
+export const MISSING_FIX_RESULT_REASON = "The fixer returned no result for this finding";
+
+/**
+ * Map the batch fixer result to one outcome per finding (`findingCount`
+ * findings, numbered from 1 in the prompt). The first result per id wins;
+ * results with unknown ids are ignored and findings without a result are
+ * unresolved. The shared verification is attached to every fixed finding.
+ */
+export function fixOutcomesFromResult(findingCount: number, result: FixerResult): FixOutcome[] {
+	const byId = new Map<number, FixerFindingResult>();
+	for (const entry of result.results) {
+		if (!byId.has(entry.id)) byId.set(entry.id, entry);
 	}
-	return next;
+	const verification = result.verification.trim();
+
+	const outcomes: FixOutcome[] = [];
+	for (let id = 1; id <= findingCount; id++) {
+		const entry = byId.get(id);
+		if (!entry) {
+			outcomes.push({ status: "unresolved", reason: MISSING_FIX_RESULT_REASON });
+		} else if (entry.status === "fixed") {
+			const summary = [entry.summary.trim() || entry.reason.trim(), verification ? `Verification: ${verification}` : ""]
+				.filter(Boolean)
+				.join(" — ");
+			outcomes.push({ status: "fixed", summary, verification: verification || undefined });
+		} else {
+			outcomes.push({ status: "rejected", reason: entry.reason.trim() || entry.summary.trim(), summary: entry.summary });
+		}
+	}
+	return outcomes;
 }
 
 /** "One more round": raise the round limit (default by one). */

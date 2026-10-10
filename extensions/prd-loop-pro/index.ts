@@ -22,20 +22,22 @@
  *    unsaved changes Save globally & start / Save for this project only & start
  * 5. Orchestrator loop per task: Implement (prd-worker) → Review-fix cycle
  *    (./review-cycle.ts: fresh prd-reviewer per round, one fresh prd-fixer per
- *    finding at/above the fix threshold, sequentially P0 first; re-review only
- *    if something was fixed; rejected findings + reasons go into the next
- *    review prompt; round limit → pause menu) → Commit (prd-committer; failure
- *    or hook failure pauses the loop, hooks are never bypassed) → Report
+ *    round for all findings at/above the fix threshold (checks run once after
+ *    all fixes); re-review only if something was fixed; rejected findings +
+ *    reasons go into the next review prompt; round limit → pause menu) →
+ *    Commit (prd-committer; failure or hook failure pauses the loop, hooks
+ *    are never bypassed) → Report
  *    (`## Execution Report` in the task todo incl. rounds, fixed, rejected,
  *    deferred, unresolved findings and created commits, close todo, update
  *    PRD Task Index)
  *
  * Unified pause handling (./pause.ts): the loop never fails hard on a task.
  * Implementation still failing after all retries, an unrepairable JSON result,
- * a failing committer/hook, the review round limit and a manual Ctrl+C all open
- * a pause menu that shows the task, the current phase and the reason. Ctrl+C
- * offers "Resume current phase", "Skip phase" (not during commit), "Retry task"
- * (discard changes, restart at implement), "Release", "Skip task" and "Abort".
+ * a crashed reviewer/fixer, a failing committer/hook, the review round limit
+ * and a manual Ctrl+C all open a pause menu that shows the task, the current
+ * phase and the reason. Ctrl+C offers "Resume current phase", "Skip phase"
+ * (not during commit), "Retry task" (discard changes, restart at implement),
+ * "Release", "Skip task" and "Abort".
  * Discard operations ("Retry task", "Skip task") never touch `.pi/`
  * (./discard.ts), even when `.pi/` is tracked.
  *
@@ -48,7 +50,7 @@
  * round; task details show the review round counter, fixed/rejected/deferred/
  * unresolved counts and the cost per phase. The output viewer (`o`) groups the
  * events per subagent run under phase headers (`Implement`, `Review #1`,
- * `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and duration. The
+ * `Fix #1 • 3 findings`, `Commit`) with outcome, cost and duration. The
  * final summary widget lists rounds and counts per task and marks
  * `needs-human` tasks with ⚠️.
  */
@@ -95,12 +97,13 @@ import {
 } from "./task-index.ts";
 import type { TaskInfo } from "./task-index.ts";
 import {
-	applyFixOutcome,
+	applyFixOutcomes,
 	applyReview,
 	commitAsIs,
 	createReviewCycle,
 	cycleCounts,
 	extendRoundLimit,
+	fixOutcomesFromResult,
 	nextStep,
 	openFindings,
 	rejectedForNextReview,
@@ -127,7 +130,8 @@ import {
 	countPhaseEvents,
 	finishPhaseGroup,
 	formatElapsed,
-	formatFixOutcome,
+	fixPhaseLabel,
+	formatFixOutcomes,
 	formatReviewOutcome,
 	phaseGroupMeta,
 	startPhaseGroup,
@@ -1206,7 +1210,7 @@ interface LoopTaskState {
 	status: TaskStatus;
 	/** Current pipeline phase (while running/retrying). */
 	phase?: TaskPhase;
-	/** Display label of the current phase incl. round progress (e.g. "Review 2/3", "Fix 2/4 [P1] Title"). */
+	/** Display label of the current phase incl. round progress (e.g. "Review 2/3", "Fix #1 • 3 findings"). */
 	phaseLabel?: string;
 	/** Review-fix cycle progress (round counter + finding counts), once a review round completed. */
 	review?: TaskReviewProgress;
@@ -1813,7 +1817,7 @@ class SubagentOutputViewer {
 
 	/**
 	 * Events grouped by phase: one header per subagent run (`Implement`,
-	 * `Review #1`, `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and
+	 * `Review #1`, `Fix #1 • 3 findings`, `Commit`) with outcome, cost and
 	 * duration, followed by the run's events.
 	 */
 	private formatEvents(maxWidth: number): string[] {
@@ -2346,7 +2350,7 @@ async function runOrchestratorLoop(
 
 	/**
 	 * Start a new output group for the next subagent run (header in the output
-	 * viewer, e.g. `Review #1` or `Fix #1.1 [P1] <title>`).
+	 * viewer, e.g. `Review #1` or `Fix #1 • 3 findings`).
 	 */
 	const beginPhaseOutput = (taskState: LoopTaskState, ref: PhaseRef, note?: string) => {
 		startPhaseGroup(taskState.outputGroups, ref, { note });
@@ -2774,16 +2778,19 @@ async function runOrchestratorLoop(
 	};
 
 	type FixPhaseOutcome =
-		| { kind: "result"; outcome: FixOutcome }
+		| { kind: "result"; outcomes: FixOutcome[] }
 		| PhaseExit;
 
 	/**
-	 * Fix phase for exactly one finding: a fresh prd-fixer subagent (fix
-	 * model/thinking) gets the task title/body and the finding, fixes it (and
-	 * runs the relevant checks) or rejects it with a reason. A crashed fixer or
-	 * an unparseable result (even after JSON repair) counts the finding as
-	 * unresolved — it never stops the loop. "Skip phase" (Ctrl+C) leaves the
-	 * finding unresolved, too.
+	 * Fix phase for all open findings of a review round (batch): one fresh
+	 * prd-fixer subagent (fix model/thinking) gets the task title/body and the
+	 * numbered findings, fixes the valid ones, rejects the others with a reason
+	 * and runs the relevant checks once after all fixes. It returns one outcome
+	 * per finding; findings without a result count as unresolved. A crashed
+	 * fixer or an unparseable result (even after JSON repair) pauses the loop
+	 * (Retry phase / Release / Skip task / Abort), because its partial changes
+	 * would otherwise be committed without a re-review. "Skip phase" (Ctrl+C)
+	 * leaves all findings of the batch unresolved.
 	 */
 	const runFixPhase = async (
 		task: TaskInfo,
@@ -2794,24 +2801,18 @@ async function runOrchestratorLoop(
 		const prompt = buildFixerPrompt({
 			taskTitle: task.title,
 			taskBody: task.body,
-			finding: step.finding,
+			findings: step.findings,
 			round: step.round,
 			prdId,
 		});
 
-		const fixRef: PhaseRef = {
-			phase: "fix",
-			round: step.round,
-			index: step.index,
-			priority: step.finding.priority,
-			title: step.finding.title,
-		};
-		/** Qualifier of the next output group header (`restarted`). */
+		const fixRef: PhaseRef = { phase: "fix", round: step.round, count: step.findings.length };
+		/** Qualifier of the next output group header (`restarted`, `retry`). */
 		let runNote: string | undefined;
-		/** Record the fixer outcome in the output group and return it. */
-		const fixResult = (outcome: FixOutcome): FixPhaseOutcome => {
-			endPhaseOutput(taskState, formatFixOutcome(outcome), outcome.status === "unresolved");
-			return { kind: "result", outcome };
+		/** Record the fixer outcomes in the output group and return them. */
+		const fixResult = (outcomes: FixOutcome[]): FixPhaseOutcome => {
+			endPhaseOutput(taskState, formatFixOutcomes(outcomes), outcomes.some((outcome) => outcome.status === "unresolved"));
+			return { kind: "result", outcomes };
 		};
 
 		while (true) {
@@ -2842,26 +2843,40 @@ async function runOrchestratorLoop(
 					continue;
 				}
 				if (action === "skip-phase") {
-					return fixResult({ status: "unresolved", reason: "Fix skipped manually (pause)" });
+					return fixResult(step.findings.map(() => ({ status: "unresolved", reason: "Fix skipped manually (pause)" })));
 				}
 				return handleCommonPauseAction(task, taskState, "Fix", pauseOptions, action);
 			}
 
 			if (aborted) return { kind: "aborted" };
 
-			if (!parsed.ok) {
-				const what = parsed.status === "invalid-result" ? "returned no valid result" : parsed.status === "aborted" ? "was aborted" : "crashed";
-				return fixResult({ status: "unresolved", reason: `Fixer ${what}: ${truncateStr(parsed.error, 300)}` });
+			if (parsed.ok) {
+				return fixResult(fixOutcomesFromResult(step.findings.length, parsed.value));
 			}
 
-			const value = parsed.value;
-			if (value.status === "fixed") {
-				const summary = [value.summary || value.reason, value.verification ? `Verification: ${value.verification}` : ""]
-					.filter((part) => part.trim())
-					.join(" — ");
-				return fixResult({ status: "fixed", summary, verification: value.verification });
+			// --- Pause: unrepairable JSON / fixer failure ---
+			endPhaseOutput(
+				taskState,
+				parsed.status === "invalid-result" ? "invalid JSON result (repair failed)" : `fixer ${parsed.status}`,
+				true,
+			);
+			const failure: PauseOptions = parsed.status === "invalid-result"
+				? { reason: "invalid-result", errors: [parsed.error] }
+				: {
+					reason: "phase-failed",
+					reasonText: `fix failed — the fixer ${parsed.status === "aborted" ? "was aborted" : "crashed"}`,
+					errors: [parsed.error],
+				};
+			taskState.errors = failure.errors ?? [];
+			const action = await pause(task, taskState, "Fix", failure);
+			if (action === "retry-phase") {
+				runNote = "retry";
+				taskState.errors = [];
+				taskState.currentActivity = "▶ retrying fix…";
+				requestOverlayRender();
+				continue;
 			}
-			return fixResult({ status: "rejected", reason: value.reason || value.summary, summary: value.summary });
+			return handleCommonPauseAction(task, taskState, "Fix", failure, action);
 		}
 	};
 
@@ -3098,11 +3113,10 @@ async function runOrchestratorLoop(
 			}
 
 			if (step.kind === "fix") {
-				const findingTitle = step.finding.title.replace(/\s+/g, " ").trim();
-				setPhase(taskState, "Fix", `Fix ${step.index}/${step.total} [${step.finding.priority}] ${findingTitle}`);
+				setPhase(taskState, "Fix", fixPhaseLabel(step.round, step.findings.length));
 				const fixOutcome = await runFixPhase(task, taskState, phaseCosts, step);
 				if (fixOutcome.kind === "result") {
-					cycle = applyFixOutcome(cycle, fixOutcome.outcome);
+					cycle = applyFixOutcomes(cycle, fixOutcome.outcomes);
 					updateCycleInfo();
 					continue;
 				}

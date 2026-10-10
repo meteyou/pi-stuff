@@ -25,15 +25,23 @@ describe("module purity", () => {
 	});
 });
 
-describe("buildFixerPrompt", () => {
-	const prompt = buildFixerPrompt({ taskTitle: TASK_TITLE, taskBody: TASK_BODY, finding: FINDING, round: 2, prdId: "TODO-abc123" });
+const SECOND: ReviewFinding = {
+	priority: "P2",
+	title: "  Missing\n test ",
+	file: "",
+	body: "",
+};
 
-	it("contains exactly the one finding with priority, location and explanation", () => {
-		assert.match(prompt, /^# Fix review finding: \[P1\] Missing null check/);
-		assert.match(prompt, /\*\*Location:\*\* `src\/widget\.ts:12`/);
+describe("buildFixerPrompt", () => {
+	const prompt = buildFixerPrompt({ taskTitle: TASK_TITLE, taskBody: TASK_BODY, findings: [FINDING, SECOND], round: 2, prdId: "TODO-abc123" });
+
+	it("lists all findings numbered with priority, location and explanation", () => {
+		assert.match(prompt, /^# Fix 2 review findings \(review round 2\)/);
+		assert.match(prompt, /### Finding 1: \[P1\] Missing null check\n\n- \*\*Location:\*\* `src\/widget\.ts:12`/);
 		assert.ok(prompt.includes(FINDING.body));
-		assert.match(prompt, /raised in review round 2/);
-		assert.match(prompt, /exactly this one finding/);
+		assert.match(prompt, /### Finding 2: \[P2\] Missing test\n\n- \*\*Location:\*\* `\(no specific file — see explanation\)`\n\n\(no explanation given\)/);
+		assert.match(prompt, /every listed finding/);
+		assert.ok(prompt.indexOf("### Finding 1") < prompt.indexOf("### Finding 2"));
 	});
 
 	it("contains task title and body incl. acceptance criteria", () => {
@@ -42,12 +50,13 @@ describe("buildFixerPrompt", () => {
 		assert.match(prompt, /PRD todo: TODO-abc123/);
 	});
 
-	it("requires running the relevant tests/checks", () => {
-		assert.match(prompt, /Run the relevant tests and checks after the fix/);
+	it("requires running the relevant tests/checks once after all fixes", () => {
+		assert.match(prompt, /Run the relevant tests and checks once, after all fixes/);
+		assert.match(prompt, /Do not run the full checks after each individual fix/);
 	});
 
-	it("allows rejecting the finding with a reason", () => {
-		assert.match(prompt, /reject it with a concrete reason/);
+	it("allows rejecting findings with a reason", () => {
+		assert.match(prompt, /Reject invalid findings/);
 		assert.match(prompt, /"status": "rejected"/);
 	});
 
@@ -56,22 +65,20 @@ describe("buildFixerPrompt", () => {
 		assert.match(prompt, /NEVER touch anything under `\.pi\/`/);
 	});
 
-	it("ends with the JSON output format", () => {
+	it("ends with the JSON output format (one result per finding by id)", () => {
 		assert.ok(prompt.endsWith(FIXER_OUTPUT_FORMAT));
-		for (const key of ["status", "reason", "summary", "verification"]) {
+		for (const key of ["results", "id", "status", "reason", "summary", "verification"]) {
 			assert.ok(FIXER_OUTPUT_FORMAT.includes(`"${key}"`), key);
 		}
+		assert.match(FIXER_OUTPUT_FORMAT, /exactly one entry per finding/);
 	});
 
-	it("handles findings without file/line and without round/prd", () => {
-		const minimal = buildFixerPrompt({
-			taskTitle: TASK_TITLE,
-			taskBody: TASK_BODY,
-			finding: { priority: "P0", title: "Acceptance criterion not met: tests", file: "", body: "" },
-		});
-		assert.match(minimal, /`\(no specific file — see explanation\)`/);
-		assert.match(minimal, /\(no explanation given\)/);
-		assert.doesNotMatch(minimal, /raised in review round/);
+	it("handles a single finding without round/prd", () => {
+		const minimal = buildFixerPrompt({ taskTitle: TASK_TITLE, taskBody: TASK_BODY, findings: [FINDING] });
+		assert.match(minimal, /^# Fix 1 review finding\n/);
+		assert.match(minimal, /address \*\*this finding\*\*/);
+		assert.match(minimal, /### Finding 1: \[P1\] Missing null check/);
+		assert.doesNotMatch(minimal, /review round/);
 		assert.doesNotMatch(minimal, /PRD todo/);
 	});
 });

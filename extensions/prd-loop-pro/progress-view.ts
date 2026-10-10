@@ -6,7 +6,7 @@
  * (theming and width truncation happen in ./index.ts):
  *
  * - Output log grouped by phase: one group per subagent run with a header
- *   (`Implement`, `Review #1`, `Fix #1.1 [P1] <title>`, `Commit`), its
+ *   (`Implement`, `Review #1`, `Fix #1 • 3 findings`, `Commit`), its
  *   activity events, cost and a one-line outcome.
  * - Task details: review round counter, fixed/rejected/deferred/unresolved
  *   counts and cost per phase.
@@ -88,20 +88,20 @@ export function appendOutputEvent(events: OutputEvent[], activity: SubagentActiv
 export type PhaseRef =
 	| { phase: "implement"; attempt?: number }
 	| { phase: "review"; round: number }
-	| { phase: "fix"; round: number; index: number; priority: FindingPriority; title: string }
+	| { phase: "fix"; round: number; count: number }
 	| { phase: "commit" };
 
 /** Output of one subagent run, shown under its own header in the output viewer. */
 export interface PhaseOutputGroup {
 	phase: PhaseRef["phase"];
-	/** Header text, e.g. `Review #2` or `Fix #1.1 [P1] Missing null check`. */
+	/** Header text, e.g. `Review #2` or `Fix #1 • 3 findings`. */
 	header: string;
 	startTime: number;
 	endTime?: number;
 	events: OutputEvent[];
 	/** Cost of this run (incl. JSON repair), once known. */
 	cost?: number;
-	/** One-line outcome (e.g. `fixed`, `rejected — reason`, `needs attention • 3 findings`). */
+	/** One-line outcome (e.g. `2 fixed, 1 rejected`, `needs attention • 3 findings`). */
 	outcome?: string;
 	/** True if the outcome is a failure (crash, invalid result, pause). */
 	failed?: boolean;
@@ -114,7 +114,7 @@ function oneLine(text: string): string {
 
 /**
  * Header of a phase group: `Implement`, `Implement (attempt 2)`, `Review #1`,
- * `Fix #1.1 [P1] <title>`, `Commit`. An optional note is appended in
+ * `Fix #1 • 3 findings`, `Commit`. An optional note is appended in
  * parentheses (e.g. `resumed`, `retry`), combined with the attempt:
  * `Implement (attempt 2, resumed)`.
  */
@@ -129,11 +129,9 @@ export function phaseHeader(ref: PhaseRef, note?: string): string {
 		case "review":
 			header = `Review #${ref.round}`;
 			break;
-		case "fix": {
-			const title = oneLine(ref.title) || "(untitled)";
-			header = `Fix #${ref.round}.${ref.index} [${ref.priority}] ${title}`;
+		case "fix":
+			header = fixPhaseLabel(ref.round, ref.count);
 			break;
-		}
 		case "commit":
 			header = "Commit";
 			break;
@@ -199,16 +197,19 @@ export function formatReviewOutcome(verdict: string, findings: readonly { priori
 	return `${verdict} • ${findings.length} finding${findings.length === 1 ? "" : "s"} (${byPriority.join(", ")})`;
 }
 
-/** Fixer outcome for a group header: `fixed`, `rejected — <reason>`, `unresolved — <reason>`. */
-export function formatFixOutcome(outcome: FixOutcome): string {
-	switch (outcome.status) {
-		case "fixed":
-			return "fixed";
-		case "rejected":
-			return outcome.reason.trim() ? `rejected — ${oneLine(outcome.reason)}` : "rejected";
-		case "unresolved":
-			return outcome.reason.trim() ? `unresolved — ${oneLine(outcome.reason)}` : "unresolved";
-	}
+/** Label of a fix batch (group header and phase label): `Fix #1 • 3 findings`. */
+export function fixPhaseLabel(round: number, count: number): string {
+	return `Fix #${round} • ${count} finding${count === 1 ? "" : "s"}`;
+}
+
+/** Batch fixer outcome for a group header: `2 fixed, 1 rejected, 1 unresolved` (zero counts omitted). */
+export function formatFixOutcomes(outcomes: readonly FixOutcome[]): string {
+	const count = (status: FixOutcome["status"]) => outcomes.filter((outcome) => outcome.status === status).length;
+	const parts = (["fixed", "rejected", "unresolved"] as const)
+		.map((status) => ({ status, n: count(status) }))
+		.filter((entry) => entry.n > 0)
+		.map((entry) => `${entry.n} ${entry.status}`);
+	return parts.length > 0 ? parts.join(", ") : "no findings";
 }
 
 /** Format elapsed milliseconds as "M:SS". */

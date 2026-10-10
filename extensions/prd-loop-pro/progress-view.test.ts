@@ -14,7 +14,8 @@ import {
 	buildTaskDetailLines,
 	countPhaseEvents,
 	finishPhaseGroup,
-	formatFixOutcome,
+	fixPhaseLabel,
+	formatFixOutcomes,
 	formatPhaseCosts,
 	formatReviewOutcome,
 	phaseGroupMeta,
@@ -54,11 +55,9 @@ describe("phaseHeader", () => {
 		assert.equal(phaseHeader({ phase: "implement", attempt: 1 }), "Implement");
 		assert.equal(phaseHeader({ phase: "implement", attempt: 2 }), "Implement (attempt 2)");
 		assert.equal(phaseHeader({ phase: "review", round: 1 }), "Review #1");
-		assert.equal(
-			phaseHeader({ phase: "fix", round: 1, index: 2, priority: "P1", title: "  Missing\n null check " }),
-			"Fix #1.2 [P1] Missing null check",
-		);
-		assert.equal(phaseHeader({ phase: "fix", round: 2, index: 1, priority: "P0", title: "" }), "Fix #2.1 [P0] (untitled)");
+		assert.equal(phaseHeader({ phase: "fix", round: 1, count: 3 }), "Fix #1 • 3 findings");
+		assert.equal(phaseHeader({ phase: "fix", round: 2, count: 1 }, "retry"), "Fix #2 • 1 finding (retry)");
+		assert.equal(fixPhaseLabel(2, 4), "Fix #2 • 4 findings");
 		assert.equal(phaseHeader({ phase: "commit" }), "Commit");
 	});
 
@@ -95,7 +94,7 @@ describe("phase groups", () => {
 
 	it("records cost (accumulated) and outcome, and renders the meta text", () => {
 		const groups: PhaseOutputGroup[] = [];
-		startPhaseGroup(groups, { phase: "fix", round: 1, index: 1, priority: "P1", title: "Bug" }, { now: 0 });
+		startPhaseGroup(groups, { phase: "fix", round: 1, count: 1 }, { now: 0 });
 		assert.equal(phaseGroupMeta(groups[0]!, 5_000), "running… • 0:05");
 
 		finishPhaseGroup(groups, { cost: 0.1 }, 61_000);
@@ -124,11 +123,18 @@ describe("outcome texts", () => {
 		assert.equal(formatReviewOutcome("needs attention", [{ priority: "P0" }]), "needs attention • 1 finding (1×P0)");
 	});
 
-	it("formats fix outcomes", () => {
-		assert.equal(formatFixOutcome({ status: "fixed", summary: "done" }), "fixed");
-		assert.equal(formatFixOutcome({ status: "rejected", reason: "not a bug\nreally" }), "rejected — not a bug really");
-		assert.equal(formatFixOutcome({ status: "rejected", reason: " " }), "rejected");
-		assert.equal(formatFixOutcome({ status: "unresolved", reason: "Fixer crashed" }), "unresolved — Fixer crashed");
+	it("formats batch fix outcomes (zero counts omitted)", () => {
+		assert.equal(
+			formatFixOutcomes([
+				{ status: "fixed", summary: "a" },
+				{ status: "rejected", reason: "b" },
+				{ status: "fixed", summary: "c" },
+				{ status: "unresolved", reason: "d" },
+			]),
+			"2 fixed, 1 rejected, 1 unresolved",
+		);
+		assert.equal(formatFixOutcomes([{ status: "rejected", reason: "x" }]), "1 rejected");
+		assert.equal(formatFixOutcomes([]), "no findings");
 	});
 });
 

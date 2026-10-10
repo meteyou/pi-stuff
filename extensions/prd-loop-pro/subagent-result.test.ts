@@ -198,8 +198,13 @@ describe("parseSubagentResult — schema violations", () => {
 	});
 
 	it("validates fixer and committer schemas", () => {
-		assert.equal(validateResult(FIXER_RESULT_SCHEMA, { status: "rejected", reason: "false positive" }).ok, true);
-		assert.equal(validateResult(FIXER_RESULT_SCHEMA, { status: "done" }).ok, false);
+		const fixer = validateResult(FIXER_RESULT_SCHEMA, { results: [{ id: 1, status: "rejected", reason: "false positive" }] });
+		assert.equal(fixer.ok, true);
+		if (fixer.ok) assert.deepEqual(fixer.value, { results: [{ id: 1, status: "rejected", reason: "false positive", summary: "" }], verification: "" });
+		assert.equal(validateResult(FIXER_RESULT_SCHEMA, { status: "rejected", reason: "single-finding format" }).ok, false);
+		const badFixer = validateResult(FIXER_RESULT_SCHEMA, { results: [{ id: 0, status: "done" }] });
+		assert.equal(badFixer.ok, false);
+		if (!badFixer.ok) assert.deepEqual(badFixer.issues.map((i) => i.path), ["$.results[0].id", "$.results[0].status"]);
 		const committer = validateResult(COMMITTER_RESULT_SCHEMA, { success: true, summary: "2 commits" });
 		assert.equal(committer.ok, true);
 		if (committer.ok) assert.equal(committer.value.hookFailed, false);

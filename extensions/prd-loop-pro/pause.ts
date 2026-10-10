@@ -53,7 +53,7 @@ export interface PauseRequest {
 	/** Display label of the task, e.g. "Task 2/5: Add settings". */
 	taskLabel: string;
 	phase: PausePhase;
-	/** Phase label incl. progress (e.g. "Review 2/3", "Fix 1/2 [P1] Title"); defaults to `phase`. */
+	/** Phase label incl. progress (e.g. "Review 2/3", "Fix #1 • 3 findings"); defaults to `phase`. */
 	phaseLabel?: string;
 	reason: PauseReasonKind;
 	/** Human-readable reason; defaults to `defaultReasonText(reason, phase)`. */
@@ -136,7 +136,7 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 			switch (phase) {
 				case "Implement": return "Resume current phase — keep changes, continue the implementation where it left off";
 				case "Review": return "Resume current phase — keep changes, restart the review";
-				case "Fix": return "Resume current phase — keep changes, restart the fix of this finding";
+				case "Fix": return "Resume current phase — keep changes, restart the fixer for the open findings";
 				case "Commit": return "Resume current phase — keep changes, run the committer again";
 			}
 			break;
@@ -144,7 +144,7 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 			switch (phase) {
 				case "Implement": return "Skip phase — keep changes, continue with the review";
 				case "Review": return "Skip phase — skip the review, continue with the commit";
-				case "Fix": return "Skip phase — leave this finding unresolved, continue with the next step";
+				case "Fix": return "Skip phase — leave the open findings unresolved, continue with the next step";
 				case "Commit": return "Skip phase";
 			}
 			break;

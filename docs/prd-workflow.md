@@ -178,8 +178,8 @@ Implement → Review ⇄ Fix → Commit → Report
 1. **Implement** — `prd-worker` implements the task in an isolated subagent (with optional automatic retries).
 2. **Review** — a fresh `prd-reviewer` reviews the uncommitted changes (excluding `.pi/`) with the same rubric as
    `/review`, and also checks completeness against the task's acceptance criteria and out-of-scope changes.
-3. **Fix** — one fresh `prd-fixer` per finding at/above the fix threshold, sequentially (P0 first). Each fixer fixes
-   the finding and runs the relevant checks, or rejects it with a reason.
+3. **Fix** — one fresh `prd-fixer` per review round for all findings at/above the fix threshold (P0 first). It fixes
+   each valid finding or rejects it with a reason, and runs the relevant checks once after all fixes.
 4. **Re-review** — only if at least one finding was fixed; rejected findings and their reasons are passed to the next
    reviewer so they aren't raised again. Ends when no findings at/above the threshold remain, all were rejected, or
    the round limit is reached (→ pause).

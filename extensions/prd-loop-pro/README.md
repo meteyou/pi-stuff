@@ -50,7 +50,7 @@ Implement → Review ⇄ Fix → Commit → Report
 |-------|-------|--------------|
 | **Implement** | `prd-worker` | Implements the task, validates acceptance criteria, runs tests/build/lint. Retried automatically up to *Implementation retries* times with the previous errors as context. |
 | **Review** | `prd-reviewer` | Reviews the uncommitted changes (excluding `.pi/`) with the shared `/review` rubric, the project's `REVIEW_GUIDELINES.md` (if any) and the task title/body. Also reports missing/partial acceptance criteria and out-of-scope changes. Each round uses a fresh reviewer. |
-| **Fix** | `prd-fixer` | One fresh fixer **per finding** at/above the [fix threshold](#fix-threshold--round-limit), sequentially in priority order (P0 first). The fixer either fixes the finding and runs the relevant checks, or rejects it with a reason. |
+| **Fix** | `prd-fixer` | One fresh fixer **per review round** for all findings at/above the [fix threshold](#fix-threshold--round-limit) (listed P0 first). It fixes each valid finding, rejects the others with a reason and runs the relevant checks **once** after all fixes. It reports fixed/rejected per finding. |
 | **Commit** | `prd-committer` | Commits the changes (excluding `.pi/`) as small Conventional Commits following the `/commit` template. Never bypasses hooks. |
 | **Report** | — (orchestrator) | Appends a deterministic `## Execution Report` to the task todo, closes it and updates the PRD Task Index (closes the PRD when all tasks are closed). |
 
@@ -60,7 +60,7 @@ Implement → Review ⇄ Fix → Commit → Report
 review → findings ≥ threshold? ──no──────────────────────────────▶ commit
             │ yes
             ▼
-        fix each (P0 → P3) → ≥1 fixed? ──no (all rejected/unresolved)─▶ commit
+        fix all (1 fixer) → ≥1 fixed? ──no (all rejected/unresolved)──▶ commit
                                 │ yes
                                 ▼
                             review again (next round)
@@ -69,8 +69,9 @@ review → findings ≥ threshold? ──no────────────�
 - **Below-threshold findings** are never fixed; they are recorded as *deferred* findings in the execution report.
 - **Rejected findings** (with the fixer's reason) are passed to the next review prompt. The reviewer must not raise
   them again unless it explicitly disagrees with the reason.
-- **Unresolved findings** — a fixer that crashes or returns no valid result leaves its finding unresolved; the loop
-  continues with the next finding.
+- **Unresolved findings** — findings the fixer returns no result for stay unresolved. A fixer that crashes or returns
+  no valid result (even after [JSON repair](#json-repair)) pauses the loop, because its partial changes would
+  otherwise be committed without a re-review.
 - A **re-review** only happens if at least one finding of the round was fixed.
 - **Round limit** — if review round *Max review rounds* still reports findings at/above the threshold, the loop pauses
   (see [Pause Cases](#pause-cases)) instead of fixing them blindly.
@@ -161,14 +162,14 @@ An invalid project file blocks *Save globally & start*, but can be overwritten v
 ## Pause Cases
 
 The loop never fails hard on a task. Instead, it opens a pause menu that shows the task, the current phase (incl.
-progress, e.g. `Review 2/3` or `Fix 1/2 [P1] <title>`), the reason and any errors/details:
+progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any errors/details:
 
 | Reason | Options |
 |--------|---------|
 | Manual pause (`Ctrl+C`) | Resume current phase, Skip phase\*, Retry task, Release, Skip task, Abort |
 | Implementation failed after all retries | Retry task, Release, Skip task, Abort |
 | JSON repair failed (no valid subagent result) | Retry phase, Release, Skip task, Abort |
-| Phase failed (reviewer crashed, git error, …) | Retry phase, Release, Skip task, Abort |
+| Phase failed (reviewer/fixer crashed, git error, …) | Retry phase, Release, Skip task, Abort |
 | Committer failed | Retry phase, Release, Skip task, Abort |
 | Git hook failed (e.g. pre-commit) | Retry phase, Release, Skip task, Abort |
 | Review round limit reached (lists open findings: priority, `file:line`, title) | One more round, Commit as-is & close task, Release, Skip task, Abort |
@@ -178,7 +179,7 @@ progress, e.g. `Review 2/3` or `Fix 1/2 [P1] <title>`), the reason and any error
 | Option | Effect |
 |--------|--------|
 | Resume current phase | Keep changes and continue/restart the paused phase |
-| Skip phase | Keep changes and move on (implement → review, review → commit, fix → next finding) |
+| Skip phase | Keep changes and move on (implement → review, review → commit, fix → open findings unresolved, commit) |
 | Retry phase | Keep changes and run the phase's agent again |
 | Retry task | Discard changes (except `.pi/`) and restart at implement |
 | One more round | Fix the open findings and review again |
@@ -216,12 +217,12 @@ continues with the next task of the PRD.
 
 ## UI
 
-- **Live overlay** — task rows show the current phase and round (e.g. `Review 2/3`, `Fix 2/4 [P1] <title>`). Expanded
+- **Live overlay** — task rows show the current phase and round (e.g. `Review 2/3`, `Fix #1 • 3 findings`). Expanded
   task details show the review round counter, fixed/rejected/deferred/unresolved counts and the cost per phase.
   Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
   `a` expand/collapse all, `o` output viewer, `Ctrl+C` pause, `Esc` (twice) abort.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
-  `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and duration.
+  `Fix #1 • 3 findings`, `Commit`) with outcome, cost and duration.
 - **Finished view** — when the run is over (completed, failed, aborted by a pause action or released), the overlay
   stays open: the header shows the outcome, totals and the final notification; tasks can still be expanded and their
   output inspected. `Esc`/`q` closes it.
@@ -238,7 +239,7 @@ message**.
 |-------|------|-------|-----------------|
 | [`prd-worker`](./agents/prd-worker.md) | Implement | read, bash, write, edit | `{ success, errors[], summary }` |
 | [`prd-reviewer`](./agents/prd-reviewer.md) | Review | read, bash, grep, find, ls (read-only) | `{ verdict: "correct" \| "needs attention", summary, findings: [{ priority: "P0".."P3", title, file, line?, body }], callouts: [string] }` |
-| [`prd-fixer`](./agents/prd-fixer.md) | Fix | read, bash, edit, write | `{ status: "fixed" \| "rejected", reason, summary, verification }` |
+| [`prd-fixer`](./agents/prd-fixer.md) | Fix | read, bash, edit, write | `{ results: [{ id, status: "fixed" \| "rejected", reason, summary }], verification }` (one entry per finding) |
 | [`prd-committer`](./agents/prd-committer.md) | Commit | read, bash | `{ success, errors[], summary, hookFailed }` |
 
 Rules shared by all agents: never touch `.pi/`, never use the todo tool. Worker, reviewer and fixer never run git write

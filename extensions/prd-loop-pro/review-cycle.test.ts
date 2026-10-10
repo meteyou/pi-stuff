@@ -6,12 +6,14 @@ import { fileURLToPath } from "node:url";
 
 import {
 	COMMIT_AS_IS_REASON,
-	applyFixOutcome,
+	MISSING_FIX_RESULT_REASON,
+	applyFixOutcomes,
 	applyReview,
 	commitAsIs,
 	createReviewCycle,
 	cycleCounts,
 	extendRoundLimit,
+	fixOutcomesFromResult,
 	meetsFixThreshold,
 	nextStep,
 	openFindings,
@@ -47,7 +49,7 @@ function describeStep(step: CycleStep): string {
 		case "review":
 			return `review ${step.round}/${step.roundLimit}`;
 		case "fix":
-			return `fix ${step.round}.${step.index}/${step.total} [${step.finding.priority}] ${step.finding.title}`;
+			return `fix ${step.round}: ${step.findings.map((x) => `[${x.priority}] ${x.title}`).join(", ")}`;
 		case "commit":
 			return "commit";
 		case "pause":
@@ -57,7 +59,7 @@ function describeStep(step: CycleStep): string {
 
 type Event =
 	| { review: ReviewerResult }
-	| { fix: FixOutcome }
+	| { fix: FixOutcome[] }
 	| { extend: true }
 	| { commitAsIs: true };
 
@@ -68,7 +70,7 @@ function run(state: ReviewCycleState, events: Event[]): { steps: string[]; state
 	for (const event of events) {
 		steps.push(describeStep(nextStep(current)));
 		if ("review" in event) current = applyReview(current, event.review);
-		else if ("fix" in event) current = applyFixOutcome(current, event.fix);
+		else if ("fix" in event) current = applyFixOutcomes(current, event.fix);
 		else if ("extend" in event) current = extendRoundLimit(current);
 		else current = commitAsIs(current);
 	}
@@ -150,54 +152,44 @@ describe("nextStep transitions (table-driven)", () => {
 			threshold: "P1",
 			events: [
 				{ review: review([f("P2", "Style"), f("P1", "Edge case"), f("P0", "Crash"), f("P3", "Nit")]) },
-				{ fix: fixed() },
-				{ fix: fixed() },
+				{ fix: [fixed(), fixed()] },
 				{ review: review([]) },
 			],
-			steps: [
-				"review 1/3",
-				"fix 1.1/2 [P0] Crash",
-				"fix 1.2/2 [P1] Edge case",
-				"review 2/3",
-				"commit",
-			],
+			steps: ["review 1/3", "fix 1: [P0] Crash, [P1] Edge case", "review 2/3", "commit"],
 			counts: { round: 2, fixed: 2, deferred: 2 },
 		},
 		{
 			name: "all rejected → commit without re-review",
 			events: [
 				{ review: review([f("P1", "A"), f("P0", "B")]) },
-				{ fix: rejected("Intended behavior.") },
-				{ fix: rejected("Covered by caller.") },
+				{ fix: [rejected("Intended behavior."), rejected("Covered by caller.")] },
 			],
-			steps: ["review 1/3", "fix 1.1/2 [P0] B", "fix 1.2/2 [P1] A", "commit"],
+			steps: ["review 1/3", "fix 1: [P0] B, [P1] A", "commit"],
 			counts: { round: 1, fixed: 0, rejected: 2 },
 		},
 		{
 			name: "some fixed, some rejected → re-review",
 			events: [
 				{ review: review([f("P1", "A"), f("P1", "B")]) },
-				{ fix: rejected() },
-				{ fix: fixed() },
+				{ fix: [rejected(), fixed()] },
 			],
-			steps: ["review 1/3", "fix 1.1/2 [P1] A", "fix 1.2/2 [P1] B", "review 2/3"],
+			steps: ["review 1/3", "fix 1: [P1] A, [P1] B", "review 2/3"],
 			counts: { fixed: 1, rejected: 1 },
 		},
 		{
-			name: "unresolved only (fixer crashed) → commit, finding reported as unresolved",
-			events: [{ review: review([f("P0", "A")]) }, { fix: unresolved() }],
-			steps: ["review 1/3", "fix 1.1/1 [P0] A", "commit"],
+			name: "unresolved only (no fixer result) → commit, finding reported as unresolved",
+			events: [{ review: review([f("P0", "A")]) }, { fix: [unresolved()] }],
+			steps: ["review 1/3", "fix 1: [P0] A", "commit"],
 			counts: { fixed: 0, unresolved: 1 },
 		},
 		{
 			name: "unresolved + fixed → re-review; superseded unresolved is dropped",
 			events: [
 				{ review: review([f("P0", "A"), f("P1", "B")]) },
-				{ fix: unresolved() },
-				{ fix: fixed() },
+				{ fix: [unresolved(), fixed()] },
 				{ review: review([]) },
 			],
-			steps: ["review 1/3", "fix 1.1/2 [P0] A", "fix 1.2/2 [P1] B", "review 2/3", "commit"],
+			steps: ["review 1/3", "fix 1: [P0] A, [P1] B", "review 2/3", "commit"],
 			counts: { round: 2, fixed: 1, unresolved: 0 },
 		},
 		{
@@ -205,10 +197,10 @@ describe("nextStep transitions (table-driven)", () => {
 			maxRounds: 2,
 			events: [
 				{ review: review([f("P1", "A")]) },
-				{ fix: fixed() },
+				{ fix: [fixed()] },
 				{ review: review([f("P1", "A again"), f("P0", "New")]) },
 			],
-			steps: ["review 1/2", "fix 1.1/1 [P1] A", "review 2/2", "pause round-limit 2/2: [P0] New, [P1] A again"],
+			steps: ["review 1/2", "fix 1: [P1] A", "review 2/2", "pause round-limit 2/2: [P0] New, [P1] A again"],
 			counts: { round: 2, fixed: 1 },
 		},
 		{
@@ -224,10 +216,10 @@ describe("nextStep transitions (table-driven)", () => {
 			events: [
 				{ review: review([f("P1", "A")]) },
 				{ extend: true },
-				{ fix: fixed() },
+				{ fix: [fixed()] },
 				{ review: review([]) },
 			],
-			steps: ["review 1/1", "pause round-limit 1/1: [P1] A", "fix 1.1/1 [P1] A", "review 2/2", "commit"],
+			steps: ["review 1/1", "pause round-limit 1/1: [P1] A", "fix 1: [P1] A", "review 2/2", "commit"],
 			counts: { round: 2, roundLimit: 2, fixed: 1 },
 		},
 		{
@@ -247,8 +239,8 @@ describe("nextStep transitions (table-driven)", () => {
 		{
 			name: "threshold P3 fixes everything",
 			threshold: "P3",
-			events: [{ review: review([f("P3", "C"), f("P2", "B")]) }, { fix: fixed() }, { fix: rejected() }],
-			steps: ["review 1/3", "fix 1.1/2 [P2] B", "fix 1.2/2 [P3] C", "review 2/3"],
+			events: [{ review: review([f("P3", "C"), f("P2", "B")]) }, { fix: [fixed(), rejected()] }],
+			steps: ["review 1/3", "fix 1: [P2] B, [P3] C", "review 2/3"],
 		},
 	];
 
@@ -273,7 +265,13 @@ describe("guards", () => {
 	});
 
 	it("applyFixOutcome throws when no fix is due", () => {
-		assert.throws(() => applyFixOutcome(cycle(), fixed()), /next step is "review"/);
+		assert.throws(() => applyFixOutcomes(cycle(), [fixed()]), /next step is "review"/);
+	});
+
+	it("applyFixOutcomes throws when the number of outcomes differs from the findings", () => {
+		const state = applyReview(cycle(), review([f("P1", "A"), f("P0", "B")]));
+		assert.throws(() => applyFixOutcomes(state, [fixed()]), /Expected 2 fix outcome\(s\), got 1/);
+		assert.throws(() => applyFixOutcomes(state, [fixed(), fixed(), fixed()]), /Expected 2 fix outcome\(s\), got 3/);
 	});
 
 	it("does not mutate the given state", () => {
@@ -281,7 +279,7 @@ describe("guards", () => {
 		const snapshot = JSON.stringify(initial);
 		const reviewed = applyReview(initial, review([f("P1", "A"), f("P3", "B")], ["New dependency"]));
 		const reviewedSnapshot = JSON.stringify(reviewed);
-		applyFixOutcome(reviewed, rejected());
+		applyFixOutcomes(reviewed, [rejected()]);
 		extendRoundLimit(reviewed);
 		commitAsIs(reviewed);
 		assert.equal(JSON.stringify(initial), snapshot);
@@ -293,11 +291,9 @@ describe("rejected findings for the next review prompt", () => {
 	it("accumulates rejected findings with reasons across rounds", () => {
 		const { state } = run(cycle(), [
 			{ review: review([f("P1", "A"), f("P1", "B")]) },
-			{ fix: rejected("A is intended.") },
-			{ fix: fixed() },
+			{ fix: [rejected("A is intended."), fixed()] },
 			{ review: review([f("P0", "C"), f("P1", "D")]) },
-			{ fix: rejected("C is handled upstream.") },
-			{ fix: fixed() },
+			{ fix: [rejected("C is handled upstream."), fixed()] },
 		]);
 		const list = rejectedForNextReview(state);
 		assert.deepEqual(
@@ -311,7 +307,7 @@ describe("rejected findings for the next review prompt", () => {
 	});
 
 	it("fills in a placeholder for empty reasons", () => {
-		const { state } = run(cycle(), [{ review: review([f("P1", "A")]) }, { fix: rejected("  ") }]);
+		const { state } = run(cycle(), [{ review: review([f("P1", "A")]) }, { fix: [rejected("  ")] }]);
 		assert.equal(state.rejected[0]!.reason, "(no reason given)");
 	});
 });
@@ -325,8 +321,7 @@ describe("openFindings / reportFields", () => {
 	it("builds the report fields (rounds, verdict, fixed, rejected, deferred, unresolved, callouts)", () => {
 		const { state } = run(cycle("P1", 2), [
 			{ review: review([f("P0", "A"), f("P1", "B"), f("P2", "Style")], ["New dependency: x"]) },
-			{ fix: fixed("Guarded null.") },
-			{ fix: rejected("Intended.") },
+			{ fix: [fixed("Guarded null."), rejected("Intended.")] },
 			{ review: review([f("P1", "C"), f("P2", "Style"), f("P3", "Nit")], ["Auth change"]) },
 			{ commitAsIs: true },
 		]);
@@ -342,9 +337,9 @@ describe("openFindings / reportFields", () => {
 		assert.deepEqual(fields.callouts, ["New dependency: x", "Auth change"]);
 	});
 
-	it("reports unresolved findings of crashed fixers", () => {
-		const { state } = run(cycle(), [{ review: review([f("P0", "A")]) }, { fix: unresolved("Fixer returned no valid result") }]);
-		assert.deepEqual(reportFields(state).unresolved.map((x) => [x.finding.title, x.reason]), [["A", "Fixer returned no valid result"]]);
+	it("reports unresolved findings without a fixer result", () => {
+		const { state } = run(cycle(), [{ review: review([f("P0", "A")]) }, { fix: [unresolved(MISSING_FIX_RESULT_REASON)] }]);
+		assert.deepEqual(reportFields(state).unresolved.map((x) => [x.finding.title, x.reason]), [["A", MISSING_FIX_RESULT_REASON]]);
 	});
 
 	it("is empty before the first review", () => {
@@ -352,5 +347,62 @@ describe("openFindings / reportFields", () => {
 		assert.equal(fields.reviewRounds, 0);
 		assert.equal(fields.finalVerdict, undefined);
 		assert.deepEqual([fields.fixed, fields.rejected, fields.deferred, fields.unresolved, fields.callouts], [[], [], [], [], []]);
+	});
+});
+
+describe("fixOutcomesFromResult", () => {
+	it("maps one outcome per finding by 1-based id and attaches the shared verification to fixed findings", () => {
+		const outcomes = fixOutcomesFromResult(3, {
+			results: [
+				{ id: 2, status: "rejected", reason: "Intended.", summary: "Checked callers." },
+				{ id: 1, status: "fixed", reason: "Was missing.", summary: "Added a guard." },
+				{ id: 3, status: "fixed", reason: "Off by one.", summary: "" },
+			],
+			verification: "npm test (ok)",
+		});
+		assert.deepEqual(outcomes, [
+			{ status: "fixed", summary: "Added a guard. — Verification: npm test (ok)", verification: "npm test (ok)" },
+			{ status: "rejected", reason: "Intended.", summary: "Checked callers." },
+			{ status: "fixed", summary: "Off by one. — Verification: npm test (ok)", verification: "npm test (ok)" },
+		]);
+	});
+
+	it("marks findings without a result as unresolved and ignores unknown or duplicate ids", () => {
+		const outcomes = fixOutcomesFromResult(2, {
+			results: [
+				{ id: 2, status: "fixed", reason: "", summary: "First." },
+				{ id: 2, status: "rejected", reason: "Duplicate.", summary: "" },
+				{ id: 7, status: "fixed", reason: "", summary: "Unknown id." },
+			],
+			verification: "",
+		});
+		assert.deepEqual(outcomes, [
+			{ status: "unresolved", reason: MISSING_FIX_RESULT_REASON },
+			{ status: "fixed", summary: "First.", verification: undefined },
+		]);
+	});
+
+	it("falls back to the summary for rejected findings without a reason", () => {
+		const [outcome] = fixOutcomesFromResult(1, { results: [{ id: 1, status: "rejected", reason: " ", summary: "Not reproducible." }], verification: "" });
+		assert.deepEqual(outcome, { status: "rejected", reason: "Not reproducible.", summary: "Not reproducible." });
+	});
+
+	it("feeds the cycle: fixed + rejected + unresolved in one batch", () => {
+		const state = applyReview(cycle(), review([f("P1", "A"), f("P0", "B"), f("P1", "C")]));
+		const step = nextStep(state);
+		assert.equal(step.kind, "fix");
+		if (step.kind !== "fix") return;
+		const outcomes = fixOutcomesFromResult(step.findings.length, {
+			results: [
+				{ id: 1, status: "fixed", reason: "", summary: "Fixed B." },
+				{ id: 2, status: "rejected", reason: "A is intended.", summary: "" },
+			],
+			verification: "npm test",
+		});
+		const next = applyFixOutcomes(state, outcomes);
+		assert.deepEqual(next.fixed.map((x) => x.finding.title), ["B"]);
+		assert.deepEqual(next.rejected.map((x) => [x.finding.title, x.reason]), [["A", "A is intended."]]);
+		assert.deepEqual(reportFields(next).unresolved.map((x) => x.finding.title), ["C"]);
+		assert.equal(describeStep(nextStep(next)), "review 2/3");
 	});
 });
