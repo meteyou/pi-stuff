@@ -26,8 +26,17 @@ import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
-import type { PrdLoopProSettings } from "./settings.ts";
+import type { ThinkingLevel as AiThinkingLevel } from "@earendil-works/pi-ai";
+import type { PrdLoopProSettings, StepSetting } from "./settings.ts";
+import { findModel } from "./settings.ts";
 import { resolveStartSettings } from "./settings-ui.ts";
+import {
+	COMMITTER_RESULT_SCHEMA,
+	parseSubagentResult,
+	rawSnippet,
+	WORKER_RESULT_SCHEMA,
+} from "./subagent-result.ts";
+import type { RepairFunction, ResultSchema, WorkerResult } from "./subagent-result.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -189,11 +198,28 @@ export interface SubagentUsage {
 	turns: number;
 }
 
+/** Worker-level result of one implementation attempt (after parsing). */
 export interface SubagentResult {
 	success: boolean;
 	errors: string[];
 	summary: string;
 	usage: SubagentUsage;
+}
+
+/**
+ * Raw result of a subagent run. Parsing of the final text into a typed agent
+ * result happens in ./subagent-result.ts.
+ */
+export interface SubagentRunResult {
+	/** completed = the agent finished (final text available); aborted = cancelled; failed = process error. */
+	status: "completed" | "aborted" | "failed";
+	/** Final assistant text (raw, unparsed). */
+	finalText: string;
+	usage: SubagentUsage;
+	/** Activity events collected during the run (same format as the output viewer). */
+	events: OutputEvent[];
+	/** Error description for aborted/failed runs. */
+	error?: string;
 }
 
 /** Activity update from a running subagent. */
@@ -224,6 +250,34 @@ export interface OutputEvent {
 	error?: boolean;
 	text?: string;
 	turn: number;
+}
+
+/**
+ * Append a subagent activity to an output event list. Consecutive text/thinking
+ * deltas are collapsed into a single event.
+ */
+export function appendOutputEvent(events: OutputEvent[], activity: SubagentActivity, now: number = Date.now()): void {
+	switch (activity.type) {
+		case "tool_start":
+			events.push({ time: now, kind: "tool_start", tool: activity.toolName, args: activity.argsSummary, turn: activity.turn });
+			break;
+		case "tool_end":
+			events.push({
+				time: now,
+				kind: "tool_end",
+				tool: activity.toolName,
+				error: !activity.toolSuccess,
+				result: activity.resultPreview,
+				turn: activity.turn,
+			});
+			break;
+		case "text_delta":
+			if (events.at(-1)?.kind !== "text") events.push({ time: now, kind: "text", turn: activity.turn });
+			break;
+		case "thinking":
+			if (events.at(-1)?.kind !== "thinking") events.push({ time: now, kind: "thinking", turn: activity.turn });
+			break;
+	}
 }
 
 /**
@@ -309,85 +363,17 @@ async function loadPrdWorkerAgent(extensionDir: string): Promise<AgentDefinition
 }
 
 /**
- * Parse the structured JSON result from the subagent's final output.
- *
- * Tries to find a JSON object with `success`, `errors`, and `summary` fields
- * in the text. Handles both raw JSON and JSON in markdown code fences.
- */
-function parseSubagentResult(text: string): { success: boolean; errors: string[]; summary: string } | null {
-	if (!text.trim()) return null;
-
-	// Try parsing the entire text as JSON first
-	try {
-		const parsed = JSON.parse(text.trim());
-		if (typeof parsed.success === "boolean") {
-			return {
-				success: parsed.success,
-				errors: Array.isArray(parsed.errors) ? parsed.errors : [],
-				summary: typeof parsed.summary === "string" ? parsed.summary : "",
-			};
-		}
-	} catch {
-		// Not valid JSON as a whole, try extracting
-	}
-
-	// Try to find JSON in the last part of the text (subagent should output it last)
-	// Look for the last JSON object that contains "success"
-	const jsonPattern = /\{[^{}]*"success"\s*:\s*(true|false)[^{}]*\}/g;
-	let lastMatch: string | null = null;
-	let match: RegExpExecArray | null;
-	while ((match = jsonPattern.exec(text)) !== null) {
-		lastMatch = match[0];
-	}
-
-	if (lastMatch) {
-		try {
-			const parsed = JSON.parse(lastMatch);
-			return {
-				success: Boolean(parsed.success),
-				errors: Array.isArray(parsed.errors) ? parsed.errors : [],
-				summary: typeof parsed.summary === "string" ? parsed.summary : "",
-			};
-		} catch {
-			// Matched pattern but not valid JSON
-		}
-	}
-
-	// Try extracting from markdown code fences
-	const fencePattern = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
-	let lastFenceMatch: string | null = null;
-	while ((match = fencePattern.exec(text)) !== null) {
-		lastFenceMatch = match[1];
-	}
-
-	if (lastFenceMatch) {
-		try {
-			const parsed = JSON.parse(lastFenceMatch);
-			if (typeof parsed.success === "boolean") {
-				return {
-					success: parsed.success,
-					errors: Array.isArray(parsed.errors) ? parsed.errors : [],
-					summary: typeof parsed.summary === "string" ? parsed.summary : "",
-				};
-			}
-		} catch {
-			// Not valid JSON in fence
-		}
-	}
-
-	return null;
-}
-
-/**
  * Get the final assistant text output from the message stream.
  */
 function getFinalAssistantText(messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text" && part.text) return part.text;
-			}
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			const text = msg.content
+				.filter((part) => part.type === "text" && part.text)
+				.map((part) => part.text!)
+				.join("\n");
+			if (text) return text;
 		}
 	}
 	return "";
@@ -401,15 +387,17 @@ const AGENT_END_EXIT_TIMEOUT_MS = 10000;
 /**
  * Spawn a pi subagent process to execute a task.
  *
- * The subagent runs in an isolated context window with the prd-worker agent definition
- * as its system prompt. It returns a structured JSON result.
+ * The subagent runs in an isolated context window with the given agent definition
+ * as its system prompt. The runner does not interpret the agent's answer: it
+ * returns the raw final text, usage and collected activity events. Parsing into
+ * a typed result happens in ./subagent-result.ts (see `parseRunResult`).
  *
  * @param options.taskPrompt - The full prompt to send to the subagent (task body + context)
  * @param options.model - Model to use (overrides agent default)
  * @param options.cwd - Working directory for the subagent process
- * @param options.agent - The agent definition (loaded from prd-worker.md)
+ * @param options.agent - The agent definition (e.g. loaded from prd-worker.md)
  * @param options.signal - AbortSignal for cancellation
- * @returns SubagentResult with success/failure, errors, summary, and usage stats
+ * @returns SubagentRunResult with status, raw final text, usage stats and events
  */
 export async function spawnSubagent(options: {
 	taskPrompt: string;
@@ -419,12 +407,18 @@ export async function spawnSubagent(options: {
 	agent: AgentDefinition;
 	signal?: AbortSignal;
 	onActivity?: (activity: SubagentActivity) => void;
-}): Promise<SubagentResult> {
+}): Promise<SubagentRunResult> {
 	const { taskPrompt, model, thinkingLevel, cwd, agent, signal, onActivity } = options;
+
+	const events: OutputEvent[] = [];
+	const emitActivity = (activity: SubagentActivity) => {
+		appendOutputEvent(events, activity);
+		onActivity?.(activity);
+	};
 
 	// Write agent system prompt to temp file
 	const tmpDir = mkdtempSync(join(tmpdir(), "prd-loop-pro-"));
-	const promptPath = join(tmpDir, "prd-worker-prompt.md");
+	const promptPath = join(tmpDir, `${agent.name}-prompt.md`);
 	writeFileSync(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
 
 	// Build pi arguments — disable extension/theme discovery to keep the subagent
@@ -551,9 +545,9 @@ export async function spawnSubagent(options: {
 				}
 
 				// Stream activity events to the caller
-				if (onActivity) {
+				{
 					if (event.type === "tool_execution_start") {
-						onActivity({
+						emitActivity({
 							type: "tool_start",
 							toolName: event.toolName,
 							argsSummary: summarizeToolArgs(event.toolName, event.args),
@@ -574,7 +568,7 @@ export async function spawnSubagent(options: {
 								resultPreview = truncateStr(event.result, 200);
 							}
 						} catch { /* ignore parse errors */ }
-						onActivity({
+						emitActivity({
 							type: "tool_end",
 							toolName: event.toolName,
 							toolSuccess: !event.isError,
@@ -584,13 +578,13 @@ export async function spawnSubagent(options: {
 					} else if (event.type === "message_update" && event.assistantMessageEvent) {
 						const ame = event.assistantMessageEvent;
 						if (ame.type === "text_delta" && ame.delta) {
-							onActivity({
+							emitActivity({
 								type: "text_delta",
 								text: ame.delta,
 								turn: usage.turns + 1,
 							});
 						} else if (ame.type === "thinking_delta" || ame.type === "thinking") {
-							onActivity({
+							emitActivity({
 								type: "thinking",
 								turn: usage.turns + 1,
 							});
@@ -645,48 +639,28 @@ export async function spawnSubagent(options: {
 			}
 		});
 
+		// Prefer the last run's agent_end messages, fall back to incrementally
+		// collected message_end messages.
+		const finalText = getFinalAssistantText(agentEndMessages ?? messages);
+
 		// Handle abort
 		if (wasAborted) {
-			return {
-				success: false,
-				errors: ["Subagent was aborted"],
-				summary: "Task execution was cancelled",
-				usage,
-			};
+			return { status: "aborted", finalText, usage, events, error: "Subagent was aborted" };
 		}
 
 		// Handle non-zero exit code — but if we received agent_settled, the agent
 		// DID complete; the non-zero code is likely from post-agent cleanup.
 		if (exitCode !== 0 && !settled) {
 			return {
-				success: false,
-				errors: [`Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`],
-				summary: "Subagent process failed",
+				status: "failed",
+				finalText,
 				usage,
+				events,
+				error: `Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`,
 			};
 		}
 
-		// Prefer the last run's agent_end messages, fall back to incrementally
-		// collected message_end messages.
-		const finalMessages = agentEndMessages ?? messages;
-		const finalText = getFinalAssistantText(finalMessages);
-		const parsed = parseSubagentResult(finalText);
-
-		if (!parsed) {
-			return {
-				success: false,
-				errors: ["Failed to parse result: subagent did not return valid JSON"],
-				summary: finalText ? finalText.slice(0, 200) : "No output from subagent",
-				usage,
-			};
-		}
-
-		return {
-			success: parsed.success,
-			errors: parsed.errors,
-			summary: parsed.summary,
-			usage,
-		};
+		return { status: "completed", finalText, usage, events };
 	} finally {
 		// Clean up temp files
 		try {
@@ -695,6 +669,101 @@ export async function spawnSubagent(options: {
 			// Ignore cleanup errors
 		}
 	}
+}
+
+// --- Subagent result parsing & JSON repair ---
+
+/**
+ * Create the LLM repair function for invalid subagent JSON. Uses the
+ * orchestrator model + thinking level from the settings, without tools.
+ */
+export function createOrchestratorRepair(
+	modelRegistry: ExtensionCommandContext["modelRegistry"],
+	step: StepSetting,
+	options: { signal?: AbortSignal; onCost?: (cost: number) => void } = {},
+): RepairFunction {
+	return async (request) => {
+		const model = findModel(modelRegistry.getAll(), step.model);
+		if (!model) throw new Error(`orchestrator model "${step.model}" not found`);
+
+		const reasoning = step.thinking && step.thinking !== "off" ? (step.thinking as AiThinkingLevel) : undefined;
+		const stream = modelRegistry.streamSimple(
+			model,
+			{
+				systemPrompt: request.systemPrompt,
+				messages: [{ role: "user", content: [{ type: "text", text: request.prompt }], timestamp: Date.now() }],
+			},
+			{ reasoning, signal: options.signal },
+		);
+		const response = await stream.result();
+		options.onCost?.(response.usage?.cost?.total ?? 0);
+
+		if (response.stopReason === "aborted") throw new Error("JSON repair was aborted");
+		if (response.stopReason === "error") {
+			throw new Error(`${step.model}: ${response.errorMessage ?? "unknown error"}`);
+		}
+
+		const text = response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n");
+		if (!text.trim()) throw new Error(`${step.model} returned no text`);
+		return text;
+	};
+}
+
+/** Typed outcome of a subagent run after parsing its final text. */
+export type ParsedRunResult<T> =
+	| { ok: true; value: T; usage: SubagentUsage; events: OutputEvent[]; repaired: boolean }
+	| { ok: false; status: SubagentRunResult["status"] | "invalid-result"; error: string; rawSnippet: string; usage: SubagentUsage; events: OutputEvent[] };
+
+/**
+ * Parse a raw subagent run into a typed result using the agent's schema.
+ * Deterministic repair first, then (if given) one LLM repair attempt.
+ * Cost of the repair call is added to the returned usage.
+ */
+export async function parseRunResult<T>(
+	run: SubagentRunResult,
+	schema: ResultSchema<T>,
+	repair?: (onCost: (cost: number) => void) => RepairFunction,
+): Promise<ParsedRunResult<T>> {
+	if (run.status !== "completed") {
+		return {
+			ok: false,
+			status: run.status,
+			error: run.error ?? `Subagent ${run.status}`,
+			rawSnippet: rawSnippet(run.finalText),
+			usage: run.usage,
+			events: run.events,
+		};
+	}
+
+	let repairCost = 0;
+	const outcome = await parseSubagentResult(schema, run.finalText, {
+		repair: repair?.((cost) => {
+			repairCost += cost;
+		}),
+	});
+	const usage: SubagentUsage = { ...run.usage, cost: run.usage.cost + repairCost };
+
+	if (!outcome.ok) {
+		return { ok: false, status: "invalid-result", error: outcome.message, rawSnippet: outcome.rawSnippet, usage, events: run.events };
+	}
+	return { ok: true, value: outcome.value, usage, events: run.events, repaired: outcome.method === "llm-repair" };
+}
+
+/** Map a parsed prd-worker run to the worker-level result used by the orchestrator. */
+function toWorkerResult(parsed: ParsedRunResult<WorkerResult>): SubagentResult {
+	if (parsed.ok) {
+		return { success: parsed.value.success, errors: parsed.value.errors, summary: parsed.value.summary, usage: parsed.usage };
+	}
+	const summary =
+		parsed.status === "aborted"
+			? "Task execution was cancelled"
+			: parsed.status === "failed"
+				? "Subagent process failed"
+				: `Invalid result: ${parsed.rawSnippet}`;
+	return { success: false, errors: [parsed.error], summary, usage: parsed.usage };
 }
 
 // --- Task resolution and dependency graph ---
@@ -1906,7 +1975,7 @@ async function spawnCommitterSubagent(
 			`Add "Refs: ${prdTag}" as a footer line in each commit message body.`,
 		].join("\n");
 
-		const result = await spawnSubagent({
+		const run = await spawnSubagent({
 			taskPrompt: prompt,
 			model,
 			thinkingLevel,
@@ -1914,9 +1983,11 @@ async function spawnCommitterSubagent(
 			agent,
 			signal,
 		});
+		// Deterministic parsing only for now; the committer rework wires up LLM repair.
+		const result = await parseRunResult(run, COMMITTER_RESULT_SCHEMA);
 
-		if (result.success) {
-			const commitCountMatch = result.summary.match(/(\d+)\s*commit/i);
+		if (result.ok && result.value.success) {
+			const commitCountMatch = result.value.summary.match(/(\d+)\s*commit/i);
 			const commitCount = commitCountMatch ? parseInt(commitCountMatch[1], 10) : 1;
 			return { success: true, commitCount, cost: result.usage.cost };
 		}
@@ -2179,7 +2250,7 @@ async function runOrchestratorLoop(
 				while (true) {
 					if (aborted) break;
 
-					result = await spawnSubagent({
+					const run = await spawnSubagent({
 						taskPrompt: currentPrompt,
 						model: settings.steps.implement.model,
 						thinkingLevel: settings.steps.implement.thinking,
@@ -2204,50 +2275,26 @@ async function runOrchestratorLoop(
 									break;
 							}
 
-							const now = Date.now();
-							switch (activity.type) {
-								case "tool_start":
-									taskState.outputEvents.push({
-										time: now,
-										kind: "tool_start",
-										tool: activity.toolName,
-										args: activity.argsSummary,
-										turn: activity.turn,
-									});
-									break;
-								case "tool_end":
-									taskState.outputEvents.push({
-										time: now,
-										kind: "tool_end",
-										tool: activity.toolName,
-										error: !activity.toolSuccess,
-										result: activity.resultPreview,
-										turn: activity.turn,
-									});
-									break;
-								case "text_delta":
-									if (taskState.outputEvents.at(-1)?.kind !== "text") {
-										taskState.outputEvents.push({
-											time: now,
-											kind: "text",
-											turn: activity.turn,
-										});
-									}
-									break;
-								case "thinking":
-									if (taskState.outputEvents.at(-1)?.kind !== "thinking") {
-										taskState.outputEvents.push({
-											time: now,
-											kind: "thinking",
-											turn: activity.turn,
-										});
-									}
-									break;
-							}
-
+							appendOutputEvent(taskState.outputEvents, activity);
 							requestOverlayRender();
 						},
 					});
+
+					// Parse the raw final text: deterministic repair first, then one
+					// LLM repair attempt with the orchestrator model/thinking level.
+					const repairSignal = currentAbortController.signal;
+					const parsedRun = await parseRunResult(run, WORKER_RESULT_SCHEMA, (onCost) => {
+						const repair = createOrchestratorRepair(ctx.modelRegistry, settings.steps.orchestrator, {
+							signal: repairSignal,
+							onCost,
+						});
+						return async (request) => {
+							taskState.currentActivity = "🔧 repairing JSON result…";
+							requestOverlayRender();
+							return repair(request);
+						};
+					});
+					result = toWorkerResult(parsedRun);
 
 					taskState.cost += result.usage.cost;
 					loopState.totalCost += result.usage.cost;
