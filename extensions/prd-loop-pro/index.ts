@@ -29,10 +29,19 @@
  *    deferred, unresolved findings and created commits, close todo, update
  *    PRD Task Index)
  *
- * "Release (fix manually)" (round limit, commit failure, manual pause) sets the
- * task todo to `needs-human`, appends the open findings and stops the loop.
- * `needs-human` is not closed: dependent tasks stay blocked until the task is
- * resolved at the next start.
+ * Unified pause handling (./pause.ts): the loop never fails hard on a task.
+ * Implementation still failing after all retries, an unrepairable JSON result,
+ * a failing committer/hook, the review round limit and a manual Ctrl+C all open
+ * a pause menu that shows the task, the current phase and the reason. Ctrl+C
+ * offers "Resume current phase", "Skip phase" (not during commit), "Retry task"
+ * (discard changes, restart at implement), "Release", "Skip task" and "Abort".
+ * Discard operations ("Retry task", "Skip task") never touch `.pi/`
+ * (./discard.ts), even when `.pi/` is tracked.
+ *
+ * "Release (fix manually)" (offered in every pause menu) sets the task todo to
+ * `needs-human`, appends the open findings and stops the loop. `needs-human`
+ * is not closed: dependent tasks stay blocked until the task is resolved at
+ * the next start.
  */
 
 import { spawn } from "node:child_process";
@@ -94,6 +103,9 @@ import { buildFixerPrompt } from "./fixer-prompt.ts";
 import { buildReviewerPrompt, filterReviewableStatus, REVIEW_EXCLUDED_DIR, REVIEW_PATHSPEC } from "./reviewer-prompt.ts";
 import { buildCommitterPrompt, loadCommitRules } from "./committer-prompt.ts";
 import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
+import { buildPauseMenu, defaultReasonText, releaseReasonFor, skipSummaryFor } from "./pause.ts";
+import type { PauseAction, PauseReasonKind, PauseRequest } from "./pause.ts";
+import { discardChanges } from "./discard.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1861,51 +1873,7 @@ function statusIconFn(status: TaskStatus): string {
 	return statusIcon(status);
 }
 
-// --- Pause menu ---
-
-type PauseAction = "resume" | "release" | "retry" | "retry-commit" | "skip" | "abort";
-
-/**
- * Label of the "Release" option: the task todo is set to `needs-human`, the
- * open findings are appended to it and the loop stops. The task is offered
- * first at the next start.
- */
-const RELEASE_LABEL = "🔧 Release (fix manually) — mark task needs-human, stop the loop, resolve at next start";
-
-/**
- * Show an interactive pause menu (after Ctrl+C interrupts a running subagent
- * or when a phase fails, e.g. committer failure / pre-commit hook failure).
- * Cancelling the dialog selects the first offered action.
- */
-async function showPauseMenu(
-	ctx: ExtensionCommandContext,
-	task: TaskInfo,
-	options: { phase?: TaskPhase; actions?: PauseAction[]; reason?: string } = {},
-): Promise<PauseAction> {
-	const phase = options.phase ?? "Implement";
-	const actions = options.actions ?? ["resume", "release", "retry", "skip", "abort"];
-	const labels: Record<PauseAction, string> = {
-		resume: phase === "Implement"
-			? "▶️  Resume — keep changes, continue where it left off"
-			: `▶️  Resume — keep changes, restart the ${phase.toLowerCase()} phase`,
-		release: RELEASE_LABEL,
-		retry: "🔄 Retry task — discard changes, try again from scratch",
-		"retry-commit": "🔁 Retry commit — run the committer again",
-		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
-		abort: "❌ Abort loop — stop and keep changes on disk",
-	};
-	const menu = actions.map((action) => labels[action]);
-
-	const choice = await ctx.ui.select(
-		`⏸️  Paused (${phase}${options.reason ? `: ${options.reason}` : ""}) — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
-		menu,
-	);
-
-	const index = choice === undefined ? -1 : menu.indexOf(choice);
-	return index === -1 ? actions[0]! : actions[index]!;
-}
-
-type RoundLimitAction = "one-more-round" | "commit-as-is" | "release" | "skip" | "abort";
+// --- Pause menu (reasons, offered actions and titles: see ./pause.ts) ---
 
 /** Maximum number of open findings listed in the round-limit menu title. */
 const ROUND_LIMIT_MAX_LISTED_FINDINGS = 12;
@@ -1917,41 +1885,32 @@ export function formatOpenFindingLine(finding: ReviewFinding): string {
 	return `[${finding.priority}] ${location} — ${title}`;
 }
 
-/**
- * Pause menu shown when the review round limit is reached with open findings
- * at/above the fix threshold. Lists the open findings (priority, file:line,
- * title). Cancelling the dialog shows it again (every option has a cost or
- * consequence, so none is chosen implicitly).
- */
-async function showRoundLimitMenu(
-	ctx: ExtensionCommandContext,
-	task: TaskInfo,
-	step: Extract<CycleStep, { kind: "pause" }>,
-): Promise<RoundLimitAction> {
+/** Detail lines of the round-limit pause: the open findings at/above the fix threshold. */
+function roundLimitDetails(step: Extract<CycleStep, { kind: "pause" }>): string[] {
 	const count = step.openFindings.length;
 	const listed = step.openFindings.slice(0, ROUND_LIMIT_MAX_LISTED_FINDINGS);
-	const titleLines = [
-		`⏸️  Review round limit reached (${step.round}/${step.roundLimit}) — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
-		"",
+	const lines = [
 		`${count} open finding${count === 1 ? "" : "s"} at/above the fix threshold:`,
 		...listed.map((finding) => `  ${formatOpenFindingLine(finding)}`),
 	];
-	if (count > listed.length) titleLines.push(`  … and ${count - listed.length} more`);
+	if (count > listed.length) lines.push(`  … and ${count - listed.length} more`);
+	return lines;
+}
 
-	const actions: RoundLimitAction[] = ["one-more-round", "commit-as-is", "release", "skip", "abort"];
-	const labels: Record<RoundLimitAction, string> = {
-		"one-more-round": "🔁 One more round — fix the open findings and review again",
-		"commit-as-is": "✅ Commit as-is & close task — open findings go into the report",
-		release: RELEASE_LABEL,
-		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
-		abort: "❌ Abort loop — stop and keep changes on disk",
-	};
-	const menu = actions.map((action) => labels[action]);
-
+/**
+ * Show a pause menu. The title always states task, phase and reason (plus
+ * errors/details); the offered actions depend on reason and phase. Cancelling
+ * resumes a manual pause; every other menu is shown again (all of its options
+ * have a cost or consequence, so none is chosen implicitly).
+ */
+async function showPauseMenu(ctx: ExtensionCommandContext, request: PauseRequest): Promise<PauseAction> {
+	const menu = buildPauseMenu(request);
+	const labels = menu.options.map((option) => option.label);
 	while (true) {
-		const choice = await ctx.ui.select(titleLines.join("\n"), menu);
-		const index = choice === undefined ? -1 : menu.indexOf(choice);
-		if (index !== -1) return actions[index]!;
+		const choice = await ctx.ui.select(menu.title, labels);
+		const index = choice === undefined ? -1 : labels.indexOf(choice);
+		if (index !== -1) return menu.options[index]!.action;
+		if (menu.cancelAction) return menu.cancelAction;
 	}
 }
 
@@ -2286,11 +2245,11 @@ async function runOrchestratorLoop(
 		requestOverlayRender();
 	};
 
-	/** Discard all uncommitted changes (tracked + untracked). */
-	const discardChanges = async () => {
-		await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-		await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
-	};
+	/**
+	 * Discard all uncommitted changes outside `.pi/` (see ./discard.ts). Todo
+	 * bookkeeping under `.pi/` is never touched, even when `.pi/` is tracked.
+	 */
+	const discardTaskChanges = () => discardChanges((args) => pi.exec("git", args, { cwd: ctx.cwd }));
 
 	/** Close a task todo and update the PRD Task Index (index errors are reported, not fatal). */
 	const closeTaskAndUpdateIndex = async (task: TaskInfo, options: { notifyIndexError: boolean }) => {
@@ -2308,9 +2267,9 @@ async function runOrchestratorLoop(
 		}
 	};
 
-	/** Skip a task after a pause: discard changes and close the todo. */
-	const skipTask = async (task: TaskInfo, taskState: LoopTaskState, summary = "Skipped after manual pause.") => {
-		await discardChanges();
+	/** "Skip task": discard changes (except `.pi/`), close the todo, continue with the next task. */
+	const skipTask = async (task: TaskInfo, taskState: LoopTaskState, summary: string) => {
+		await discardTaskChanges();
 		currentAbortController = new AbortController();
 		taskState.status = "completed";
 		taskState.endTime = Date.now();
@@ -2318,6 +2277,7 @@ async function runOrchestratorLoop(
 		taskState.summary = summary;
 		taskState.errors = [];
 		await closeTaskAndUpdateIndex(task, { notifyIndexError: false });
+		requestOverlayRender();
 	};
 
 	/** Why and with which open findings a task is released to a human. */
@@ -2388,18 +2348,200 @@ async function runOrchestratorLoop(
 		};
 	};
 
+	// --- Unified pause handling (see ./pause.ts) ---
+
+	/** Why the loop pauses (reason kind + optional text, errors and detail lines). */
+	type PauseOptions = { reason: PauseReasonKind; reasonText?: string; errors?: string[]; details?: string[] };
+
+	/** Exits shared by all phases, chosen in a pause menu. */
+	type PhaseExit =
+		| { kind: "retry-task" }
+		| { kind: "skipped" }
+		| { kind: "released"; reason: string; errors?: string[] }
+		| { kind: "aborted" };
+
+	/**
+	 * Pause the loop and ask the human. The menu shows task, current phase
+	 * (incl. round progress) and reason. The overlay refresh stops while the
+	 * menu is open; afterwards a fresh abort controller is installed so the
+	 * chosen action can spawn subagents again.
+	 */
+	const pause = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phase: TaskPhase,
+		options: PauseOptions,
+	): Promise<PauseAction> => {
+		pauseRequested = false;
+		const reasonText = options.reasonText ?? defaultReasonText(options.reason, phase);
+		taskState.currentActivity = `⏸ ${reasonText}`;
+		requestOverlayRender();
+		if (widgetTimer) clearInterval(widgetTimer);
+		try {
+			return await showPauseMenu(ctx, {
+				taskLabel: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+				phase,
+				phaseLabel: taskState.phaseLabel ?? phase,
+				reason: options.reason,
+				reasonText,
+				errors: options.errors,
+				details: options.details,
+			});
+		} finally {
+			if (widgetTimer) clearInterval(widgetTimer);
+			widgetTimer = setInterval(requestOverlayRender, 1000);
+			currentAbortController = new AbortController();
+			taskState.currentActivity = undefined;
+			requestOverlayRender();
+		}
+	};
+
+	/**
+	 * Handle the actions every pause menu shares: "Retry task" (the caller
+	 * discards the changes and restarts at implement), "Skip task", "Release"
+	 * and "Abort". Phase-specific actions must be handled before; anything
+	 * else aborts the loop.
+	 */
+	const handleCommonPauseAction = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phase: TaskPhase,
+		options: PauseOptions,
+		action: PauseAction,
+	): Promise<PhaseExit> => {
+		const reasonInfo = { phase, reason: options.reason, reasonText: options.reasonText };
+		switch (action) {
+			case "retry-task":
+				return { kind: "retry-task" };
+			case "skip-task":
+				await skipTask(task, taskState, skipSummaryFor(reasonInfo));
+				return { kind: "skipped" };
+			case "release":
+				return { kind: "released", reason: releaseReasonFor(reasonInfo), errors: options.errors };
+			default:
+				aborted = true;
+				return { kind: "aborted" };
+		}
+	};
+
+	type ImplementPhaseOutcome =
+		| { kind: "implemented"; summary: string }
+		| PhaseExit;
+
+	/**
+	 * Implement phase: prd-worker subagent (implement model/thinking) with up
+	 * to `implementationRetries` automatic retries. Pauses instead of failing:
+	 * - still failing after all retries → Retry task / Release / Skip task / Abort
+	 * - unrepairable JSON result → Retry phase / Release / Skip task / Abort
+	 * - Ctrl+C → Resume / Skip phase / Retry task / Release / Skip task / Abort
+	 */
+	const runImplementPhase = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+	): Promise<ImplementPhaseOutcome> => {
+		let prompt = buildTaskPrompt(task, prdId);
+		let retriesRemaining = settings.implementationRetries;
+		let attempt = 1;
+
+		while (true) {
+			if (aborted) return { kind: "aborted" };
+
+			const run = await spawnSubagent({
+				taskPrompt: prompt,
+				model: settings.steps.implement.model,
+				thinkingLevel: settings.steps.implement.thinking,
+				cwd: ctx.cwd,
+				agent,
+				signal: currentAbortController.signal,
+				onActivity: createActivityHandler(taskState),
+			});
+
+			// Parse the raw final text: deterministic repair first, then one
+			// LLM repair attempt with the orchestrator model/thinking level.
+			const parsedRun = await parseRunResult(run, WORKER_RESULT_SCHEMA, createRepairFactory(taskState));
+			const result = toWorkerResult(parsedRun);
+			addCost(taskState, phaseCosts, "implement", result.usage.cost);
+			taskState.summary = result.summary;
+			requestOverlayRender();
+
+			// --- Pause: Ctrl+C ---
+			if (pauseRequested) {
+				const options: PauseOptions = { reason: "manual" };
+				const action = await pause(task, taskState, "Implement", options);
+				if (action === "resume") {
+					prompt = buildContinuePrompt(task, prdId);
+					taskState.currentActivity = "▶ resuming…";
+					requestOverlayRender();
+					continue;
+				}
+				if (action === "skip-phase") {
+					return {
+						kind: "implemented",
+						summary: "Implementation phase skipped manually (pause); continued with the changes on disk as-is.",
+					};
+				}
+				return handleCommonPauseAction(task, taskState, "Implement", options, action);
+			}
+
+			if (aborted) return { kind: "aborted" };
+
+			// --- Pause: the worker finished, but its result is not valid JSON even after repair ---
+			if (!parsedRun.ok && parsedRun.status === "invalid-result") {
+				const options: PauseOptions = { reason: "invalid-result", errors: [parsedRun.error] };
+				taskState.errors = options.errors!;
+				const action = await pause(task, taskState, "Implement", options);
+				if (action === "retry-phase") {
+					prompt = buildContinuePrompt(task, prdId);
+					taskState.errors = [];
+					taskState.currentActivity = "▶ retrying implementation…";
+					requestOverlayRender();
+					continue;
+				}
+				return handleCommonPauseAction(task, taskState, "Implement", options, action);
+			}
+
+			if (result.success) {
+				taskState.errors = [];
+				taskState.status = "running";
+				return { kind: "implemented", summary: result.summary };
+			}
+
+			taskState.errors = result.errors;
+
+			// --- Pause: still failing after all retries ---
+			if (retriesRemaining <= 0) {
+				const options: PauseOptions = {
+					reason: "implementation-failed",
+					reasonText: `implementation failed after ${attempt} attempt${attempt === 1 ? "" : "s"}`,
+					errors: result.errors,
+				};
+				const action = await pause(task, taskState, "Implement", options);
+				return handleCommonPauseAction(task, taskState, "Implement", options, action);
+			}
+
+			retriesRemaining--;
+			attempt++;
+			taskState.retries++;
+			taskState.status = "retrying";
+			loopState.currentRetry = attempt - 1;
+			prompt = buildRetryPrompt(task, prdId, result.errors);
+			requestOverlayRender();
+		}
+	};
+
 	type ReviewPhaseOutcome =
 		| { kind: "reviewed"; review: ReviewerResult }
 		| { kind: "no-changes" }
-		| { kind: "skipped" }
-		| { kind: "released"; reason: string }
-		| { kind: "aborted" }
-		| { kind: "failed"; error: string };
+		| { kind: "skip-phase" }
+		| PhaseExit;
 
 	/**
 	 * Review phase: one fresh prd-reviewer subagent (review model/thinking)
 	 * reviews the uncommitted changes outside `.pi/` against the task. The
 	 * result is parsed and, if needed, repaired with the reviewer schema.
+	 * An unrepairable result or a crashed reviewer pauses the loop
+	 * (Retry phase / Release / Skip task / Abort).
 	 */
 	const runReviewPhase = async (
 		task: TaskInfo,
@@ -2407,83 +2549,91 @@ async function runOrchestratorLoop(
 		phaseCosts: Partial<Record<CostPhase, number>>,
 		options: { round: number; rejectedFindings: RejectedFinding[] },
 	): Promise<ReviewPhaseOutcome> => {
-		const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
-		if (status.code !== 0) {
-			return { kind: "failed", error: `git status failed: ${(status.stderr || status.stdout).trim()}` };
-		}
-		const changedFiles = filterReviewableStatus(status.stdout);
-		if (changedFiles.length === 0) return { kind: "no-changes" };
-
-		const prompt = buildReviewerPrompt({
-			taskTitle: task.title,
-			taskBody: task.body,
-			changedFiles,
-			projectGuidelines: await loadProjectReviewGuidelines(ctx.cwd),
-			rejectedFindings: options.rejectedFindings,
-			round: options.round,
-		});
-
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
-			const run = await spawnSubagent({
-				taskPrompt: prompt,
-				model: settings.steps.review.model,
-				thinkingLevel: settings.steps.review.thinking,
-				cwd: ctx.cwd,
-				agent: reviewerAgent,
-				signal: currentAbortController.signal,
-				onActivity: createActivityHandler(taskState),
-			});
-			const parsed = await parseRunResult(run, REVIEWER_RESULT_SCHEMA, createRepairFactory(taskState));
-			addCost(taskState, phaseCosts, "review", parsed.usage.cost);
+			let failure: PauseOptions;
+			const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
+			if (status.code !== 0) {
+				failure = {
+					reason: "phase-failed",
+					reasonText: "review failed — git status failed",
+					errors: [(status.stderr || status.stdout).trim() || `exit code ${status.code}`],
+				};
+			} else {
+				const changedFiles = filterReviewableStatus(status.stdout);
+				if (changedFiles.length === 0) return { kind: "no-changes" };
 
-			if (pauseRequested) {
-				pauseRequested = false;
-				if (widgetTimer) clearInterval(widgetTimer);
-				const pauseAction = await showPauseMenu(ctx, task, {
-					phase: "Review",
-					actions: ["resume", "release", "skip", "abort"],
+				const prompt = buildReviewerPrompt({
+					taskTitle: task.title,
+					taskBody: task.body,
+					changedFiles,
+					projectGuidelines: await loadProjectReviewGuidelines(ctx.cwd),
+					rejectedFindings: options.rejectedFindings,
+					round: options.round,
 				});
-				widgetTimer = setInterval(requestOverlayRender, 1000);
 
-				switch (pauseAction) {
-					case "resume":
-						currentAbortController = new AbortController();
+				const run = await spawnSubagent({
+					taskPrompt: prompt,
+					model: settings.steps.review.model,
+					thinkingLevel: settings.steps.review.thinking,
+					cwd: ctx.cwd,
+					agent: reviewerAgent,
+					signal: currentAbortController.signal,
+					onActivity: createActivityHandler(taskState),
+				});
+				const parsed = await parseRunResult(run, REVIEWER_RESULT_SCHEMA, createRepairFactory(taskState));
+				addCost(taskState, phaseCosts, "review", parsed.usage.cost);
+
+				// --- Pause: Ctrl+C ---
+				if (pauseRequested) {
+					const pauseOptions: PauseOptions = { reason: "manual" };
+					const action = await pause(task, taskState, "Review", pauseOptions);
+					if (action === "resume") {
 						taskState.currentActivity = "▶ restarting review…";
 						requestOverlayRender();
 						continue;
-					case "release":
-						return { kind: "released", reason: "manual pause during review" };
-					case "skip":
-						await skipTask(task, taskState);
-						requestOverlayRender();
-						return { kind: "skipped" };
-					case "retry": // not offered during review
-					case "abort":
-						aborted = true;
-						return { kind: "aborted" };
+					}
+					if (action === "skip-phase") return { kind: "skip-phase" };
+					return handleCommonPauseAction(task, taskState, "Review", pauseOptions, action);
 				}
+
+				if (aborted) return { kind: "aborted" };
+				if (parsed.ok) return { kind: "reviewed", review: parsed.value };
+
+				failure = parsed.status === "invalid-result"
+					? { reason: "invalid-result", errors: [parsed.error] }
+					: {
+						reason: "phase-failed",
+						reasonText: `review failed — the reviewer ${parsed.status === "aborted" ? "was aborted" : "crashed"}`,
+						errors: [parsed.error],
+					};
 			}
 
-			if (aborted) return { kind: "aborted" };
-			if (!parsed.ok) return { kind: "failed", error: parsed.error };
-			return { kind: "reviewed", review: parsed.value };
+			// --- Pause: unrepairable JSON / reviewer failure ---
+			taskState.errors = failure.errors ?? [];
+			const action = await pause(task, taskState, "Review", failure);
+			if (action === "retry-phase") {
+				taskState.errors = [];
+				taskState.currentActivity = "▶ retrying review…";
+				requestOverlayRender();
+				continue;
+			}
+			return handleCommonPauseAction(task, taskState, "Review", failure, action);
 		}
 	};
 
 	type FixPhaseOutcome =
 		| { kind: "result"; outcome: FixOutcome }
-		| { kind: "skipped" }
-		| { kind: "released"; reason: string }
-		| { kind: "aborted" };
+		| PhaseExit;
 
 	/**
 	 * Fix phase for exactly one finding: a fresh prd-fixer subagent (fix
 	 * model/thinking) gets the task title/body and the finding, fixes it (and
 	 * runs the relevant checks) or rejects it with a reason. A crashed fixer or
 	 * an unparseable result (even after JSON repair) counts the finding as
-	 * unresolved — it never stops the loop.
+	 * unresolved — it never stops the loop. "Skip phase" (Ctrl+C) leaves the
+	 * finding unresolved, too.
 	 */
 	const runFixPhase = async (
 		task: TaskInfo,
@@ -2514,31 +2664,19 @@ async function runOrchestratorLoop(
 			const parsed = await parseRunResult(run, FIXER_RESULT_SCHEMA, createRepairFactory(taskState));
 			addCost(taskState, phaseCosts, "fix", parsed.usage.cost);
 
+			// --- Pause: Ctrl+C ---
 			if (pauseRequested) {
-				pauseRequested = false;
-				if (widgetTimer) clearInterval(widgetTimer);
-				const pauseAction = await showPauseMenu(ctx, task, {
-					phase: "Fix",
-					actions: ["resume", "release", "skip", "abort"],
-				});
-				widgetTimer = setInterval(requestOverlayRender, 1000);
-
-				switch (pauseAction) {
-					case "release":
-						return { kind: "released", reason: "manual pause during fix" };
-					case "skip":
-						await skipTask(task, taskState);
-						requestOverlayRender();
-						return { kind: "skipped" };
-					case "abort":
-						aborted = true;
-						return { kind: "aborted" };
-					default:
-						currentAbortController = new AbortController();
-						taskState.currentActivity = "▶ restarting fix…";
-						requestOverlayRender();
-						continue;
+				const pauseOptions: PauseOptions = { reason: "manual" };
+				const action = await pause(task, taskState, "Fix", pauseOptions);
+				if (action === "resume") {
+					taskState.currentActivity = "▶ restarting fix…";
+					requestOverlayRender();
+					continue;
 				}
+				if (action === "skip-phase") {
+					return { kind: "result", outcome: { status: "unresolved", reason: "Fix skipped manually (pause)" } };
+				}
+				return handleCommonPauseAction(task, taskState, "Fix", pauseOptions, action);
 			}
 
 			if (aborted) return { kind: "aborted" };
@@ -2564,16 +2702,16 @@ async function runOrchestratorLoop(
 
 	type CommitPhaseOutcome =
 		| { kind: "committed"; commits: CommitRef[] }
-		| { kind: "skipped" }
-		| { kind: "released"; reason: string; errors?: string[] }
-		| { kind: "aborted" };
+		| PhaseExit;
 
 	/**
 	 * Commit phase: a prd-committer subagent (commit model/thinking) commits the
 	 * uncommitted changes outside `.pi/` following the `/commit` prompt template
 	 * rules. There is no fallback commit: committer failure, a failing hook
 	 * (`hookFailed`), an unparseable result, leftover changes or commits touching
-	 * `.pi/` pause the loop with "Retry commit" / "Skip task" / "Abort".
+	 * `.pi/` pause the loop with "Retry phase" / "Release" / "Skip task" / "Abort".
+	 * "Skip phase" is never offered here: uncommitted changes would leak into
+	 * the next task.
 	 *
 	 * HEAD is recorded before the phase; the created commits (SHA + subject) are
 	 * determined by the orchestrator, not by the agent.
@@ -2589,7 +2727,7 @@ async function runOrchestratorLoop(
 			if (aborted) return { kind: "aborted" };
 
 			let errors: string[] = [];
-			let hookFailed = false;
+			let reason: PauseReasonKind = "committer-failed";
 
 			const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
 			if (status.code !== 0) {
@@ -2611,41 +2749,29 @@ async function runOrchestratorLoop(
 					const parsed = await parseRunResult(run, COMMITTER_RESULT_SCHEMA, createRepairFactory(taskState));
 					addCost(taskState, phaseCosts, "commit", parsed.usage.cost);
 
+					// --- Pause: Ctrl+C (no "Skip phase" during commit) ---
 					if (pauseRequested) {
-						pauseRequested = false;
-						if (widgetTimer) clearInterval(widgetTimer);
-						// "Skip phase" is never offered during commit: uncommitted changes
-						// would leak into the next task.
-						const pauseAction = await showPauseMenu(ctx, task, {
-							phase: "Commit",
-							actions: ["retry-commit", "release", "skip", "abort"],
-						});
-						widgetTimer = setInterval(requestOverlayRender, 1000);
-
-						switch (pauseAction) {
-							case "release":
-								return { kind: "released", reason: "manual pause during commit" };
-							case "skip":
-								await skipTask(task, taskState);
-								requestOverlayRender();
-								return { kind: "skipped" };
-							case "abort":
-								aborted = true;
-								return { kind: "aborted" };
-							default:
-								currentAbortController = new AbortController();
-								taskState.currentActivity = "▶ restarting commit…";
-								requestOverlayRender();
-								continue;
+						const pauseOptions: PauseOptions = { reason: "manual" };
+						const action = await pause(task, taskState, "Commit", pauseOptions);
+						if (action === "resume") {
+							taskState.currentActivity = "▶ restarting commit…";
+							requestOverlayRender();
+							continue;
 						}
+						return handleCommonPauseAction(task, taskState, "Commit", pauseOptions, action);
 					}
 
 					if (aborted) return { kind: "aborted" };
 
 					if (!parsed.ok) {
-						errors = [`Committer returned no valid result: ${parsed.error}`];
+						if (parsed.status === "invalid-result") {
+							reason = "invalid-result";
+							errors = [`Committer returned no valid result: ${parsed.error}`];
+						} else {
+							errors = [`Committer ${parsed.status === "aborted" ? "was aborted" : "crashed"}: ${parsed.error}`];
+						}
 					} else if (parsed.value.hookFailed) {
-						hookFailed = true;
+						reason = "hook-failed";
 						errors = parsed.value.errors.length > 0 ? parsed.value.errors : [parsed.value.summary || "Git hook failed"];
 					} else if (!parsed.value.success) {
 						errors = parsed.value.errors.length > 0 ? parsed.value.errors : [parsed.value.summary || "Committer failed"];
@@ -2677,41 +2803,193 @@ async function runOrchestratorLoop(
 				return { kind: "committed", commits: await listCommitsSince(pi, ctx.cwd, headBefore) };
 			}
 
-			// --- Pause: committer failed or a hook rejected the commit (never bypassed) ---
-			const reason = hookFailed ? "git hook failed" : "committer failed";
+			// --- Pause: committer failed, invalid result or a hook rejected the commit (never bypassed) ---
+			const failure: PauseOptions = { reason, errors };
 			taskState.errors = errors;
-			taskState.currentActivity = `⏸ ${reason}`;
-			requestOverlayRender();
-			if (widgetTimer) clearInterval(widgetTimer);
-			ctx.ui.notify(
-				`⚠️ Commit phase paused (${reason}) — Task ${task.sequenceLabel}:\n${errors.join("\n")}`,
-				"warning",
-			);
-			const pauseAction = await showPauseMenu(ctx, task, {
-				phase: "Commit",
-				reason,
-				actions: ["retry-commit", "release", "skip", "abort"],
-			});
-			widgetTimer = setInterval(requestOverlayRender, 1000);
+			const action = await pause(task, taskState, "Commit", failure);
+			if (action === "retry-phase") {
+				taskState.errors = [];
+				taskState.currentActivity = "▶ retrying commit…";
+				requestOverlayRender();
+				continue;
+			}
+			return handleCommonPauseAction(task, taskState, "Commit", failure, action);
+		}
+	};
 
-			switch (pauseAction) {
-				case "release":
-					return { kind: "released", reason, errors };
-				case "skip":
-					await skipTask(task, taskState, `Skipped after commit failure (${reason}).`);
-					requestOverlayRender();
-					return { kind: "skipped" };
-				case "abort":
-					aborted = true;
-					return { kind: "aborted" };
-				default:
-					currentAbortController = new AbortController();
-					taskState.errors = [];
-					taskState.currentActivity = "▶ retrying commit…";
-					requestOverlayRender();
+	/** Outcome of one pipeline run of a task (implement → review-fix → commit → report). */
+	type TaskOutcome =
+		| { kind: "completed" }
+		| { kind: "skipped" }
+		| { kind: "retry-task" }
+		| { kind: "released"; request: ReleaseRequest }
+		| { kind: "aborted"; summary: string };
+
+	/** Map a phase exit to the task outcome (release details from `release`). */
+	const exitToTaskOutcome = (
+		exit: PhaseExit,
+		release: Omit<ReleaseRequest, "reason" | "errors">,
+		abortSummary: string,
+	): TaskOutcome => {
+		switch (exit.kind) {
+			case "released":
+				return { kind: "released", request: { ...release, reason: exit.reason, errors: exit.errors } };
+			case "aborted":
+				return { kind: "aborted", summary: abortSummary };
+			default:
+				return exit;
+		}
+	};
+
+	/**
+	 * Run the pipeline for one task. `resumeMode` (resolving a `needs-human`
+	 * task) replaces the implementation phase with the human's uncommitted
+	 * changes: "commit" goes straight to the commit phase, "review" re-enters
+	 * the review-fix cycle first.
+	 */
+	const runTaskPipeline = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+		resumeMode: NeedsHumanResume["mode"] | undefined,
+	): Promise<TaskOutcome> => {
+		// --- Implement phase (skipped when resolving a needs-human task) ---
+		let implementerSummary: string;
+		if (resumeMode) {
+			implementerSummary = "Resolved manually after the task was released to a human (needs-human).";
+		} else {
+			setPhase(taskState, "Implement");
+			const implement = await runImplementPhase(task, taskState, phaseCosts);
+			if (implement.kind !== "implemented") {
+				return exitToTaskOutcome(implement, {}, "Task execution was cancelled.");
+			}
+			implementerSummary = implement.summary;
+		}
+		taskState.summary = implementerSummary;
+
+		// --- Review-fix cycle (see ./review-cycle.ts) ---
+		const cycleAbortSummary = "Task execution was cancelled during the review-fix cycle.";
+		let cycle: ReviewCycleState = createReviewCycle({
+			fixThreshold: settings.fixThreshold as FindingPriority,
+			maxReviewRounds: settings.maxReviewRounds,
+		});
+		let reviewNote: string | undefined = resumeMode === "commit"
+			? "Resolved by a human (needs-human) — changes committed without another automated review."
+			: undefined;
+		const updateCycleInfo = () => {
+			taskState.reviewInfo = formatCycleInfo(cycle);
+			requestOverlayRender();
+		};
+
+		// "Commit changes & close" skips the review-fix cycle.
+		cycleLoop: while (resumeMode !== "commit") {
+			if (aborted) return { kind: "aborted", summary: cycleAbortSummary };
+			const step = nextStep(cycle);
+
+			if (step.kind === "commit") break;
+
+			if (step.kind === "review") {
+				setPhase(taskState, "Review", `Review ${step.round}/${step.roundLimit}`);
+				const reviewOutcome = await runReviewPhase(task, taskState, phaseCosts, {
+					round: step.round,
+					rejectedFindings: rejectedForNextReview(cycle),
+				});
+				switch (reviewOutcome.kind) {
+					case "reviewed":
+						cycle = applyReview(cycle, reviewOutcome.review);
+						updateCycleInfo();
+						continue cycleLoop;
+					case "no-changes":
+						reviewNote = step.round === 1
+							? "No changes outside .pi/ — review skipped."
+							: `No changes outside .pi/ left for review round ${step.round} — review skipped.`;
+						if (resumeMode === "review") reviewNote = `Re-reviewed after release to a human (needs-human). ${reviewNote}`;
+						if (step.round === 1) taskState.reviewInfo = "skipped (no changes outside .pi/)";
+						break cycleLoop;
+					case "skip-phase":
+						reviewNote = step.round === 1
+							? "Review skipped manually (pause) — committed without an automated review."
+							: `Review round ${step.round} skipped manually (pause) — the last fixes were committed without a re-review.`;
+						if (step.round === 1) taskState.reviewInfo = "skipped manually";
+						break cycleLoop;
+					default:
+						return exitToTaskOutcome(reviewOutcome, { cycle }, cycleAbortSummary);
+				}
+			}
+
+			if (step.kind === "fix") {
+				const findingTitle = step.finding.title.replace(/\s+/g, " ").trim();
+				setPhase(taskState, "Fix", `Fix ${step.index}/${step.total} [${step.finding.priority}] ${findingTitle}`);
+				const fixOutcome = await runFixPhase(task, taskState, phaseCosts, step);
+				if (fixOutcome.kind === "result") {
+					cycle = applyFixOutcome(cycle, fixOutcome.outcome);
+					updateCycleInfo();
 					continue;
+				}
+				return exitToTaskOutcome(fixOutcome, { cycle, openReason: "Not fixed before the release" }, cycleAbortSummary);
+			}
+
+			// --- Pause: round limit reached with open findings ---
+			const open = step.openFindings.length;
+			taskState.phaseLabel = `Review ${step.round}/${step.roundLimit} — round limit`;
+			const limitOptions: PauseOptions = {
+				reason: "round-limit",
+				reasonText: `review round limit reached (${step.round}/${step.roundLimit}) with ${open} open finding${open === 1 ? "" : "s"}`,
+				details: roundLimitDetails(step),
+			};
+			const roundLimitAction = await pause(task, taskState, "Review", limitOptions);
+
+			switch (roundLimitAction) {
+				case "one-more-round":
+					cycle = extendRoundLimit(cycle);
+					updateCycleInfo();
+					continue;
+				case "commit-as-is":
+					cycle = commitAsIs(cycle);
+					updateCycleInfo();
+					continue;
+				default: {
+					const exit = await handleCommonPauseAction(task, taskState, "Review", limitOptions, roundLimitAction);
+					return exitToTaskOutcome(
+						exit,
+						{ cycle, openReason: `Open at the review round limit (${step.round}/${step.roundLimit})` },
+						cycleAbortSummary,
+					);
+				}
 			}
 		}
+
+		// --- Commit phase ---
+		setPhase(taskState, "Commit");
+		const commitOutcome = await runCommitPhase(task, taskState, phaseCosts);
+		if (commitOutcome.kind !== "committed") {
+			return exitToTaskOutcome(commitOutcome, { cycle }, "Task execution was cancelled during commit.");
+		}
+
+		// Commit SHAs are determined by the orchestrator (HEAD before vs. after).
+		const commits = commitOutcome.commits;
+		loopState.totalCommits += commits.length;
+
+		// --- Report: append execution report, close todo, update PRD Task Index ---
+		if (resumeMode === "review" && reviewNote === undefined) {
+			reviewNote = "Re-reviewed after release to a human (needs-human).";
+		}
+		const record: ExecutionRecord = {
+			implementerSummary,
+			...reportFields(cycle),
+			reviewNote,
+			commits,
+			cost: phaseCosts,
+		};
+		const taskBody = await readTodoBody(ctx.cwd, task.id);
+		await updateTodoFileBody(ctx.cwd, task.id, appendSection(taskBody, buildExecutionReport(record)));
+
+		taskState.status = "completed";
+		taskState.endTime = Date.now();
+		taskState.currentActivity = undefined;
+		await closeTaskAndUpdateIndex(task, { notifyIndexError: true });
+		requestOverlayRender();
+		return { kind: "completed" };
 	};
 
 	const runPromise = (async (): Promise<LoopRunResult> => {
@@ -2726,353 +3004,50 @@ async function runOrchestratorLoop(
 				if (taskStateIndex === -1) continue;
 				const taskState = loopState.tasks[taskStateIndex]!;
 				loopState.currentTaskIndex = taskStateIndex;
-				loopState.currentRetry = 0;
 				overlayComponent?.focusTask(taskStateIndex);
-				updateStatus();
 
-				taskState.status = "running";
-				taskState.startTime = Date.now();
-				taskState.endTime = undefined;
-				taskState.errors = [];
-				taskState.summary = undefined;
-				taskState.currentActivity = undefined;
-				taskState.currentTurn = 0;
-				taskState.outputEvents = [];
-				taskState.reviewInfo = undefined;
-
-				/**
-				 * Resolving a `needs-human` task: the human's uncommitted changes
-				 * replace the implementation phase. "commit" goes straight to the
-				 * commit phase, "review" re-enters the review-fix cycle first.
-				 */
-				const resumeMode = resume && resume.taskId === task.id ? resume.mode : undefined;
-				setPhase(taskState, resumeMode === "commit" ? "Commit" : resumeMode === "review" ? "Review" : "Implement");
-
-				/** Cost per phase for the execution report. */
+				/** Resolving a `needs-human` task ("Retry task" restarts it at implement). */
+				let resumeMode = resume && resume.taskId === task.id ? resume.mode : undefined;
+				/** Cost per phase for the execution report (kept across "Retry task"). */
 				const phaseCosts: Partial<Record<CostPhase, number>> = {};
-				const initialPrompt = buildTaskPrompt(task, prdId);
-				let retriesRemaining = settings.implementationRetries;
-				let attempt = 1;
-				let result: SubagentResult | undefined;
-				let currentPrompt = initialPrompt;
-				let taskSucceeded = resumeMode !== undefined;
-				let taskSkipped = false;
+				taskState.startTime = Date.now();
 
-				// Implementation phase (skipped when resolving a needs-human task).
-				while (!resumeMode) {
-					if (aborted) break;
-
-					const run = await spawnSubagent({
-						taskPrompt: currentPrompt,
-						model: settings.steps.implement.model,
-						thinkingLevel: settings.steps.implement.thinking,
-						cwd: ctx.cwd,
-						agent,
-						signal: currentAbortController.signal,
-						onActivity: createActivityHandler(taskState),
-					});
-
-					// Parse the raw final text: deterministic repair first, then one
-					// LLM repair attempt with the orchestrator model/thinking level.
-					const parsedRun = await parseRunResult(run, WORKER_RESULT_SCHEMA, createRepairFactory(taskState));
-					result = toWorkerResult(parsedRun);
-
-					addCost(taskState, phaseCosts, "implement", result.usage.cost);
-					taskState.summary = result.summary;
+				let outcome: TaskOutcome;
+				while (true) {
+					loopState.currentRetry = 0;
+					taskState.status = "running";
+					taskState.endTime = undefined;
+					taskState.retries = 0;
+					taskState.errors = [];
+					taskState.summary = undefined;
+					taskState.currentActivity = undefined;
+					taskState.currentTurn = 0;
+					taskState.outputEvents = [];
+					taskState.reviewInfo = undefined;
+					taskState.phase = undefined;
+					taskState.phaseLabel = undefined;
+					updateStatus();
 					requestOverlayRender();
 
-					if (pauseRequested) {
-						pauseRequested = false;
-						if (widgetTimer) clearInterval(widgetTimer);
-						const pauseAction = await showPauseMenu(ctx, task);
+					outcome = await runTaskPipeline(task, taskState, phaseCosts, resumeMode);
+					if (outcome.kind !== "retry-task") break;
 
-						switch (pauseAction) {
-							case "resume":
-								currentAbortController = new AbortController();
-								currentPrompt = buildContinuePrompt(task, prdId);
-								taskState.status = "running";
-								taskState.currentActivity = "▶ resuming…";
-								widgetTimer = setInterval(requestOverlayRender, 1000);
-								requestOverlayRender();
-								continue;
-
-							case "release":
-								return releaseTask(task, taskState, { reason: "manual pause during implementation" });
-
-							case "retry":
-								await discardChanges();
-								currentAbortController = new AbortController();
-								currentPrompt = initialPrompt;
-								retriesRemaining = settings.implementationRetries;
-								attempt = 1;
-								taskState.retries = 0;
-								taskState.errors = [];
-								taskState.summary = undefined;
-								taskState.status = "running";
-								taskState.currentActivity = undefined;
-								taskState.currentTurn = 0;
-								taskState.outputEvents = [];
-								taskState.endTime = undefined;
-								loopState.currentRetry = 0;
-								widgetTimer = setInterval(requestOverlayRender, 1000);
-								requestOverlayRender();
-								continue;
-
-							case "skip": {
-								await skipTask(task, taskState);
-								widgetTimer = setInterval(requestOverlayRender, 1000);
-								requestOverlayRender();
-								taskSucceeded = false;
-								taskSkipped = true;
-								break;
-							}
-
-							case "abort":
-								aborted = true;
-								taskState.status = "aborted";
-								taskState.summary = "Task execution was cancelled.";
-								taskState.endTime = Date.now();
-								break;
-						}
-
-						if (aborted) break;
-						if (taskSkipped) break;
-						continue;
-					}
-
-					if (aborted) {
-						taskState.status = "aborted";
-						taskState.summary = "Task execution was cancelled.";
-						taskState.endTime = Date.now();
-						break;
-					}
-
-					if (result.success) {
-						taskSucceeded = true;
-						taskState.errors = [];
-						break;
-					}
-
-					taskState.errors = result.errors;
-					if (retriesRemaining <= 0) {
-						taskState.status = "failed";
-						taskState.endTime = Date.now();
-						requestOverlayRender();
-						return {
-							outcome: "failed",
-							notification: {
-								message: `❌ Task failed: ${task.title} (after ${attempt} attempt${attempt > 1 ? "s" : ""})
-Errors: ${result.errors.join("; ")}`,
-								level: "error",
-							},
-						};
-					}
-
-					retriesRemaining--;
-					attempt++;
-					taskState.retries++;
-					taskState.status = "retrying";
-					loopState.currentRetry = attempt - 1;
-					currentPrompt = buildRetryPrompt(task, prdId, result.errors);
-					requestOverlayRender();
+					// "Retry task": discard changes (except .pi/) and restart at implement.
+					await discardTaskChanges();
+					resumeMode = undefined;
 				}
 
-				if (aborted) {
-					if (taskState.status !== "aborted") {
-						taskState.status = "aborted";
-						taskState.summary = "Task execution was cancelled.";
-						taskState.endTime = Date.now();
-					}
-					break;
+				if (outcome.kind === "released") {
+					return releaseTask(task, taskState, outcome.request);
 				}
-
-				if (!taskSucceeded) continue;
-
-				const implementerSummary = resumeMode
-					? "Resolved manually after the task was released to a human (needs-human)."
-					: result?.summary ?? "";
-				taskState.summary = implementerSummary;
-
-				// --- Review-fix cycle (see ./review-cycle.ts) ---
-				let cycle: ReviewCycleState = createReviewCycle({
-					fixThreshold: settings.fixThreshold as FindingPriority,
-					maxReviewRounds: settings.maxReviewRounds,
-				});
-				let reviewNote: string | undefined = resumeMode === "commit"
-					? "Resolved by a human (needs-human) — changes committed without another automated review."
-					: undefined;
-				let cycleExit: "commit" | "skipped" | "released" | "aborted" | "failed" = "commit";
-				let cycleError = "";
-				let releaseRequest: ReleaseRequest | undefined;
-				const updateCycleInfo = () => {
-					taskState.reviewInfo = formatCycleInfo(cycle);
-					requestOverlayRender();
-				};
-
-				// "Commit changes & close" skips the review-fix cycle.
-				cycleLoop: while (resumeMode !== "commit") {
-					if (aborted) {
-						cycleExit = "aborted";
-						break;
-					}
-					const step = nextStep(cycle);
-
-					if (step.kind === "commit") break;
-
-					if (step.kind === "review") {
-						setPhase(taskState, "Review", `Review ${step.round}/${step.roundLimit}`);
-						const reviewOutcome = await runReviewPhase(task, taskState, phaseCosts, {
-							round: step.round,
-							rejectedFindings: rejectedForNextReview(cycle),
-						});
-						switch (reviewOutcome.kind) {
-							case "reviewed":
-								cycle = applyReview(cycle, reviewOutcome.review);
-								updateCycleInfo();
-								continue cycleLoop;
-							case "no-changes":
-								reviewNote = step.round === 1
-									? "No changes outside .pi/ — review skipped."
-									: `No changes outside .pi/ left for review round ${step.round} — review skipped.`;
-								if (resumeMode === "review") reviewNote = `Re-reviewed after release to a human (needs-human). ${reviewNote}`;
-								if (step.round === 1) taskState.reviewInfo = "skipped (no changes outside .pi/)";
-								break cycleLoop;
-							case "failed":
-								cycleExit = "failed";
-								cycleError = reviewOutcome.error;
-								break cycleLoop;
-							case "released":
-								cycleExit = "released";
-								releaseRequest = { reason: reviewOutcome.reason, cycle };
-								break cycleLoop;
-							default:
-								cycleExit = reviewOutcome.kind;
-								break cycleLoop;
-						}
-					}
-
-					if (step.kind === "fix") {
-						const findingTitle = step.finding.title.replace(/\s+/g, " ").trim();
-						setPhase(taskState, "Fix", `Fix ${step.index}/${step.total} [${step.finding.priority}] ${findingTitle}`);
-						const fixOutcome = await runFixPhase(task, taskState, phaseCosts, step);
-						if (fixOutcome.kind === "result") {
-							cycle = applyFixOutcome(cycle, fixOutcome.outcome);
-							updateCycleInfo();
-							continue;
-						}
-						cycleExit = fixOutcome.kind;
-						if (fixOutcome.kind === "released") {
-							releaseRequest = { reason: fixOutcome.reason, cycle, openReason: "Not fixed before the release" };
-						}
-						break;
-					}
-
-					// --- Pause: round limit reached with open findings ---
-					taskState.phaseLabel = `Review ${step.round}/${step.roundLimit} — round limit`;
-					taskState.currentActivity = `⏸ round limit reached (${step.openFindings.length} open)`;
-					requestOverlayRender();
-					if (widgetTimer) clearInterval(widgetTimer);
-					const roundLimitAction = await showRoundLimitMenu(ctx, task, step);
-					widgetTimer = setInterval(requestOverlayRender, 1000);
-
-					switch (roundLimitAction) {
-						case "one-more-round":
-							cycle = extendRoundLimit(cycle);
-							taskState.currentActivity = undefined;
-							updateCycleInfo();
-							continue;
-						case "commit-as-is":
-							cycle = commitAsIs(cycle);
-							taskState.currentActivity = undefined;
-							updateCycleInfo();
-							continue;
-						case "release":
-							cycleExit = "released";
-							releaseRequest = {
-								reason: `review round limit reached (${step.round}/${step.roundLimit}) with ${step.openFindings.length} open finding${step.openFindings.length === 1 ? "" : "s"}`,
-								cycle,
-								openReason: `Open at the review round limit (${step.round}/${step.roundLimit})`,
-							};
-							break cycleLoop;
-						case "skip":
-							await skipTask(task, taskState, "Skipped at the review round limit.");
-							requestOverlayRender();
-							cycleExit = "skipped";
-							break cycleLoop;
-						case "abort":
-							aborted = true;
-							cycleExit = "aborted";
-							break cycleLoop;
-					}
-				}
-
-				if (cycleExit === "released") {
-					return releaseTask(task, taskState, releaseRequest ?? { reason: "released during the review-fix cycle", cycle });
-				}
-				if (cycleExit === "skipped") continue;
-				if (cycleExit === "aborted" || aborted) {
+				if (outcome.kind === "aborted") {
 					aborted = true;
 					taskState.status = "aborted";
-					taskState.summary = "Task execution was cancelled during the review-fix cycle.";
-					taskState.endTime = Date.now();
-					break;
-				}
-				if (cycleExit === "failed") {
-					taskState.status = "failed";
-					taskState.errors = [cycleError];
-					taskState.endTime = Date.now();
-					requestOverlayRender();
-					return {
-						outcome: "failed",
-						notification: {
-							message:
-								`❌ Review failed: ${task.title}\n${cycleError}\n` +
-								"Uncommitted changes left on disk. Commit or discard them, then re-run /prd-loop-pro.",
-							level: "error",
-						},
-					};
-				}
-
-				// --- Commit phase ---
-				setPhase(taskState, "Commit");
-				const commitOutcome = await runCommitPhase(task, taskState, phaseCosts);
-
-				if (commitOutcome.kind === "released") {
-					return releaseTask(task, taskState, { reason: commitOutcome.reason, errors: commitOutcome.errors, cycle });
-				}
-				if (commitOutcome.kind === "skipped") continue;
-				if (commitOutcome.kind === "aborted" || aborted) {
-					aborted = true;
-					taskState.status = "aborted";
-					taskState.summary = "Task execution was cancelled during commit.";
+					taskState.summary = outcome.summary;
 					if (!taskState.endTime) taskState.endTime = Date.now();
 					break;
 				}
-
-				// Commit SHAs are determined by the orchestrator (HEAD before vs. after).
-				const commits = commitOutcome.commits;
-				loopState.totalCommits += commits.length;
-
-				// --- Report: append execution report, close todo, update PRD Task Index ---
-				if (resumeMode === "review" && reviewNote === undefined) {
-					reviewNote = "Re-reviewed after release to a human (needs-human).";
-				}
-				const record: ExecutionRecord = {
-					implementerSummary,
-					...reportFields(cycle),
-					reviewNote,
-					commits,
-					cost: phaseCosts,
-				};
-				const taskBody = await readTodoBody(ctx.cwd, task.id);
-				await updateTodoFileBody(ctx.cwd, task.id, appendSection(taskBody, buildExecutionReport(record)));
-
-				taskState.status = "completed";
-				taskState.endTime = Date.now();
-				taskState.currentActivity = undefined;
-				await closeTaskAndUpdateIndex(task, { notifyIndexError: true });
-
-				requestOverlayRender();
+				// completed / skipped: continue with the next task (unless aborted meanwhile)
 			}
 
 			if (aborted) {
