@@ -257,6 +257,24 @@ describe("buildOpenFindingsSection", () => {
 		assert.match(rejected, /\*Reason:\* False positive/);
 	});
 
+	it("states the release reason and the errors of the failed phase", () => {
+		const md = buildOpenFindingsSection([], [], {
+			reason: "git hook failed",
+			errors: ["pre-commit: lint failed\nsrc/app.ts:1 unused var", "  "],
+		});
+		assert.match(md, /\*\*Released to a human:\*\* git hook failed/);
+		assert.match(md, /re-run `\/prd-loop-pro`/);
+		const errors = sectionContent(md, "### Errors");
+		assert.match(errors, /^- pre-commit: lint failed\n {2}src\/app\.ts:1 unused var$/);
+		assert.equal(sectionContent(md, "### Open"), "_None._");
+	});
+
+	it("omits release details when none are given", () => {
+		const md = buildOpenFindingsSection([]);
+		assert.doesNotMatch(md, /Released to a human/);
+		assert.doesNotMatch(md, /### Errors/);
+	});
+
 	it("handles empty lists", () => {
 		const md = buildOpenFindingsSection([]);
 		assert.equal(sectionContent(md, "### Open"), "_None._");
