@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { keyText, parseFrontmatter, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
+import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
 import {
 	buildOutcomeLabel,
 	buildSummaryEntryLines,
@@ -2156,6 +2156,7 @@ async function runOrchestratorLoop(
 	let overlayDone: ((reason: "finished" | "user-abort") => void) | undefined;
 	let overlayRequestRender = () => {};
 	let overlayComponent: PrdLoopOverlayComponent | undefined;
+	let overlayHandle: OverlayHandle | undefined;
 	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 
 	const requestOverlayRender = () => {
@@ -2165,6 +2166,23 @@ async function runOrchestratorLoop(
 		if (overlayClosed) return;
 		overlayClosed = true;
 		overlayDone?.(reason);
+	};
+
+	/**
+	 * Show a dialog (pause menu) while the loop overlay is temporarily hidden.
+	 * pi renders select dialogs in the editor area below overlays, so a visible
+	 * overlay would cover the dialog and keep looking busy. Hiding it moves the
+	 * input focus to the dialog; showing it again restores the focus.
+	 */
+	const withOverlayHidden = async <T>(dialog: () => Promise<T>): Promise<T> => {
+		const handle = overlayClosed ? undefined : overlayHandle;
+		handle?.setHidden(true);
+		try {
+			return await dialog();
+		} finally {
+			if (handle && !overlayClosed) handle.setHidden(false);
+			requestOverlayRender();
+		}
 	};
 	const updateStatus = () => {
 		const currentTask = loopState.tasks[loopState.currentTaskIndex];
@@ -2242,6 +2260,9 @@ async function runOrchestratorLoop(
 		},
 		{
 			overlay: true,
+			onHandle: (handle) => {
+				overlayHandle = handle;
+			},
 			overlayOptions: {
 				anchor: "center",
 				width: "90%",
@@ -2371,7 +2392,7 @@ async function runOrchestratorLoop(
 					if (pauseRequested) {
 						pauseRequested = false;
 						if (widgetTimer) clearInterval(widgetTimer);
-						const pauseAction = await showPauseMenu(ctx, task);
+						const pauseAction = await withOverlayHidden(() => showPauseMenu(ctx, task));
 
 						switch (pauseAction) {
 							case "resume":
