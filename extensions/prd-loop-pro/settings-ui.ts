@@ -1,9 +1,12 @@
 /**
  * PRD Loop Pro — Settings UI.
  *
- * First-start wizard, overview dialog, model picker (scoped models first +
- * "All available models…") and thinking picker. Persistence and validation live
- * in the pure settings module (./settings.ts).
+ * First-start wizard, overview dialog (with the source of every entry:
+ * `[global]` / `[project]`), per-entry change menu with the save targets
+ * "Save globally" / "Save for this project only" / "Remove project overrides",
+ * model picker (scoped models first + "All available models…") and thinking
+ * picker. Persistence, merging and validation live in the pure settings module
+ * (./settings.ts).
  *
  * Not an index.ts, so pi does not load this file as a separate extension.
  */
@@ -11,6 +14,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import {
+	changedFields,
 	clampThinkingLevel,
 	cloneSettings,
 	createDefaultSettings,
@@ -21,22 +25,36 @@ import {
 	fieldIssues,
 	findModel,
 	getGlobalSettingsPath,
+	getProjectSettingsPath,
 	getSupportedThinkingLevels,
+	hasOverrides,
 	isFixThreshold,
+	loadProjectSettingsFile,
 	loadSettingsFile,
+	mergeSettings,
 	MIN_IMPLEMENTATION_RETRIES,
 	MIN_MAX_REVIEW_ROUNDS,
 	modelRef,
+	OVERRIDE_FIELDS,
+	overrideFieldIssues,
+	overrideFieldStep,
 	parseIntegerInput,
+	removeProjectOverrides,
+	saveGlobally,
+	saveProjectOnly,
 	saveSettingsFile,
 	STEP_KEYS,
 	STEP_LABELS,
-	stepIssues,
 	validateSettings,
 	type FixThreshold,
 	type ModelInfo,
+	type OverrideField,
 	type PrdLoopProSettings,
+	type ResolvedSettings,
 	type SettingsIssue,
+	type SettingsOverrides,
+	type SettingsSource,
+	type SettingsState,
 	type StepKey,
 	type ThinkingLevel,
 } from "./settings.ts";
@@ -283,7 +301,7 @@ function isValidInteger(value: number, min: number): boolean {
 	return Number.isInteger(value) && value >= min;
 }
 
-// --- Overview ---
+// --- Formatting ---
 
 export interface PrdOverviewInfo {
 	title: string;
@@ -291,24 +309,55 @@ export interface PrdOverviewInfo {
 	completedTaskCount: number;
 }
 
-function formatStepValue(settings: PrdLoopProSettings, key: StepKey): string {
-	const step = settings.steps[key];
-	return `${step.model || "(not configured)"} · ${step.thinking}`;
+/** Paths of the settings files shown in the overview. */
+export interface SettingsPaths {
+	globalPath: string;
+	projectPath: string;
+}
+
+const FIELD_LABELS: Record<Exclude<OverrideField, `steps.${StepKey}`>, string> = {
+	fixThreshold: "Fix threshold",
+	maxReviewRounds: "Max review rounds",
+	implementationRetries: "Impl. retries",
+};
+
+function fieldLabel(field: OverrideField): string {
+	const step = overrideFieldStep(field);
+	return step ? STEP_LABELS[step] : FIELD_LABELS[field as keyof typeof FIELD_LABELS];
 }
 
 function formatThreshold(value: string): string {
 	return isFixThreshold(value) ? FIX_THRESHOLD_LABELS[value] : value;
 }
 
-/** Build the overview text (PRD, task counts, all settings, ⚠️ on invalid entries). */
+function formatFieldValue(settings: PrdLoopProSettings, field: OverrideField): string {
+	const step = overrideFieldStep(field);
+	if (step) {
+		const setting = settings.steps[step];
+		return `${setting.model || "(not configured)"} · ${setting.thinking}`;
+	}
+	if (field === "fixThreshold") return formatThreshold(settings.fixThreshold);
+	if (field === "maxReviewRounds") return String(settings.maxReviewRounds);
+	return String(settings.implementationRetries);
+}
+
+function formatSource(source: SettingsSource): string {
+	return `[${source}]`;
+}
+
+/**
+ * Build the overview text (PRD, task counts, all settings with their source,
+ * ⚠️ on invalid entries).
+ */
 export function buildOverviewMessage(
 	prd: PrdOverviewInfo,
-	settings: PrdLoopProSettings,
+	resolved: ResolvedSettings,
 	issues: SettingsIssue[],
-	settingsPath: string,
+	paths: SettingsPaths & { projectFileExists: boolean },
 ): string {
-	const row = (label: string, value: string, invalid: boolean) =>
-		`   ${invalid ? "⚠️ " : "   "}${label.padEnd(20)}${value}`;
+	const { settings, sources } = resolved;
+	const row = (label: string, value: string, source: SettingsSource, invalid: boolean) =>
+		`   ${invalid ? "⚠️ " : "   "}${label.padEnd(20)}${value.padEnd(44)} ${formatSource(source)}`;
 
 	const lines = [
 		`🚀 PRD Loop Pro`,
@@ -316,23 +365,25 @@ export function buildOverviewMessage(
 		`   PRD:   ${prd.title}`,
 		`   Tasks: ${prd.openTaskCount} open, ${prd.completedTaskCount} completed`,
 		``,
-		`   Settings (${settingsPath}):`,
+		`   Settings:`,
+		`      global:  ${paths.globalPath}`,
+		`      project: ${paths.projectPath}${paths.projectFileExists ? "" : " (none)"}`,
+		``,
 	];
 
-	for (const key of STEP_KEYS) {
-		lines.push(row(`${STEP_LABELS[key]}:`, formatStepValue(settings, key), stepIssues(issues, key).length > 0));
+	for (const field of OVERRIDE_FIELDS) {
+		lines.push(
+			row(
+				`${fieldLabel(field)}:`,
+				formatFieldValue(settings, field),
+				sources[field],
+				overrideFieldIssues(issues, field).length > 0,
+			),
+		);
 	}
-	lines.push(row("Fix threshold:", formatThreshold(settings.fixThreshold), fieldIssues(issues, "fixThreshold").length > 0));
-	lines.push(
-		row("Max review rounds:", String(settings.maxReviewRounds), fieldIssues(issues, "maxReviewRounds").length > 0),
-	);
-	lines.push(
-		row(
-			"Impl. retries:",
-			String(settings.implementationRetries),
-			fieldIssues(issues, "implementationRetries").length > 0,
-		),
-	);
+	if (fieldIssues(issues, "projectFile").length > 0) {
+		lines.push(`   ⚠️ ${"Project file:".padEnd(20)}invalid — remove or overwrite it via "Change"`);
+	}
 
 	if (issues.length > 0) {
 		lines.push("", "⚠️  Invalid settings — change them before starting:");
@@ -358,6 +409,173 @@ async function showOverview(
 	return "cancel";
 }
 
+// --- Change menu ---
+
+/** Edit a single entry in place. Returns false if the user cancelled. */
+async function editField(
+	ctx: ExtensionCommandContext,
+	catalog: ModelCatalog,
+	draft: PrdLoopProSettings,
+	field: OverrideField,
+): Promise<boolean> {
+	const label = fieldLabel(field);
+	const step = overrideFieldStep(field);
+
+	if (step) {
+		const current = draft.steps[step];
+		const model = await pickModel(ctx, `${label} — model`, catalog, current.model || undefined);
+		if (model === undefined) return false;
+		const modelInfo = findModel(catalog.available, model);
+		const thinking = await pickThinking(
+			ctx,
+			`${label} — thinking level`,
+			modelInfo,
+			clampThinkingLevel(modelInfo, current.thinking),
+		);
+		if (thinking === undefined) return false;
+		draft.steps[step] = { model, thinking };
+		return true;
+	}
+
+	if (field === "fixThreshold") {
+		const threshold = await pickFixThreshold(ctx, label, draft.fixThreshold);
+		if (threshold === undefined) return false;
+		draft.fixThreshold = threshold;
+		return true;
+	}
+
+	if (field === "maxReviewRounds") {
+		const value = await inputInteger(ctx, label, {
+			min: MIN_MAX_REVIEW_ROUNDS,
+			current: isValidInteger(draft.maxReviewRounds, MIN_MAX_REVIEW_ROUNDS)
+				? draft.maxReviewRounds
+				: DEFAULT_MAX_REVIEW_ROUNDS,
+		});
+		if (value === undefined) return false;
+		draft.maxReviewRounds = value;
+		return true;
+	}
+
+	const value = await inputInteger(ctx, label, {
+		min: MIN_IMPLEMENTATION_RETRIES,
+		current: isValidInteger(draft.implementationRetries, MIN_IMPLEMENTATION_RETRIES)
+			? draft.implementationRetries
+			: DEFAULT_IMPLEMENTATION_RETRIES,
+	});
+	if (value === undefined) return false;
+	draft.implementationRetries = value;
+	return true;
+}
+
+function notifyError(ctx: ExtensionCommandContext, prefix: string, err: unknown): void {
+	ctx.ui.notify(`${prefix}: ${err instanceof Error ? err.message : String(err)}`, "error");
+}
+
+/**
+ * Change menu: one row per entry (with source and ⚠️ marker) plus the save
+ * actions. Selecting a row edits only that entry and returns to the menu.
+ *
+ * Returns the new settings state after a save/remove action, or undefined if
+ * the user went back to the overview without saving.
+ */
+async function runChangeMenu(
+	ctx: ExtensionCommandContext,
+	catalog: ModelCatalog,
+	paths: SettingsPaths,
+	state: SettingsState,
+	projectFileError: string | undefined,
+): Promise<SettingsState | undefined> {
+	const before = mergeSettings(state.global, state.overrides);
+	const draft = cloneSettings(before.settings);
+
+	const SAVE_GLOBAL = "💾 Save globally";
+	const SAVE_PROJECT = "📁 Save for this project only";
+	const REMOVE_PROJECT = "🗑  Remove project overrides";
+	const BACK = "↩  Back to overview (discard changes)";
+
+	while (true) {
+		const issues = validateSettings(draft, catalog.available, { knownModels: catalog.all });
+		const changed = changedFields(before.settings, draft);
+
+		const rows = OVERRIDE_FIELDS.map((field) => {
+			const invalid = overrideFieldIssues(issues, field).length > 0;
+			const modified = changed.includes(field) ? " • changed" : "";
+			return `${invalid ? "⚠️ " : ""}${fieldLabel(field)}: ${formatFieldValue(draft, field)} ${formatSource(before.sources[field])}${modified}`;
+		});
+
+		const canRemoveProject = hasOverrides(state.overrides) || projectFileError !== undefined;
+		const actions = [SAVE_GLOBAL, SAVE_PROJECT, ...(canRemoveProject ? [REMOVE_PROJECT] : []), BACK];
+
+		const titleLines = ["✏️  Change PRD Loop Pro settings — select an entry or an action"];
+		if (changed.length > 0) titleLines.push(`   ${changed.length} unsaved change(s)`);
+		if (projectFileError) titleLines.push(`   ⚠️ ${projectFileError}`);
+		for (const issue of issues) titleLines.push(`   ⚠️ ${issue.message}`);
+
+		const choice = await ctx.ui.select(titleLines.join("\n"), [...rows, ...actions]);
+
+		if (choice === undefined || choice === BACK) {
+			if (changed.length === 0) return undefined;
+			const discard = await ctx.ui.confirm(
+				"Discard changes?",
+				`${changed.length} unsaved change(s) will be lost.`,
+			);
+			if (discard) return undefined;
+			continue;
+		}
+
+		const rowIndex = rows.indexOf(choice);
+		if (rowIndex !== -1) {
+			await editField(ctx, catalog, draft, OVERRIDE_FIELDS[rowIndex]!);
+			continue;
+		}
+
+		if (choice === SAVE_GLOBAL) {
+			try {
+				const next = saveGlobally(paths, state, before.settings, draft);
+				ctx.ui.notify(`Saved PRD Loop Pro settings globally (${paths.globalPath})`, "info");
+				return next;
+			} catch (err) {
+				notifyError(ctx, "Failed to save global settings", err);
+				continue;
+			}
+		}
+
+		if (choice === SAVE_PROJECT) {
+			try {
+				const next = saveProjectOnly(paths.projectPath, state.global, draft);
+				const count = OVERRIDE_FIELDS.filter((f) => mergeSettings(next.global, next.overrides).sources[f] === "project").length;
+				ctx.ui.notify(
+					count > 0
+						? `Saved ${count} project override(s) to ${paths.projectPath}`
+						: `No differences from global settings — removed ${paths.projectPath}`,
+					"info",
+				);
+				return next;
+			} catch (err) {
+				notifyError(ctx, "Failed to save project settings", err);
+				continue;
+			}
+		}
+
+		if (choice === REMOVE_PROJECT) {
+			const lost = changed.length > 0 ? ` ${changed.length} unsaved change(s) will be discarded.` : "";
+			const ok = await ctx.ui.confirm(
+				"Remove project overrides?",
+				`Deletes ${paths.projectPath}; this project will use the global settings.${lost}`,
+			);
+			if (!ok) continue;
+			try {
+				const next = removeProjectOverrides(paths.projectPath, state.global);
+				ctx.ui.notify(`Removed project overrides (${paths.projectPath})`, "info");
+				return next;
+			} catch (err) {
+				notifyError(ctx, "Failed to remove project settings", err);
+				continue;
+			}
+		}
+	}
+}
+
 // --- Start flow ---
 
 function saveGlobalSettings(ctx: ExtensionCommandContext, path: string, settings: PrdLoopProSettings): void {
@@ -365,18 +583,29 @@ function saveGlobalSettings(ctx: ExtensionCommandContext, path: string, settings
 		saveSettingsFile(path, settings);
 		ctx.ui.notify(`Saved PRD Loop Pro settings to ${path}`, "info");
 	} catch (err) {
-		ctx.ui.notify(
-			`Failed to save settings to ${path}: ${err instanceof Error ? err.message : String(err)}`,
-			"error",
-		);
+		notifyError(ctx, `Failed to save settings to ${path}`, err);
 	}
 }
 
+interface ProjectSettingsLoad {
+	overrides: SettingsOverrides;
+	exists: boolean;
+	error?: string;
+}
+
+function loadProjectSettings(path: string): ProjectSettingsLoad {
+	const loaded = loadProjectSettingsFile(path);
+	if (loaded.status === "missing") return { overrides: {}, exists: false };
+	if (loaded.status === "invalid") return { overrides: {}, exists: true, error: loaded.error };
+	return { overrides: loaded.overrides, exists: true };
+}
+
 /**
- * Load + validate settings, run the wizard if none exist, then show the
- * overview until the user confirms valid settings or cancels.
+ * Load global settings (wizard if none exist) and project overrides, then show
+ * the overview until the user confirms valid settings or cancels.
  *
- * Returns the confirmed settings, or undefined if the start was cancelled.
+ * Returns the confirmed effective settings (global merged with project
+ * overrides), or undefined if the start was cancelled.
  */
 export async function resolveStartSettings(
 	ctx: ExtensionCommandContext,
@@ -389,9 +618,12 @@ export async function resolveStartSettings(
 		return undefined;
 	}
 
-	const settingsPath = getGlobalSettingsPath(getAgentDir());
-	const loaded = loadSettingsFile(settingsPath);
-	let settings: PrdLoopProSettings;
+	const paths: SettingsPaths = {
+		globalPath: getGlobalSettingsPath(getAgentDir()),
+		projectPath: getProjectSettingsPath(ctx.cwd),
+	};
+	const loaded = loadSettingsFile(paths.globalPath);
+	let global: PrdLoopProSettings;
 
 	const sessionModelRef = ctx.model ? modelRef(ctx.model) : undefined;
 	const defaultModel =
@@ -403,7 +635,7 @@ export async function resolveStartSettings(
 		});
 
 	if (loaded.status === "loaded") {
-		settings = loaded.settings;
+		global = loaded.settings;
 	} else {
 		if (loaded.status === "invalid") {
 			const rerun = "Run setup wizard (overwrites the file)";
@@ -413,27 +645,34 @@ export async function resolveStartSettings(
 
 		const wizardResult = await runSettingsWizard(ctx, catalog, firstStartDefaults());
 		if (!wizardResult) return undefined;
-		settings = wizardResult;
-		saveGlobalSettings(ctx, settingsPath, settings);
+		global = wizardResult;
+		saveGlobalSettings(ctx, paths.globalPath, global);
 	}
 
+	let project = loadProjectSettings(paths.projectPath);
+	let state: SettingsState = { global, overrides: project.overrides };
+
 	while (true) {
-		const issues = validateSettings(settings, catalog.available, { knownModels: catalog.all });
-		const message = buildOverviewMessage(prd, settings, issues, settingsPath);
+		const resolved = mergeSettings(state.global, state.overrides);
+		const issues = validateSettings(resolved.settings, catalog.available, { knownModels: catalog.all });
+		if (project.error) issues.push({ field: "projectFile", message: project.error });
+
+		const message = buildOverviewMessage(prd, resolved, issues, { ...paths, projectFileExists: project.exists });
 		const choice = await showOverview(ctx, message, issues.length === 0);
 
 		if (choice === "cancel") return undefined;
 
 		if (choice === "start") {
-			if (issues.length === 0) return settings;
+			if (issues.length === 0) return resolved.settings;
 			ctx.ui.notify("Cannot start: fix the entries marked with ⚠️ first (choose \"Change\").", "warning");
 			continue;
 		}
 
-		// "Change" re-runs the wizard with the current values as defaults.
-		const changed = await runSettingsWizard(ctx, catalog, settings);
-		if (!changed) continue; // Cancelled — back to the overview with unchanged settings
-		settings = changed;
-		saveGlobalSettings(ctx, settingsPath, settings);
+		const next = await runChangeMenu(ctx, catalog, paths, state, project.error);
+		if (!next) continue; // Back without saving — overview with unchanged settings
+		state = next;
+		// Re-read the project file so its existence / error state reflects what was written
+		project = loadProjectSettings(paths.projectPath);
+		if (!project.error) state = { global: state.global, overrides: project.overrides };
 	}
 }
