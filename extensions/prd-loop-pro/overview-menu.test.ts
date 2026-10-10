@@ -4,9 +4,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildOverviewMenu, formatOverviewRow } from "./overview-menu.ts";
-import type { OverviewMenuInput } from "./overview-menu.ts";
-import { createDefaultSettings, OVERRIDE_FIELDS } from "./settings.ts";
+import { buildOverviewMenu, buildRunSettingsMenu, formatOverviewRow, formatRunSettingsRow } from "./overview-menu.ts";
+import type { OverviewMenuInput, RunSettingsMenuInput } from "./overview-menu.ts";
+import { createDefaultSettings, OVERRIDE_FIELDS, STEP_KEYS } from "./settings.ts";
 import type { OverrideField, SettingsSource } from "./settings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -71,6 +71,87 @@ describe("buildOverviewMenu", () => {
 		assert.equal(byKind("save-global-start").blocked, true);
 		assert.equal(byKind("save-project-start").blocked, undefined);
 		assert.deepEqual(actions(menu).slice(-2), ["Remove project overrides", "Cancel"]);
+	});
+});
+
+describe("buildRunSettingsMenu", () => {
+	function runInput(overrides: Partial<RunSettingsMenuInput> = {}): RunSettingsMenuInput {
+		return {
+			draft: createDefaultSettings({ model: "anthropic/claude", thinking: "medium" }),
+			changed: [],
+			issues: [],
+			...overrides,
+		};
+	}
+	const runActions = (menu: ReturnType<typeof buildRunSettingsMenu>) =>
+		menu.items.slice(menu.rowCount).map((item) => item.label);
+
+	it("lists one row per step (no scalar fields) and only 'Back to loop' without changes", () => {
+		const menu = buildRunSettingsMenu(runInput());
+		assert.equal(menu.rowCount, STEP_KEYS.length);
+		assert.equal(menu.defaultIndex, 0);
+		assert.deepEqual(
+			menu.items.slice(0, menu.rowCount).map((item) => item.action),
+			STEP_KEYS.map((step) => ({ kind: "edit", step })),
+		);
+		assert.deepEqual(runActions(menu), ["Back to loop"]);
+		assert.equal(menu.items[0]!.label, `   ${"Implement:".padEnd(20)}anthropic/claude · medium`);
+		assert.match(menu.title, /Running now: no subagent/);
+		assert.match(menu.title, /running subagent keeps its model/);
+	});
+
+	it("marks the running step and shows its start model in the title", () => {
+		const draft = createDefaultSettings({ model: "anthropic/claude", thinking: "medium" });
+		draft.steps.fix = { model: "openai/gpt-5", thinking: "high" };
+		const menu = buildRunSettingsMenu(
+			runInput({ draft, changed: ["fix"], running: { step: "fix", model: "anthropic/claude", thinking: "medium" } }),
+		);
+		const fixRow = menu.items[STEP_KEYS.indexOf("fix")]!.label;
+		assert.match(fixRow, /openai\/gpt-5 · high +▶ running • changed$/);
+		assert.match(menu.title, /Running now: Fix — anthropic\/claude · medium/);
+	});
+
+	it("offers apply (run / global / project) and discard with unsaved changes", () => {
+		const menu = buildRunSettingsMenu(runInput({ changed: ["review", "commit"] }));
+		assert.deepEqual(runActions(menu), [
+			"Apply to this run",
+			"Apply & save globally",
+			"Apply & save for this project only",
+			"Discard changes & back to loop",
+		]);
+		assert.deepEqual(
+			menu.items.slice(menu.rowCount).map((item) => item.action),
+			[
+				{ kind: "apply", scope: "run" },
+				{ kind: "apply", scope: "global" },
+				{ kind: "apply", scope: "project" },
+				{ kind: "discard" },
+			],
+		);
+		assert.match(menu.title, /2 unsaved change\(s\)/);
+	});
+
+	it("blocks applying only for issues of changed steps", () => {
+		const issues = [{ field: "steps.fix.model" as const, message: "Fix: model x/y is not available" }];
+		const unrelated = buildRunSettingsMenu(runInput({ changed: ["review"], issues }));
+		assert.equal(unrelated.items.some((item) => item.blocked), false);
+		assert.match(unrelated.items[STEP_KEYS.indexOf("fix")]!.label, /^⚠️ Fix:/);
+
+		const related = buildRunSettingsMenu(runInput({ changed: ["fix"], issues }));
+		const applies = related.items.filter((item) => item.action.kind === "apply");
+		assert.equal(applies.length, 3);
+		assert.ok(applies.every((item) => item.blocked && item.label.endsWith("(fix ⚠️ entries first)")));
+		assert.equal(related.items.find((item) => item.action.kind === "discard")!.blocked, undefined);
+	});
+});
+
+describe("formatRunSettingsRow", () => {
+	it("has no trailing padding without tags", () => {
+		const draft = createDefaultSettings({ model: "a/b", thinking: "low" });
+		const row = formatRunSettingsRow("commit", draft, { invalid: false, changed: false, running: false });
+		assert.equal(row, `   ${"Commit:".padEnd(20)}a/b · low`);
+		const tagged = formatRunSettingsRow("commit", draft, { invalid: true, changed: true, running: false });
+		assert.equal(tagged, `⚠️ ${"Commit:".padEnd(20)}${"a/b · low".padEnd(44)} • changed`);
 	});
 });
 
