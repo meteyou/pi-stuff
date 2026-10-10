@@ -9,7 +9,7 @@
   "pi": {
     "extensions": [
       "./extensions",
-      "./node_modules/agent-stuff/pi-extensions/session-breakdown.ts",
+      "./node_modules/agent-stuff/extensions/session-breakdown.ts",
       "./node_modules/pi-ghostty/extensions/ghostty.ts"
     ],
     "skills": [
