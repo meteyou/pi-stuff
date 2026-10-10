@@ -10,13 +10,16 @@
  *
  * Start sequence:
  * 1. Git clean check
+ * 1b. Load the commit rules from the package's `/commit` prompt template
+ *     (missing template = hard error)
  * 2. PRD selection (dialog or argument)
  * 3. Load global settings (wizard on first start), merge per-field project
  *    overrides (`.pi/prd-loop-pro.json`) and validate
  * 4. Overview dialog: Confirm & start / Change (per-entry menu) / Cancel
  * 5. Orchestrator loop per task: Implement (prd-worker) → Review (prd-reviewer,
- *    one round) → Commit (prd-committer) → Report (`## Execution Report` in the
- *    task todo, close todo, update PRD Task Index)
+ *    one round) → Commit (prd-committer; failure or hook failure pauses the
+ *    loop, hooks are never bypassed) → Report (`## Execution Report` in the
+ *    task todo incl. created commits, close todo, update PRD Task Index)
  */
 
 import { spawn } from "node:child_process";
@@ -49,7 +52,8 @@ import type {
 } from "./subagent-result.ts";
 import { appendSection, buildExecutionReport } from "./execution-report.ts";
 import type { CommitRef, CostPhase, ExecutionRecord, UnresolvedFinding } from "./execution-report.ts";
-import { buildReviewerPrompt, filterReviewableStatus, REVIEW_PATHSPEC } from "./reviewer-prompt.ts";
+import { buildReviewerPrompt, filterReviewableStatus, REVIEW_EXCLUDED_DIR, REVIEW_PATHSPEC } from "./reviewer-prompt.ts";
+import { buildCommitterPrompt, loadCommitRules } from "./committer-prompt.ts";
 import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
 
 /** Extension directory for locating agent definition files. */
@@ -1275,41 +1279,6 @@ function extractShortTitle(title: string): string {
 	return match ? match[1].trim() : title;
 }
 
-const COMMIT_SCOPE_STOP_WORDS = new Set([
-	"a", "an", "and", "the", "to", "in", "on", "for", "from", "of", "with", "by", "at", "into", "as",
-	"add", "adds", "added", "implement", "implements", "implemented", "integrate", "integrates", "integrated",
-	"create", "creates", "created", "update", "updates", "updated", "improve", "improves", "improved",
-	"fix", "fixes", "fixed", "refactor", "refactors", "refactored", "support", "supports", "supported",
-	"enable", "enables", "enabled",
-]);
-
-function normalizeCommitDescription(shortTitle: string): string {
-	const trimmed = shortTitle.trim();
-	if (!trimmed) return "apply task changes";
-	return trimmed[0].toLowerCase() + trimmed.slice(1);
-}
-
-function deriveCommitScopeFromTitle(shortTitle: string, fallbackScope: string): string {
-	const tokens = shortTitle
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, " ")
-		.split(/\s+/)
-		.filter(Boolean)
-		.filter((t) => !COMMIT_SCOPE_STOP_WORDS.has(t));
-
-	if (tokens.length === 0) return fallbackScope;
-
-	const preferredSuffixes = new Set(["ui", "api", "auth", "db", "tests", "test"]);
-	for (let i = tokens.length - 1; i >= 1; i--) {
-		if (preferredSuffixes.has(tokens[i])) {
-			return `${tokens[i - 1]}-${tokens[i] === "test" ? "tests" : tokens[i]}`;
-		}
-	}
-
-	if (tokens.length >= 2) return `${tokens[0]}-${tokens[1]}`;
-	return tokens[0];
-}
-
 // --- Loop state and UI ---
 
 type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
@@ -1958,15 +1927,17 @@ function statusIconFn(status: TaskStatus): string {
 
 // --- Pause menu ---
 
-type PauseAction = "resume" | "release" | "retry" | "skip" | "abort";
+type PauseAction = "resume" | "release" | "retry" | "retry-commit" | "skip" | "abort";
 
 /**
- * Show an interactive pause menu after Ctrl+C interrupts a running subagent.
+ * Show an interactive pause menu (after Ctrl+C interrupts a running subagent
+ * or when a phase fails, e.g. committer failure / pre-commit hook failure).
+ * Cancelling the dialog selects the first offered action.
  */
 async function showPauseMenu(
 	ctx: ExtensionCommandContext,
 	task: TaskInfo,
-	options: { phase?: TaskPhase; actions?: PauseAction[] } = {},
+	options: { phase?: TaskPhase; actions?: PauseAction[]; reason?: string } = {},
 ): Promise<PauseAction> {
 	const phase = options.phase ?? "Implement";
 	const actions = options.actions ?? ["resume", "release", "retry", "skip", "abort"];
@@ -1976,104 +1947,19 @@ async function showPauseMenu(
 			: `▶️  Resume — keep changes, restart the ${phase.toLowerCase()} phase`,
 		release: "🔧 Release session — fix manually, re-run /prd-loop-pro to continue",
 		retry: "🔄 Retry task — discard changes, try again from scratch",
+		"retry-commit": "🔁 Retry commit — run the committer again",
 		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
 		abort: "❌ Abort loop — stop and keep changes on disk",
 	};
 	const menu = actions.map((action) => labels[action]);
 
 	const choice = await ctx.ui.select(
-		`⏸️  Paused (${phase}) — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+		`⏸️  Paused (${phase}${options.reason ? `: ${options.reason}` : ""}) — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
 		menu,
 	);
 
 	const index = choice === undefined ? -1 : menu.indexOf(choice);
-	return index === -1 ? "resume" : actions[index]!;
-}
-
-// --- Commits (prd-committer agent) ---
-
-/**
- * Load the prd-committer agent definition from the extension's agents/ directory.
- */
-async function loadPrdCommitterAgent(extensionDir: string): Promise<AgentDefinition> {
-	const agentPath = join(extensionDir, "agents", "prd-committer.md");
-	const content = await readFile(agentPath, "utf-8");
-	const agent = loadAgentDefinition(agentPath, content);
-	if (!agent) {
-		throw new Error(`Failed to parse prd-committer agent at ${agentPath}`);
-	}
-	return agent;
-}
-
-/**
- * Spawn a committer subagent that creates granular conventional commits.
- */
-async function spawnCommitterSubagent(
-	cwd: string,
-	prdTag: string,
-	model: string,
-	thinkingLevel?: string,
-	signal?: AbortSignal,
-): Promise<{ success: boolean; commitCount: number; cost: number }> {
-	try {
-		const agent = await loadPrdCommitterAgent(EXTENSION_DIR);
-		const prompt = [
-			`Analyze all uncommitted changes and create granular conventional commits.`,
-			``,
-			`PRD reference: ${prdTag}`,
-			`Use meaningful scopes based on the changed module or area (e.g., chat-ui, auth, api, docs).`,
-			`Do NOT use "${prdTag}" as the scope unless there is truly no better module scope.`,
-			`Add "Refs: ${prdTag}" as a footer line in each commit message body.`,
-		].join("\n");
-
-		const run = await spawnSubagent({
-			taskPrompt: prompt,
-			model,
-			thinkingLevel,
-			cwd,
-			agent,
-			signal,
-		});
-		// Deterministic parsing only for now; the committer rework wires up LLM repair.
-		const result = await parseRunResult(run, COMMITTER_RESULT_SCHEMA);
-
-		if (result.ok && result.value.success) {
-			const commitCountMatch = result.value.summary.match(/(\d+)\s*commit/i);
-			const commitCount = commitCountMatch ? parseInt(commitCountMatch[1], 10) : 1;
-			return { success: true, commitCount, cost: result.usage.cost };
-		}
-
-		return { success: false, commitCount: 0, cost: result.usage.cost };
-	} catch {
-		return { success: false, commitCount: 0, cost: 0 };
-	}
-}
-
-/**
- * Simple auto-commit: stages all changes and creates a single conventional commit.
- */
-async function simpleAutoCommit(
-	pi: ExtensionAPI,
-	cwd: string,
-	prdTag: string,
-	sequenceLabel: string,
-	shortTitle: string,
-): Promise<{ committed: boolean; error?: string }> {
-	const scope = deriveCommitScopeFromTitle(shortTitle, prdTag);
-	const description = normalizeCommitDescription(shortTitle);
-	const commitHeader = `feat(${scope}): ${description}`;
-	const commitFooter = `Refs: ${prdTag}\nTask: ${sequenceLabel}`;
-
-	await pi.exec("git", ["add", "-A"], { cwd });
-	const commitResult = await pi.exec("git", ["commit", "-m", commitHeader, "-m", commitFooter], { cwd });
-
-	if (commitResult.code !== 0) {
-		if (commitResult.stdout.includes("nothing to commit")) {
-			return { committed: false };
-		}
-		return { committed: false, error: commitResult.stderr || commitResult.stdout };
-	}
-	return { committed: true };
+	return index === -1 ? actions[0]! : actions[index]!;
 }
 
 // --- Git helpers ---
@@ -2107,6 +1993,21 @@ async function listCommitsSince(pi: ExtensionAPI, cwd: string, before: string | 
 		});
 }
 
+/**
+ * Files under `.pi/` touched by the commits created since `before`
+ * (with `before === null`, all commits reachable from HEAD).
+ */
+async function listExcludedFilesCommittedSince(pi: ExtensionAPI, cwd: string, before: string | null): Promise<string[]> {
+	const after = await getHeadSha(pi, cwd);
+	if (!after || after === before) return [];
+	const range = before ? `${before}..${after}` : after;
+	const result = await pi.exec("git", ["log", "--format=", "--name-only", range, "--", REVIEW_EXCLUDED_DIR], { cwd });
+	if (result.code !== 0) {
+		throw new Error(`git log ${range} failed: ${(result.stderr || result.stdout).trim()}`);
+	}
+	return [...new Set(result.stdout.split("\n").map((line) => line.trim()).filter(Boolean))];
+}
+
 const PRIORITY_ORDER: readonly FindingPriority[] = ["P0", "P1", "P2", "P3"];
 
 /** True if `priority` is at or above (i.e. as severe as or more severe than) `threshold`. */
@@ -2132,9 +2033,11 @@ async function runOrchestratorLoop(
 	prd: TodoItem,
 	prdTag: string,
 	settings: PrdLoopProSettings,
+	commitRules: string,
 ): Promise<void> {
 	const agent = await loadPrdWorkerAgent(EXTENSION_DIR);
 	const reviewerAgent = await loadAgent(EXTENSION_DIR, "prd-reviewer");
+	const committerAgent = await loadAgent(EXTENSION_DIR, "prd-committer");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resolution = resolveTaskOrder(tasks);
@@ -2395,14 +2298,14 @@ async function runOrchestratorLoop(
 		}
 	};
 
-	/** Skip a task after a manual pause: discard changes and close the todo. */
-	const skipTask = async (task: TaskInfo, taskState: LoopTaskState) => {
+	/** Skip a task after a pause: discard changes and close the todo. */
+	const skipTask = async (task: TaskInfo, taskState: LoopTaskState, summary = "Skipped after manual pause.") => {
 		await discardChanges();
 		currentAbortController = new AbortController();
 		taskState.status = "completed";
 		taskState.endTime = Date.now();
 		taskState.currentActivity = undefined;
-		taskState.summary = "Skipped after manual pause.";
+		taskState.summary = summary;
 		taskState.errors = [];
 		await closeTaskAndUpdateIndex(task, { notifyIndexError: false });
 	};
@@ -2495,6 +2398,156 @@ async function runOrchestratorLoop(
 			if (aborted) return { kind: "aborted" };
 			if (!parsed.ok) return { kind: "failed", error: parsed.error };
 			return { kind: "reviewed", review: parsed.value };
+		}
+	};
+
+	type CommitPhaseOutcome =
+		| { kind: "committed"; commits: CommitRef[] }
+		| { kind: "skipped" }
+		| { kind: "released" }
+		| { kind: "aborted" };
+
+	/**
+	 * Commit phase: a prd-committer subagent (commit model/thinking) commits the
+	 * uncommitted changes outside `.pi/` following the `/commit` prompt template
+	 * rules. There is no fallback commit: committer failure, a failing hook
+	 * (`hookFailed`), an unparseable result, leftover changes or commits touching
+	 * `.pi/` pause the loop with "Retry commit" / "Skip task" / "Abort".
+	 *
+	 * HEAD is recorded before the phase; the created commits (SHA + subject) are
+	 * determined by the orchestrator, not by the agent.
+	 */
+	const runCommitPhase = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+	): Promise<CommitPhaseOutcome> => {
+		const headBefore = await getHeadSha(pi, ctx.cwd);
+
+		while (true) {
+			if (aborted) return { kind: "aborted" };
+
+			let errors: string[] = [];
+			let hookFailed = false;
+
+			const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
+			if (status.code !== 0) {
+				errors = [`git status failed: ${(status.stderr || status.stdout).trim()}`];
+			} else {
+				const changedFiles = filterReviewableStatus(status.stdout);
+				if (changedFiles.length > 0) {
+					taskState.currentActivity = undefined;
+					taskState.currentTurn = 0;
+					const run = await spawnSubagent({
+						taskPrompt: buildCommitterPrompt({ commitRules, taskTitle: task.title, changedFiles }),
+						model: settings.steps.commit.model,
+						thinkingLevel: settings.steps.commit.thinking,
+						cwd: ctx.cwd,
+						agent: committerAgent,
+						signal: currentAbortController.signal,
+						onActivity: createActivityHandler(taskState),
+					});
+					const parsed = await parseRunResult(run, COMMITTER_RESULT_SCHEMA, createRepairFactory(taskState));
+					addCost(taskState, phaseCosts, "commit", parsed.usage.cost);
+
+					if (pauseRequested) {
+						pauseRequested = false;
+						if (widgetTimer) clearInterval(widgetTimer);
+						// "Skip phase" is never offered during commit: uncommitted changes
+						// would leak into the next task.
+						const pauseAction = await showPauseMenu(ctx, task, {
+							phase: "Commit",
+							actions: ["retry-commit", "release", "skip", "abort"],
+						});
+						widgetTimer = setInterval(requestOverlayRender, 1000);
+
+						switch (pauseAction) {
+							case "release":
+								return { kind: "released" };
+							case "skip":
+								await skipTask(task, taskState);
+								requestOverlayRender();
+								return { kind: "skipped" };
+							case "abort":
+								aborted = true;
+								return { kind: "aborted" };
+							default:
+								currentAbortController = new AbortController();
+								taskState.currentActivity = "▶ restarting commit…";
+								requestOverlayRender();
+								continue;
+						}
+					}
+
+					if (aborted) return { kind: "aborted" };
+
+					if (!parsed.ok) {
+						errors = [`Committer returned no valid result: ${parsed.error}`];
+					} else if (parsed.value.hookFailed) {
+						hookFailed = true;
+						errors = parsed.value.errors.length > 0 ? parsed.value.errors : [parsed.value.summary || "Git hook failed"];
+					} else if (!parsed.value.success) {
+						errors = parsed.value.errors.length > 0 ? parsed.value.errors : [parsed.value.summary || "Committer failed"];
+					}
+				}
+
+				// Verify the result independently of what the agent reported.
+				if (errors.length === 0) {
+					try {
+						const excluded = await listExcludedFilesCommittedSince(pi, ctx.cwd, headBefore);
+						if (excluded.length > 0) {
+							errors = [`Commits include files under ${REVIEW_EXCLUDED_DIR}/: ${excluded.join(", ")}`];
+						}
+					} catch (err) {
+						errors = [err instanceof Error ? err.message : String(err)];
+					}
+				}
+				if (errors.length === 0 && changedFiles.length > 0) {
+					const after = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
+					const remaining = after.code === 0 ? filterReviewableStatus(after.stdout) : [];
+					if (remaining.length > 0) {
+						errors = [`Uncommitted changes remain after the commit phase: ${remaining.map((line) => line.slice(3)).join(", ")}`];
+					}
+				}
+			}
+
+			if (errors.length === 0) {
+				taskState.errors = [];
+				return { kind: "committed", commits: await listCommitsSince(pi, ctx.cwd, headBefore) };
+			}
+
+			// --- Pause: committer failed or a hook rejected the commit (never bypassed) ---
+			const reason = hookFailed ? "git hook failed" : "committer failed";
+			taskState.errors = errors;
+			taskState.currentActivity = `⏸ ${reason}`;
+			requestOverlayRender();
+			if (widgetTimer) clearInterval(widgetTimer);
+			ctx.ui.notify(
+				`⚠️ Commit phase paused (${reason}) — Task ${task.sequenceLabel}:\n${errors.join("\n")}`,
+				"warning",
+			);
+			const pauseAction = await showPauseMenu(ctx, task, {
+				phase: "Commit",
+				reason,
+				actions: ["retry-commit", "skip", "abort"],
+			});
+			widgetTimer = setInterval(requestOverlayRender, 1000);
+
+			switch (pauseAction) {
+				case "skip":
+					await skipTask(task, taskState, `Skipped after commit failure (${reason}).`);
+					requestOverlayRender();
+					return { kind: "skipped" };
+				case "abort":
+					aborted = true;
+					return { kind: "aborted" };
+				default:
+					currentAbortController = new AbortController();
+					taskState.errors = [];
+					taskState.currentActivity = "▶ retrying commit…";
+					requestOverlayRender();
+					continue;
+			}
 		}
 	};
 
@@ -2712,44 +2765,21 @@ Errors: ${result.errors.join("; ")}`,
 
 				// --- Commit phase ---
 				setPhase(taskState, "Commit");
-				const shortTitle = extractShortTitle(task.title);
-				const headBefore = await getHeadSha(pi, ctx.cwd);
+				const commitOutcome = await runCommitPhase(task, taskState, phaseCosts);
 
-				// Committer agent is always used (smart-commit toggle removed).
-				// The simple fallback commit is kept until the committer rework.
-				const committerResult = await spawnCommitterSubagent(
-					ctx.cwd,
-					prdTag,
-					settings.steps.commit.model,
-					settings.steps.commit.thinking,
-					currentAbortController.signal,
-				);
-				addCost(taskState, phaseCosts, "commit", committerResult.cost);
-
-				if (aborted) {
+				if (commitOutcome.kind === "released") return releasedResult();
+				if (commitOutcome.kind === "skipped") continue;
+				if (commitOutcome.kind === "aborted" || aborted) {
+					aborted = true;
 					taskState.status = "aborted";
 					taskState.summary = "Task execution was cancelled during commit.";
 					if (!taskState.endTime) taskState.endTime = Date.now();
 					break;
 				}
 
-				if (!committerResult.success) {
-					const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-					if (!fallback.committed && fallback.error) {
-						ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
-					}
-				}
-
 				// Commit SHAs are determined by the orchestrator (HEAD before vs. after).
-				const commits = await listCommitsSince(pi, ctx.cwd, headBefore);
+				const commits = commitOutcome.commits;
 				loopState.totalCommits += commits.length;
-
-				if (aborted) {
-					taskState.status = "aborted";
-					taskState.summary = "Task execution was cancelled after changes were created.";
-					if (!taskState.endTime) taskState.endTime = Date.now();
-					break;
-				}
 
 				// --- Report: append execution report, close todo, update PRD Task Index ---
 				const record: ExecutionRecord = {
@@ -2834,6 +2864,17 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		return;
 	}
 
+	// Step 1b: Commit rules from the package's `/commit` prompt template.
+	// Loaded at runtime so editing the template changes the committer's
+	// behavior; a missing template is a hard error.
+	let commitRules: string;
+	try {
+		commitRules = await loadCommitRules();
+	} catch (err) {
+		ctx.ui.notify(`❌ Cannot start PRD Loop Pro: ${err instanceof Error ? err.message : String(err)}`, "error");
+		return;
+	}
+
 	// Step 2: PRD selection
 	let selectedPrd: { prd: TodoItem; openTaskCount: number; totalTaskCount: number } | undefined;
 
@@ -2879,7 +2920,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 
 	// Step 5: Run the orchestrator loop
 	const selectedPrdTag = selectedPrd.prd.tags.find((t) => /^prd-\d+$/.test(t))!;
-	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, settings);
+	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, settings, commitRules);
 }
 
 // --- Extension entry point ---
