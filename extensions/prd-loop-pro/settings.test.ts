@@ -32,9 +32,11 @@ import {
 	saveGlobally,
 	saveProjectOnly,
 	saveProjectSettingsFile,
+	saveRunEdits,
 	saveSettingsFile,
 	stepIssues,
 	validateSettings,
+	withFields,
 } from "./settings.ts";
 import type { ModelInfo, PrdLoopProSettings } from "./settings.ts";
 
@@ -573,6 +575,65 @@ describe("project overrides: files", () => {
 		const loaded = loadSettingsFile(globalPath);
 		assert.equal(loaded.status, "loaded");
 		if (loaded.status === "loaded") assert.equal(loaded.settings.maxReviewRounds, 8);
+	});
+
+	it("withFields copies only the given fields into a clone", () => {
+		const target = validSettings();
+		const source = validSettings();
+		source.steps.fix = { model: "openai/gpt-5", thinking: "high" };
+		source.steps.review = { model: "openai/gpt-5", thinking: "low" };
+		source.maxReviewRounds = 7;
+		const result = withFields(target, source, ["steps.fix", "maxReviewRounds"]);
+		assert.deepEqual(result.steps.fix, source.steps.fix);
+		assert.deepEqual(result.steps.review, target.steps.review);
+		assert.equal(result.maxReviewRounds, 7);
+		assert.notEqual(result.steps.fix, source.steps.fix);
+		assert.deepEqual(target, validSettings());
+	});
+
+	it("run edits saved globally write only the edited steps (not earlier run-only edits)", () => {
+		const global = validSettings();
+		saveSettingsFile(globalPath, global);
+		const overrides = { steps: { review: { model: "openai/gpt-5", thinking: "high" } } };
+		saveProjectSettingsFile(projectPath, overrides);
+
+		// The run already differs from disk: an earlier run-only edit of the fix step.
+		const before = mergeSettings(global, overrides).settings;
+		before.steps.fix = { model: "openai/gpt-4o-mini", thinking: "off" };
+		const draft = structuredClone(before);
+		draft.steps.review = { model: "anthropic/claude-sonnet", thinking: "low" };
+
+		saveRunEdits({ globalPath, projectPath }, "global", { global, overrides }, before, draft);
+		const globalLoaded = loadSettingsFile(globalPath);
+		assert.equal(globalLoaded.status, "loaded");
+		if (globalLoaded.status !== "loaded") return;
+		assert.deepEqual(globalLoaded.settings.steps.review, { model: "anthropic/claude-sonnet", thinking: "low" });
+		assert.deepEqual(globalLoaded.settings.steps.fix, global.steps.fix);
+		// The project override of the edited step is dropped so the change takes effect here.
+		assert.equal(existsSync(projectPath), false);
+	});
+
+	it("run edits saved for the project keep all other values on disk", () => {
+		const global = validSettings();
+		saveSettingsFile(globalPath, global);
+		const overrides = { maxReviewRounds: 5 };
+		saveProjectSettingsFile(projectPath, overrides);
+
+		const before = mergeSettings(global, overrides).settings;
+		before.steps.implement = { model: "openai/gpt-4o-mini", thinking: "off" }; // run-only edit
+		const draft = structuredClone(before);
+		draft.steps.fix = { model: "openai/gpt-5", thinking: "xhigh" };
+
+		saveRunEdits({ globalPath, projectPath }, "project", { global, overrides }, before, draft);
+		const raw = JSON.parse(readFileSync(projectPath, "utf-8"));
+		assert.deepEqual(raw, {
+			version: SETTINGS_VERSION,
+			steps: { fix: { model: "openai/gpt-5", thinking: "xhigh" } },
+			maxReviewRounds: 5,
+		});
+		const globalLoaded = loadSettingsFile(globalPath);
+		assert.equal(globalLoaded.status, "loaded");
+		if (globalLoaded.status === "loaded") assert.deepEqual(globalLoaded.settings, global);
 	});
 
 	it("removing project overrides deletes the file and falls back to global", () => {

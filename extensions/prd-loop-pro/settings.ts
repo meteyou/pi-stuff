@@ -480,6 +480,17 @@ export function changedFields(before: PrdLoopProSettings, after: PrdLoopProSetti
 	return OVERRIDE_FIELDS.filter((field) => !fieldEquals(before, after, field));
 }
 
+/** Copy of `target` with the given fields taken from `source`. */
+export function withFields(
+	target: PrdLoopProSettings,
+	source: PrdLoopProSettings,
+	fields: readonly OverrideField[],
+): PrdLoopProSettings {
+	const result = cloneSettings(target);
+	for (const field of fields) copyField(result, source, field);
+	return result;
+}
+
 /**
  * Merge global settings with project overrides (per field) and record the
  * source of every field. A partial step override takes the missing part from
@@ -604,6 +615,33 @@ export function saveProjectOnly(projectPath: string, global: PrdLoopProSettings,
 	const overrides = computeProjectOverrides(global, draft);
 	saveProjectSettingsFile(projectPath, overrides);
 	return { global: cloneSettings(global), overrides };
+}
+
+/** Where edits made while the loop is running are saved (besides applying them to the run). */
+export type SaveScope = "global" | "project";
+
+/**
+ * Save edits made while the loop is running. `before` are the run settings
+ * when editing started, `draft` the edited ones; only the fields changed
+ * between them are written. `state` is the settings state currently on disk
+ * (re-read before saving: the run may already differ from it, e.g. after
+ * earlier run-only edits, which must not be persisted here).
+ *
+ * - "global": like "Save globally" (project overrides of these fields are dropped)
+ * - "project": the changed fields become project overrides; all other fields
+ *   keep their current values on disk
+ */
+export function saveRunEdits(
+	paths: { globalPath: string; projectPath: string },
+	scope: SaveScope,
+	state: SettingsState,
+	before: PrdLoopProSettings,
+	draft: PrdLoopProSettings,
+): SettingsState {
+	if (scope === "global") return saveGlobally(paths, state, before, draft);
+	const onDisk = mergeSettings(state.global, state.overrides).settings;
+	const target = withFields(onDisk, draft, changedFields(before, draft));
+	return saveProjectOnly(paths.projectPath, state.global, target);
 }
 
 /** "Remove project overrides": deletes the project file. Returns the new state. */
