@@ -1,6 +1,6 @@
 # Answer Extension
 
-Extracts open questions from the last assistant message and guides you through answering them in an interactive TUI. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/answer.ts).
+Extracts open questions from the last assistant message and guides you through answering them in an interactive TUI. Based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/extensions/answer.ts).
 
 ## Concept
 

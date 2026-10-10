@@ -1,6 +1,6 @@
 # Todos Extension
 
-File-based todo manager with claiming, locking, and garbage collection. Fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/todos.ts) with a fix for the `getEditorKeybindings` ESM/CJS interop issue.
+File-based todo manager with claiming, locking, and garbage collection. Fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/extensions/todos.ts) with a fix for the `getEditorKeybindings` ESM/CJS interop issue.
 
 ## Changes from Upstream
 
