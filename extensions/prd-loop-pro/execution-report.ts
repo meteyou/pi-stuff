@@ -19,7 +19,7 @@ export type CostPhase = "implement" | "review" | "fix" | "commit" | "repair";
 
 export const COST_PHASES: readonly CostPhase[] = ["implement", "review", "fix", "commit", "repair"];
 
-const COST_PHASE_LABELS: Record<CostPhase, string> = {
+export const COST_PHASE_LABELS: Record<CostPhase, string> = {
 	implement: "implement",
 	review: "review",
 	fix: "fix",
