@@ -133,9 +133,9 @@ The result is saved globally. If the global file is invalid, you're offered to r
 Every start shows one overview dialog with the PRD, open/completed task counts, the paths of both settings files and
 every entry with its source (`[global]` or `[project]`):
 
-- **▶️ Confirm & start** — starts the loop
-- **✏️ Change** — opens the change menu
-- **✖ Cancel**
+- **🚀 Confirm & start** — starts the loop
+- **📝 Change** — opens the change menu
+- **❌ Cancel**
 
 At start, each configured model must still be available (API key configured) and each thinking level must be valid for
 its model; numbers must be in range. Invalid entries are marked with ⚠️ and starting is blocked until they are fixed.
@@ -150,8 +150,8 @@ option, so steps can mix providers. Save actions:
 |--------|--------|
 | 💾 Save globally | Writes the edited values to the global file |
 | 📁 Save for this project only | Writes only the fields that differ from global to `.pi/prd-loop-pro.json` (removes the file if nothing differs) |
-| 🗑 Remove project overrides | Deletes the project file; the project uses the global settings again (only shown if overrides exist or the file is invalid) |
-| ↩ Back to overview | Discards unsaved changes (with confirmation) |
+| 🧹 Remove project overrides | Deletes the project file; the project uses the global settings again (only shown if overrides exist or the file is invalid) |
+| 🔙 Back to overview | Discards unsaved changes (with confirmation) |
 
 ## Fix Threshold & Round Limit
 
@@ -211,7 +211,7 @@ open findings manually (or with the main agent), then run `/prd-loop-pro` again.
 | 📝 Commit changes (committer) & close | Runs only the commit phase on the current changes, then report + close |
 | ✅ Already committed – just close | Appends an execution report, closes the task and updates the PRD Task Index |
 | 🔍 Review again | Runs the review-fix cycle on the current changes, then commit + close |
-| ⏭️ Not now | Leaves the task as `needs-human` |
+| 💤 Not now | Leaves the task as `needs-human` |
 
 The git clean check allows uncommitted changes while a `needs-human` task is being resolved. Afterwards the loop
 continues with the next task of the PRD.

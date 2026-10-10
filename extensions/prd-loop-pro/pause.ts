@@ -134,10 +134,10 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 	switch (action) {
 		case "resume":
 			switch (phase) {
-				case "Implement": return "▶️  Resume current phase — keep changes, continue the implementation where it left off";
-				case "Review": return "▶️  Resume current phase — keep changes, restart the review";
-				case "Fix": return "▶️  Resume current phase — keep changes, restart the fix of this finding";
-				case "Commit": return "▶️  Resume current phase — keep changes, run the committer again";
+				case "Implement": return "🟢 Resume current phase — keep changes, continue the implementation where it left off";
+				case "Review": return "🟢 Resume current phase — keep changes, restart the review";
+				case "Fix": return "🟢 Resume current phase — keep changes, restart the fix of this finding";
+				case "Commit": return "🟢 Resume current phase — keep changes, run the committer again";
 			}
 			break;
 		case "skip-phase":
@@ -159,7 +159,7 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 		case "release":
 			return RELEASE_LABEL;
 		case "skip-task":
-			return "⏭️  Skip task — discard changes (except .pi/), mark done, continue with next";
+			return "🚮 Skip task — discard changes (except .pi/), mark done, continue with next";
 		case "abort":
 			return "❌ Abort loop — stop and keep changes on disk";
 	}

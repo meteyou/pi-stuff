@@ -1011,7 +1011,7 @@ async function showNeedsHumanMenu(
 		commit: "📝 Commit changes (committer) & close — then continue with the next task",
 		close: "✅ Already committed – just close — then continue with the next task",
 		review: "🔍 Review again — run the review-fix cycle on the current changes, then commit & close",
-		"not-now": "⏭️  Not now — leave the task as needs-human",
+		"not-now": "💤 Not now — leave the task as needs-human",
 	};
 	const menu = actions.map((action) => labels[action]);
 	const choice = await ctx.ui.select(titleLines.join("\n"), menu);
@@ -1077,7 +1077,7 @@ async function offerNeedsHumanTasks(
 		if (remaining.length === 1) {
 			entry = remaining[0]!;
 		} else {
-			const skipAll = "⏭️  Not now — continue without resolving";
+			const skipAll = "💤 Not now — continue without resolving";
 			const options = remaining.map((e) => `🔧 ${e.task.title}`);
 			const choice = await ctx.ui.select(
 				`🔧 ${remaining.length} tasks need a human — pick one to resolve:`,
