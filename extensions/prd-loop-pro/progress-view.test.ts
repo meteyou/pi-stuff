@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import {
 	appendOutputEvent,
 	appendPhaseEvent,
+	buildOutcomeLabel,
+	buildSummaryEntryLines,
 	buildSummaryLines,
 	buildSummaryTaskLine,
 	buildTaskDetailLines,
@@ -244,5 +246,50 @@ describe("summary", () => {
 		});
 		assert.equal(lines[0], "✅ P — Loop completed");
 		assert.equal(lines.at(-1), "Total: 0:00 | $0.00 | 0 retries | 1 commit");
+	});
+});
+
+describe("summary entry", () => {
+	const input: SummaryInput = {
+		prdTitle: "PRD #1",
+		outcome: "released",
+		tasks: [
+			{ label: "Task 1/4: A", status: "completed", elapsedMs: 10_000, cost: 0.5, retries: 0 },
+			{ label: "Task 2/4: B", status: "needs-human", elapsedMs: 20_000, cost: 0.25, retries: 0 },
+			{ label: "Task 3/4: C", status: "failed", cost: 0, retries: 0 },
+			{ label: "Task 4/4: D", status: "pending", cost: 0, retries: 0 },
+		],
+		totalElapsedMs: 30_000,
+		totalCost: 0.75,
+		totalCommits: 1,
+	};
+
+	it("shows every task when expanded, without a hint", () => {
+		const lines = buildSummaryEntryLines(input, true);
+		assert.deepEqual(lines.map((l) => l.kind), ["headline", "blank", "task", "task", "task", "task", "blank", "totals"]);
+		assert.equal(lines[0]!.text, "🔧 PRD #1 — Loop stopped — task released to a human (needs-human)");
+		assert.equal(lines[2]!.status, "completed");
+		assert.ok(lines.at(-1)!.text.startsWith("Total: 0:30 | $0.75"));
+	});
+
+	it("shows only tasks that need attention when collapsed, plus an expand hint", () => {
+		const lines = buildSummaryEntryLines(input, false, "ctrl+x");
+		assert.deepEqual(lines.map((l) => l.kind), ["headline", "blank", "task", "task", "blank", "totals", "hint"]);
+		assert.deepEqual(lines.filter((l) => l.kind === "task").map((l) => l.status), ["needs-human", "failed"]);
+		assert.equal(lines.at(-1)!.text, "2 more tasks — ctrl+x to expand");
+	});
+
+	it("omits the task block when collapsed and nothing needs attention", () => {
+		const lines = buildSummaryEntryLines(
+			{ ...input, outcome: "completed", tasks: [{ label: "Task 1/1: A", status: "completed", cost: 0, retries: 0 }] },
+			false,
+		);
+		assert.deepEqual(lines.map((l) => l.kind), ["headline", "blank", "totals", "hint"]);
+		assert.equal(lines.at(-1)!.text, "1 more task — ctrl+o to expand");
+	});
+
+	it("formats the outcome label without the PRD title", () => {
+		assert.equal(buildOutcomeLabel("completed"), "✅ Loop completed");
+		assert.equal(buildOutcomeLabel("failed"), "❌ Loop failed");
 	});
 });

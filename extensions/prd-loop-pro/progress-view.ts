@@ -379,19 +379,35 @@ export function buildSummaryTaskLine(task: SummaryTask): string {
 	return parts.join("  ");
 }
 
+/** Summary headline: `✅ <PRD title> — Loop completed`. */
+export function buildSummaryHeadline(input: Pick<SummaryInput, "prdTitle" | "outcome">): string {
+	return `${OUTCOME_ICONS[input.outcome]} ${input.prdTitle} — ${OUTCOME_TEXTS[input.outcome]}`;
+}
+
+/** Outcome text without the PRD title: `✅ Loop completed`. */
+export function buildOutcomeLabel(outcome: SummaryOutcome): string {
+	return `${OUTCOME_ICONS[outcome]} ${OUTCOME_TEXTS[outcome]}`;
+}
+
 /**
- * Final summary widget lines: outcome headline, one row per task, totals
+ * Final summary lines: outcome headline, one row per task, totals
  * (time, cost, retries, commits, review rounds, finding counts and the
  * number of tasks that need a human).
  */
 export function buildSummaryLines(input: SummaryInput): string[] {
 	const lines: string[] = [];
-	lines.push(`${OUTCOME_ICONS[input.outcome]} ${input.prdTitle} — ${OUTCOME_TEXTS[input.outcome]}`);
+	lines.push(buildSummaryHeadline(input));
 	lines.push("");
 
 	for (const task of input.tasks) lines.push(buildSummaryTaskLine(task));
 	lines.push("");
+	lines.push(buildSummaryTotalsLine(input));
 
+	return lines;
+}
+
+/** Totals row of the summary (time, cost, retries, commits, review totals, needs-human count). */
+export function buildSummaryTotalsLine(input: SummaryInput): string {
 	const totalRetries = input.tasks.reduce((sum, t) => sum + t.retries, 0);
 	const reviewed = input.tasks.filter((t) => t.review).map((t) => t.review!);
 	const totals = [
@@ -408,7 +424,49 @@ export function buildSummaryLines(input: SummaryInput): string[] {
 	}
 	const needsHuman = input.tasks.filter((t) => t.status === "needs-human").length;
 	if (needsHuman > 0) totals.push(`${NEEDS_HUMAN_MARKER} ${needsHuman} needs-human`);
-	lines.push(totals.join(" | "));
+	return totals.join(" | ");
+}
 
+/** Tasks that still need attention after a run; they stay visible in the collapsed summary entry. */
+export function taskNeedsAttention(status: TaskStatus): boolean {
+	return status === "needs-human" || status === "failed" || status === "aborted";
+}
+
+export type SummaryEntryLineKind = "headline" | "task" | "totals" | "hint" | "blank";
+
+export interface SummaryEntryLine {
+	kind: SummaryEntryLineKind;
+	text: string;
+	/** Task status for `task` lines (used for coloring). */
+	status?: TaskStatus;
+}
+
+/**
+ * Lines of the summary entry posted to the chat after the overlay is closed.
+ *
+ * - Expanded: headline, every task row, totals.
+ * - Collapsed: headline, only tasks that need attention (needs-human, failed,
+ *   aborted), totals and a hint how many rows are hidden and how to expand.
+ */
+export function buildSummaryEntryLines(
+	input: SummaryInput,
+	expanded: boolean,
+	expandKey = "ctrl+o",
+): SummaryEntryLine[] {
+	const visibleTasks = expanded ? input.tasks : input.tasks.filter((task) => taskNeedsAttention(task.status));
+	const hidden = input.tasks.length - visibleTasks.length;
+
+	const lines: SummaryEntryLine[] = [{ kind: "headline", text: buildSummaryHeadline(input) }];
+	if (visibleTasks.length > 0) {
+		lines.push({ kind: "blank", text: "" });
+		for (const task of visibleTasks) {
+			lines.push({ kind: "task", text: buildSummaryTaskLine(task), status: task.status });
+		}
+	}
+	lines.push({ kind: "blank", text: "" });
+	lines.push({ kind: "totals", text: buildSummaryTotalsLine(input) });
+	if (hidden > 0) {
+		lines.push({ kind: "hint", text: `${plural(hidden, "more task", "more tasks")} — ${expandKey} to expand` });
+	}
 	return lines;
 }
