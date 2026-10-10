@@ -200,9 +200,10 @@ implementation retries (default `0`).
   (`~/.pi/agent/prd-loop-pro.json`).
 - **Per project:** individual fields can be overridden in `.pi/prd-loop-pro.json` (only the differing fields are
   stored).
-- **Every start:** an overview shows the PRD, task counts and all settings with their source (`[global]`/`[project]`)
-  → *Confirm & start*, *Change* (one row per setting; save globally, for this project only, or remove project
-  overrides) or *Cancel*. Unavailable models or invalid thinking levels are marked ⚠️ and block the start.
+- **Every start:** an overview shows the PRD, task counts and all settings with their source (`[global]`/`[project]`).
+  The cursor starts on *Confirm & start*; move up to change an entry in place. With unsaved changes, start via
+  *Save globally & start* or *Save for this project only & start* (or discard them). Unavailable models or invalid
+  thinking levels are marked ⚠️ and block the start.
 
 #### Pauses and `needs-human`
 
