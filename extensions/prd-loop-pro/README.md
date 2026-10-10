@@ -220,11 +220,16 @@ continues with the next task of the PRD.
 
 - **Live overlay** — task rows show the current phase and round (e.g. `Review 2/3`, `Fix 2/4 [P1] <title>`). Expanded
   task details show the review round counter, fixed/rejected/deferred/unresolved counts and the cost per phase.
-  Keys: `↑/↓` select, `Enter` expand, `←` collapse, `o` output viewer, `Ctrl+C` pause, `Esc` (twice) abort.
+  Keys: `↑/↓` select, `Enter` expand, `←` collapse, `a` expand/collapse all, `o` output viewer, `Ctrl+C` pause,
+  `Esc` (twice) abort.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
   `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and duration.
-- **Summary widget** — after the run: rounds and finding counts per task, totals, and a ⚠️ marker for `needs-human`
-  tasks.
+- **Finished view** — when the run is over (completed, failed, aborted by a pause action or released), the overlay
+  stays open: the header shows the outcome, totals and the final notification; tasks can still be expanded and their
+  output inspected. `Esc`/`q` closes it.
+- **Summary entry** — closing the overlay posts the summary to the chat as a custom session entry (persisted in the
+  session, never sent to the LLM). Collapsed it shows the headline, tasks that need attention (⚠️ `needs-human`,
+  failed, aborted) and the totals; `Ctrl+O` expands it to all tasks with rounds and finding counts.
 
 ## Agents
 
@@ -266,7 +271,7 @@ If both fail, the loop pauses (*JSON repair failed*).
 | `pause.ts` | Pause reasons, menu options and labels (pure) |
 | `task-index.ts` | Task graph, `needs-human` handling, PRD Task Index sync, git clean check (pure) |
 | `discard.ts` | Discard uncommitted changes except `.pi/` |
-| `progress-view.ts` | View model for overlay, output viewer and summary widget (pure) |
+| `progress-view.ts` | View model for overlay, output viewer and summary entry (pure) |
 
 ## Tests
 
