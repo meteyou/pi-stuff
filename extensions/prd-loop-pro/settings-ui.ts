@@ -3,7 +3,8 @@
  *
  * First-start wizard, overview menu (every entry with its source
  * `[global]` / `[project]` is selectable and edited in place; unsaved edits are
- * saved globally or for this project only when starting), model picker (scoped
+ * saved globally or for this project only when starting), run settings dialog
+ * (change step models/thinking while the loop is running), model picker (scoped
  * models first + "All available models…") and thinking picker. Persistence, merging and validation live in the pure settings module
  * (./settings.ts).
  *
@@ -13,8 +14,15 @@
 import type { ExtensionAPI, ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getAgentDir, keyText, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
-import { buildOverviewMenu, fieldLabel } from "./overview-menu.ts";
-import type { OverviewAction, PrdOverviewInfo, SettingsPaths } from "./overview-menu.ts";
+import { buildOverviewMenu, buildRunSettingsMenu, fieldLabel } from "./overview-menu.ts";
+import type {
+	OverviewAction,
+	PrdOverviewInfo,
+	RunningStep,
+	RunSettingsAction,
+	RunSettingsScope,
+	SettingsPaths,
+} from "./overview-menu.ts";
 import {
 	changedFields,
 	clampThinkingLevel,
@@ -24,6 +32,7 @@ import {
 	DEFAULT_MAX_REVIEW_ROUNDS,
 	FIX_THRESHOLD_LABELS,
 	FIX_THRESHOLDS,
+	fieldEquals,
 	findModel,
 	getGlobalSettingsPath,
 	getProjectSettingsPath,
@@ -41,6 +50,7 @@ import {
 	removeProjectOverrides,
 	saveGlobally,
 	saveProjectOnly,
+	saveRunEdits,
 	saveSettingsFile,
 	STEP_KEYS,
 	STEP_LABELS,
@@ -49,8 +59,10 @@ import {
 	type ModelInfo,
 	type OverrideField,
 	type PrdLoopProSettings,
+	type SaveScope,
 	type SettingsOverrides,
 	type SettingsState,
+	type StepKey,
 	type ThinkingLevel,
 } from "./settings.ts";
 
@@ -626,6 +638,127 @@ export async function resolveStartSettings(
 				const discard = await ctx.ui.confirm(
 					"Discard changes?",
 					`${changed.length} unsaved change(s) will be lost and the loop will not start.`,
+				);
+				if (discard) return undefined;
+				continue;
+			}
+		}
+	}
+}
+
+// --- Run settings (while the loop is running) ---
+
+export type { RunningStep, RunSettingsScope } from "./overview-menu.ts";
+
+/** Edits confirmed in the run settings dialog. */
+export interface RunSettingsChange {
+	/** Run settings with the edits applied (only `changed` steps differ). */
+	settings: PrdLoopProSettings;
+	/** Edited steps. */
+	changed: StepKey[];
+	scope: RunSettingsScope;
+}
+
+/**
+ * Save run edits to disk (re-reads the current global/project files first).
+ * Returns a confirmation message; throws if saving is not possible.
+ */
+function saveRunSettings(
+	cwd: string,
+	scope: SaveScope,
+	before: PrdLoopProSettings,
+	draft: PrdLoopProSettings,
+): string {
+	const paths = { globalPath: getGlobalSettingsPath(getAgentDir()), projectPath: getProjectSettingsPath(cwd) };
+	const loaded = loadSettingsFile(paths.globalPath);
+	if (loaded.status !== "loaded") {
+		throw new Error(loaded.status === "missing" ? `${paths.globalPath} does not exist` : loaded.error);
+	}
+	const project = loadProjectSettings(paths.projectPath);
+	if (scope === "global" && project.error) {
+		throw new Error(`${project.error} — fix it or save for this project only`);
+	}
+	saveRunEdits(paths, scope, { global: loaded.settings, overrides: project.overrides }, before, draft);
+	return scope === "global" ? `saved globally (${paths.globalPath})` : `saved for this project (${paths.projectPath})`;
+}
+
+/**
+ * Run settings dialog (`s` in the loop overlay): change the model + thinking
+ * level of the steps while the loop keeps running. Nothing is applied until
+ * the user confirms; the caller applies the returned settings to the run (the
+ * next subagent start of a step picks them up). Saving globally / for the
+ * project happens here; a failed save still applies the edits to the run.
+ *
+ * `getRunning` is evaluated whenever the menu is (re)built, so the "Running
+ * now" line stays current while the user edits.
+ *
+ * Returns undefined if nothing was changed or the edits were discarded.
+ */
+export async function editRunSettings(
+	ctx: ExtensionCommandContext,
+	current: PrdLoopProSettings,
+	options: { getRunning?: () => RunningStep | undefined } = {},
+): Promise<RunSettingsChange | undefined> {
+	const catalog = buildModelCatalog(ctx);
+	if (catalog.available.length === 0) {
+		ctx.ui.notify("No models available. Please configure an API key.", "error");
+		return undefined;
+	}
+
+	const before = cloneSettings(current);
+	const draft = cloneSettings(current);
+	let cursor: number | undefined;
+
+	while (true) {
+		const changed = STEP_KEYS.filter((step) => !fieldEquals(before, draft, `steps.${step}`));
+		const issues = validateSettings(draft, catalog.available, { knownModels: catalog.all });
+		const menu = buildRunSettingsMenu({ draft, changed, issues, running: options.getRunning?.() });
+
+		const index = await selectMenuItem(
+			ctx,
+			menu.title,
+			menu.items.map((item) => item.label),
+			cursor ?? menu.defaultIndex,
+			menu.rowCount,
+		);
+		const item = index === undefined ? undefined : menu.items[index];
+		// Escape = back to the loop (asks before dropping unsaved changes)
+		const action: RunSettingsAction = item?.action ?? { kind: "back" };
+		cursor = undefined;
+
+		if (action.kind === "edit") {
+			await editField(ctx, catalog, draft, `steps.${action.step}`);
+			cursor = index; // stay on the edited row
+			continue;
+		}
+
+		if (item?.blocked) {
+			ctx.ui.notify("Cannot apply: fix the entries marked with ⚠️ first (select them to change them).", "warning");
+			cursor = index;
+			continue;
+		}
+
+		switch (action.kind) {
+			case "apply": {
+				if (action.scope !== "run") {
+					try {
+						const message = saveRunSettings(ctx.cwd, action.scope, before, draft);
+						ctx.ui.notify(`PRD Loop Pro settings ${message}`, "info");
+					} catch (err) {
+						notifyError(ctx, "Applied to this run only — saving failed", err);
+					}
+				}
+				return { settings: draft, changed, scope: action.scope };
+			}
+
+			case "discard":
+				return undefined;
+
+			case "back": {
+				if (changed.length === 0) return undefined;
+				const discard = await ctx.ui.confirm(
+					"Discard changes?",
+					`${changed.length} unsaved change(s) will not be applied to the running loop.`,
 				);
 				if (discard) return undefined;
 				continue;

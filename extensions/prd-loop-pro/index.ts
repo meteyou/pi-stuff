@@ -53,6 +53,13 @@
  * `Fix #1 • 3 findings`, `Commit`) with outcome, cost and duration. The
  * final summary widget lists rounds and counts per task and marks
  * `needs-human` tasks with ⚠️.
+ *
+ * Run settings (`s` in the overlay, ./settings-ui.ts `editRunSettings`): the
+ * model + thinking level of every step can be changed while the loop keeps
+ * running. Each subagent reads its step's settings when it starts, so running
+ * subagents keep their model and the change applies from the next start.
+ * Dialogs are queued (pi has one editor slot for dialogs): a pause menu needed
+ * while the settings dialog is open is shown right after it closes.
  */
 
 import { spawn } from "node:child_process";
@@ -65,9 +72,10 @@ import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-wor
 import { keyText, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
 import type { ThinkingLevel as AiThinkingLevel } from "@earendil-works/pi-ai";
-import type { PrdLoopProSettings, StepSetting } from "./settings.ts";
-import { findModel } from "./settings.ts";
-import { resolveStartSettings } from "./settings-ui.ts";
+import type { PrdLoopProSettings, StepKey, StepSetting } from "./settings.ts";
+import { findModel, STEP_LABELS } from "./settings.ts";
+import { editRunSettings, resolveStartSettings } from "./settings-ui.ts";
+import type { RunningStep } from "./settings-ui.ts";
 import {
 	COMMITTER_RESULT_SCHEMA,
 	FIXER_RESULT_SCHEMA,
@@ -1228,6 +1236,8 @@ interface LoopTaskState {
 	currentActivity?: string;
 	/** Current turn of the subagent */
 	currentTurn: number;
+	/** Model + thinking level of the running subagent (while running). */
+	currentModel?: string;
 	/** Output events for the viewer overlay, grouped per subagent run (phase). */
 	outputGroups: PhaseOutputGroup[];
 }
@@ -1317,6 +1327,7 @@ class PrdLoopOverlayComponent {
 		private onOpenViewer: () => void,
 		private requestRender: () => void,
 		private onClose: () => void,
+		private onEditSettings: () => void,
 	) {
 		if (state.tasks.length > 0) this.expanded.add(0);
 	}
@@ -1366,6 +1377,11 @@ class PrdLoopOverlayComponent {
 			}
 			if (matchesKey(data, Key.ctrl("c"))) {
 				this.onPause();
+				return;
+			}
+			// Change models/thinking while the loop keeps running (not after the run).
+			if (data === "s" || data === "S") {
+				this.onEditSettings();
 				return;
 			}
 		}
@@ -1534,7 +1550,7 @@ class PrdLoopOverlayComponent {
 			? this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • esc/q close & post summary to chat")
 			: this.confirmingAbort
 				? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
-				: this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • ← collapse • ctrl+c pause • esc abort");
+				: this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • s models • ← collapse • ctrl+c pause • esc abort");
 		const scroll = totalRows > contentHeight
 			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
 			: "";
@@ -1605,6 +1621,14 @@ class PrdLoopOverlayComponent {
 				}
 			}
 
+			if (isTaskActive(task) && task.currentModel) {
+				rows.push({
+					taskIndex: i,
+					kind: "detail",
+					text: truncateToWidth(this.theme.fg("dim", `    Model: ${task.currentModel}`), width),
+				});
+			}
+
 			if ((task.status === "running" || task.status === "retrying") && task.currentActivity) {
 				const turnText = task.currentTurn > 0 ? ` [T${task.currentTurn}]` : "";
 				rows.push({
@@ -1636,6 +1660,11 @@ class PrdLoopOverlayComponent {
 
 		return rows;
 	}
+}
+
+/** `provider/model · thinking` of a step (or of a running subagent). */
+function formatStepModel(step: { model: string; thinking: string }): string {
+	return `${step.model || "(not configured)"} · ${step.thinking}`;
 }
 
 /** Final outcome of a loop run (`released` = a task was released to a human). */
@@ -1842,13 +1871,14 @@ class SubagentOutputViewer {
 		return lines;
 	}
 
-	/** `── Review #1 ─── needs attention • 3 findings • $0.12 • 0:45` */
+	/** `── Review #1 provider/model · high ─── needs attention • 3 findings • $0.12 • 0:45` */
 	private formatGroupHeader(group: PhaseOutputGroup, maxWidth: number, now: number): string {
 		const theme = this.theme;
 		const title = theme.fg("accent", theme.bold(group.header));
+		const model = group.model ? theme.fg("dim", ` ${group.model}`) : "";
 		const metaText = phaseGroupMeta(group, now);
 		const meta = group.failed ? theme.fg("warning", metaText) : theme.fg("muted", metaText);
-		const head = `${theme.fg("borderMuted", "──")} ${title} `;
+		const head = `${theme.fg("borderMuted", "──")} ${title}${model} `;
 		const tail = ` ${meta}`;
 		const fill = Math.max(2, maxWidth - visibleWidth(head) - visibleWidth(tail));
 		return head + theme.fg("borderMuted", "─".repeat(Math.min(fill, 6))) + tail;
@@ -2158,22 +2188,73 @@ async function runOrchestratorLoop(
 		overlayDone?.(reason);
 	};
 
+	/** Tail of the dialog queue (never rejects). */
+	let dialogQueue: Promise<void> = Promise.resolve();
+
 	/**
-	 * Show a dialog (pause menu) while the loop overlay is temporarily hidden.
-	 * pi renders select dialogs in the editor area below overlays, so a visible
-	 * overlay would cover the dialog and keep looking busy. Hiding it moves the
-	 * input focus to the dialog; showing it again restores the focus.
+	 * Show a dialog (pause menu, run settings) while the loop overlay is
+	 * temporarily hidden. pi renders dialogs in the editor area below overlays,
+	 * so a visible overlay would cover the dialog and keep looking busy. Hiding
+	 * it moves the input focus to the dialog; showing it again restores the focus.
+	 *
+	 * Dialogs are queued: pi has a single editor slot for extension dialogs, and
+	 * a second dialog would replace the first one (whose promise would never
+	 * settle). E.g. a pause menu needed while the run settings dialog is open is
+	 * shown right after the settings dialog closes.
 	 */
-	const withOverlayHidden = async <T>(dialog: () => Promise<T>): Promise<T> => {
-		// The output viewer is an overlay as well; close it so the dialog is visible.
-		closeViewer?.();
-		const handle = overlayClosed ? undefined : overlayHandle;
-		handle?.setHidden(true);
+	const withOverlayHidden = <T>(dialog: () => Promise<T>): Promise<T> => {
+		const show = async (): Promise<T> => {
+			// The output viewer is an overlay as well; close it so the dialog is visible.
+			closeViewer?.();
+			const handle = overlayClosed ? undefined : overlayHandle;
+			handle?.setHidden(true);
+			try {
+				return await dialog();
+			} finally {
+				if (handle && !overlayClosed) handle.setHidden(false);
+				requestOverlayRender();
+			}
+		};
+		const result = dialogQueue.then(show);
+		dialogQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	};
+
+	/** Subagent running right now (step + the model/thinking it was started with). */
+	let activeRun: RunningStep | undefined;
+	/** True once the run is over (no more subagent starts, settings changes are pointless). */
+	let runFinished = false;
+	let runSettingsOpen = false;
+
+	/**
+	 * Run settings dialog (`s` in the overlay): change step models/thinking
+	 * while the loop keeps running. The edits are applied to `settings`, which
+	 * every subagent start reads; a running subagent keeps its model.
+	 */
+	const openRunSettings = async () => {
+		if (runSettingsOpen || runFinished || overlayClosed || aborted) return;
+		runSettingsOpen = true;
 		try {
-			return await dialog();
+			const change = await withOverlayHidden(() =>
+				editRunSettings(ctx, settings, { getRunning: () => activeRun }),
+			);
+			if (!change || change.changed.length === 0) return;
+			for (const step of change.changed) settings.steps[step] = { ...change.settings.steps[step] };
+
+			const list = change.changed
+				.map((step) => `${STEP_LABELS[step]} → ${formatStepModel(settings.steps[step])}`)
+				.join(", ");
+			const running = activeRun && change.changed.includes(activeRun.step)
+				? ` The running ${STEP_LABELS[activeRun.step]} subagent keeps ${formatStepModel(activeRun)}.`
+				: "";
+			ctx.ui.notify(`⚙️ ${list} — takes effect at the next subagent start.${running}`, "info");
+		} catch (err) {
+			ctx.ui.notify(`⚠️ Failed to change settings: ${err instanceof Error ? err.message : String(err)}`, "error");
 		} finally {
-			if (handle && !overlayClosed) handle.setHidden(false);
-			requestOverlayRender();
+			runSettingsOpen = false;
 		}
 	};
 	const updateStatus = () => {
@@ -2257,6 +2338,9 @@ async function runOrchestratorLoop(
 					if (!overlayClosed && !viewerOpen) tui.requestRender();
 				},
 				() => closeOverlay("finished"),
+				() => {
+					void openRunSettings();
+				},
 			);
 			return overlayComponent;
 		},
@@ -2352,9 +2436,43 @@ async function runOrchestratorLoop(
 	 * Start a new output group for the next subagent run (header in the output
 	 * viewer, e.g. `Review #1` or `Fix #1 • 3 findings`).
 	 */
-	const beginPhaseOutput = (taskState: LoopTaskState, ref: PhaseRef, note?: string) => {
-		startPhaseGroup(taskState.outputGroups, ref, { note });
+	const beginPhaseOutput = (taskState: LoopTaskState, ref: PhaseRef, note: string | undefined, model: string) => {
+		startPhaseGroup(taskState.outputGroups, ref, { note, model });
 		requestOverlayRender();
+	};
+
+	/**
+	 * Start the subagent of a pipeline step with the step's current model +
+	 * thinking level. The settings are read here, at the start of every run, so
+	 * changes made in the run settings dialog apply to the next run while a
+	 * running subagent keeps the model it was started with.
+	 */
+	const runStepSubagent = async (
+		step: Exclude<StepKey, "orchestrator">,
+		taskState: LoopTaskState,
+		output: { ref: PhaseRef; note?: string },
+		run: { taskPrompt: string; agent: AgentDefinition },
+	): Promise<SubagentRunResult> => {
+		const { model, thinking } = settings.steps[step];
+		const modelText = formatStepModel({ model, thinking });
+		beginPhaseOutput(taskState, output.ref, output.note, modelText);
+		activeRun = { step, model, thinking };
+		taskState.currentModel = modelText;
+		try {
+			return await spawnSubagent({
+				taskPrompt: run.taskPrompt,
+				model,
+				thinkingLevel: thinking,
+				cwd: ctx.cwd,
+				agent: run.agent,
+				signal: currentAbortController.signal,
+				onActivity: createActivityHandler(taskState),
+			});
+		} finally {
+			activeRun = undefined;
+			taskState.currentModel = undefined;
+			requestOverlayRender();
+		}
 	};
 
 	/** Record the one-line outcome of the latest subagent run (output viewer header). */
@@ -2577,17 +2695,13 @@ async function runOrchestratorLoop(
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
-			beginPhaseOutput(taskState, { phase: "implement", attempt }, runNote);
+			const run = await runStepSubagent(
+				"implement",
+				taskState,
+				{ ref: { phase: "implement", attempt }, note: runNote },
+				{ taskPrompt: prompt, agent },
+			);
 			runNote = undefined;
-			const run = await spawnSubagent({
-				taskPrompt: prompt,
-				model: settings.steps.implement.model,
-				thinkingLevel: settings.steps.implement.thinking,
-				cwd: ctx.cwd,
-				agent,
-				signal: currentAbortController.signal,
-				onActivity: createActivityHandler(taskState),
-			});
 
 			// Parse the raw final text: deterministic repair first, then one
 			// LLM repair attempt with the orchestrator model/thinking level.
@@ -2712,17 +2826,13 @@ async function runOrchestratorLoop(
 					round: options.round,
 				});
 
-				beginPhaseOutput(taskState, { phase: "review", round: options.round }, runNote);
+				const run = await runStepSubagent(
+					"review",
+					taskState,
+					{ ref: { phase: "review", round: options.round }, note: runNote },
+					{ taskPrompt: prompt, agent: reviewerAgent },
+				);
 				runNote = undefined;
-				const run = await spawnSubagent({
-					taskPrompt: prompt,
-					model: settings.steps.review.model,
-					thinkingLevel: settings.steps.review.thinking,
-					cwd: ctx.cwd,
-					agent: reviewerAgent,
-					signal: currentAbortController.signal,
-					onActivity: createActivityHandler(taskState),
-				});
 				const parsed = await parseRunResult(run, REVIEWER_RESULT_SCHEMA, createRepairFactory(taskState));
 				addCost(taskState, phaseCosts, "review", parsed.usage.cost);
 
@@ -2818,17 +2928,13 @@ async function runOrchestratorLoop(
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
-			beginPhaseOutput(taskState, fixRef, runNote);
+			const run = await runStepSubagent(
+				"fix",
+				taskState,
+				{ ref: fixRef, note: runNote },
+				{ taskPrompt: prompt, agent: fixerAgent },
+			);
 			runNote = undefined;
-			const run = await spawnSubagent({
-				taskPrompt: prompt,
-				model: settings.steps.fix.model,
-				thinkingLevel: settings.steps.fix.thinking,
-				cwd: ctx.cwd,
-				agent: fixerAgent,
-				signal: currentAbortController.signal,
-				onActivity: createActivityHandler(taskState),
-			});
 			const parsed = await parseRunResult(run, FIXER_RESULT_SCHEMA, createRepairFactory(taskState));
 			addCost(taskState, phaseCosts, "fix", parsed.usage.cost);
 
@@ -2921,18 +3027,17 @@ async function runOrchestratorLoop(
 				if (changedFiles.length > 0) {
 					taskState.currentActivity = undefined;
 					taskState.currentTurn = 0;
-					beginPhaseOutput(taskState, { phase: "commit" }, runNote);
-					runNote = undefined;
 					spawned = true;
-					const run = await spawnSubagent({
-						taskPrompt: buildCommitterPrompt({ commitRules, taskTitle: task.title, changedFiles }),
-						model: settings.steps.commit.model,
-						thinkingLevel: settings.steps.commit.thinking,
-						cwd: ctx.cwd,
-						agent: committerAgent,
-						signal: currentAbortController.signal,
-						onActivity: createActivityHandler(taskState),
-					});
+					const run = await runStepSubagent(
+						"commit",
+						taskState,
+						{ ref: { phase: "commit" }, note: runNote },
+						{
+							taskPrompt: buildCommitterPrompt({ commitRules, taskTitle: task.title, changedFiles }),
+							agent: committerAgent,
+						},
+					);
+					runNote = undefined;
 					const parsed = await parseRunResult(run, COMMITTER_RESULT_SCHEMA, createRepairFactory(taskState));
 					addCost(taskState, phaseCosts, "commit", parsed.usage.cost);
 
@@ -3287,6 +3392,7 @@ async function runOrchestratorLoop(
 	})();
 
 	const result = await runPromise;
+	runFinished = true;
 	loopState.endTime = Date.now();
 	ctx.ui.setStatus("prd-loop-pro", undefined);
 
