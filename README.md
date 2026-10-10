@@ -17,7 +17,7 @@ Feel free to explore, use, and modify these resources to build your own perfect 
 
 | Document | Description |
 |----------|-------------|
-| [PRD Workflow](docs/prd-workflow.md) | End-to-end guide for the `grill-me` → `write-a-prd` → `prd-to-todos` → `/prd-loop` workflow |
+| [PRD Workflow](docs/prd-workflow.md) | End-to-end guide for the `grill-me` → `write-a-prd` → `prd-to-todos` → `/prd-loop` (or `/prd-loop-pro`) workflow |
 
 ## 🚀 Installation
 
@@ -60,6 +60,7 @@ git push
 | `answer` | Extracts open questions from the last assistant message and opens an interactive Q&A flow to submit structured answers. | `/answer` (+ `Ctrl+.`) | custom, based on [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/) |
 | `context-usage` | Displays a visual representation of context window usage similar to Claude Code. Shows breakdown by System Prompt, Messages, and Files. | `/context` | custom |
 | `prd-loop` | Autonomous PRD task orchestrator. Spawns isolated subagents per task, auto-commits, retries on failure, shows a live overlay with task navigation/details, and leaves a summary widget afterward. Supports `--smart-commits` for granular conventional commits. Part of the [PRD Workflow](docs/prd-workflow.md). | `/prd-loop` (alias: `/ralph`) | custom |
+| `prd-loop-pro` | PRD task orchestrator with a review-fix pipeline per task (implement → review → fix → re-review → commit → report). Per-step model + thinking level saved globally/per project, pause menus instead of hard failures, `needs-human` release & resume, JSON repair for subagent results. Part of the [PRD Workflow](docs/prd-workflow.md). See [README](extensions/prd-loop-pro/README.md). | `/prd-loop-pro` (alias: `/ralph-pro`) | custom |
 | `quota-antigravity` | Displays the current quota usage for Antigravity models, including remaining prompt credits and model-specific limits. | `/quota-antigravity` | custom |
 | `quota-claude` | Displays Claude Pro/Max subscription usage (5-hour and 7-day limits) in the footer. Only visible when using Anthropic models. | `/quota-claude` | custom |
 | `quota-codex` | Displays ChatGPT Plus/Pro (OpenAI Codex) usage windows in the footer when using provider `openai-codex`. | `/quota-openai` (alias: `/quota-codex`) | custom |
