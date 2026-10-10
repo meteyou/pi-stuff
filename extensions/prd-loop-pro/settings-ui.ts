@@ -1,18 +1,20 @@
 /**
  * PRD Loop Pro — Settings UI.
  *
- * First-start wizard, overview dialog (with the source of every entry:
- * `[global]` / `[project]`), per-entry change menu with the save targets
- * "Save globally" / "Save for this project only" / "Remove project overrides",
- * model picker (scoped models first + "All available models…") and thinking
- * picker. Persistence, merging and validation live in the pure settings module
+ * First-start wizard, overview menu (every entry with its source
+ * `[global]` / `[project]` is selectable and edited in place; unsaved edits are
+ * saved globally or for this project only when starting), model picker (scoped
+ * models first + "All available models…") and thinking picker. Persistence, merging and validation live in the pure settings module
  * (./settings.ts).
  *
  * Not an index.ts, so pi does not load this file as a separate extension.
  */
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir, keyText, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { buildOverviewMenu, fieldLabel } from "./overview-menu.ts";
+import type { OverviewAction, PrdOverviewInfo, SettingsPaths } from "./overview-menu.ts";
 import {
 	changedFields,
 	clampThinkingLevel,
@@ -22,13 +24,11 @@ import {
 	DEFAULT_MAX_REVIEW_ROUNDS,
 	FIX_THRESHOLD_LABELS,
 	FIX_THRESHOLDS,
-	fieldIssues,
 	findModel,
 	getGlobalSettingsPath,
 	getProjectSettingsPath,
 	getSupportedThinkingLevels,
 	hasOverrides,
-	isFixThreshold,
 	loadProjectSettingsFile,
 	loadSettingsFile,
 	mergeSettings,
@@ -36,7 +36,6 @@ import {
 	MIN_MAX_REVIEW_ROUNDS,
 	modelRef,
 	OVERRIDE_FIELDS,
-	overrideFieldIssues,
 	overrideFieldStep,
 	parseIntegerInput,
 	removeProjectOverrides,
@@ -50,12 +49,8 @@ import {
 	type ModelInfo,
 	type OverrideField,
 	type PrdLoopProSettings,
-	type ResolvedSettings,
-	type SettingsIssue,
 	type SettingsOverrides,
-	type SettingsSource,
 	type SettingsState,
-	type StepKey,
 	type ThinkingLevel,
 } from "./settings.ts";
 
@@ -301,115 +296,92 @@ function isValidInteger(value: number, min: number): boolean {
 	return Number.isInteger(value) && value >= min;
 }
 
-// --- Formatting ---
+export type { PrdOverviewInfo, SettingsPaths } from "./overview-menu.ts";
 
-export interface PrdOverviewInfo {
-	title: string;
-	openTaskCount: number;
-	completedTaskCount: number;
-}
-
-/** Paths of the settings files shown in the overview. */
-export interface SettingsPaths {
-	globalPath: string;
-	projectPath: string;
-}
-
-const FIELD_LABELS: Record<Exclude<OverrideField, `steps.${StepKey}`>, string> = {
-	fixThreshold: "Fix threshold",
-	maxReviewRounds: "Max review rounds",
-	implementationRetries: "Impl. retries",
-};
-
-function fieldLabel(field: OverrideField): string {
-	const step = overrideFieldStep(field);
-	return step ? STEP_LABELS[step] : FIELD_LABELS[field as keyof typeof FIELD_LABELS];
-}
-
-function formatThreshold(value: string): string {
-	return isFixThreshold(value) ? FIX_THRESHOLD_LABELS[value] : value;
-}
-
-function formatFieldValue(settings: PrdLoopProSettings, field: OverrideField): string {
-	const step = overrideFieldStep(field);
-	if (step) {
-		const setting = settings.steps[step];
-		return `${setting.model || "(not configured)"} · ${setting.thinking}`;
-	}
-	if (field === "fixThreshold") return formatThreshold(settings.fixThreshold);
-	if (field === "maxReviewRounds") return String(settings.maxReviewRounds);
-	return String(settings.implementationRetries);
-}
-
-function formatSource(source: SettingsSource): string {
-	return `[${source}]`;
-}
+// --- Menu selector ---
 
 /**
- * Build the overview text (PRD, task counts, all settings with their source,
- * ⚠️ on invalid entries).
+ * Selector that looks like pi's `ctx.ui.select`, but starts at a given item
+ * and can separate groups with a blank line (settings rows / actions).
  */
-export function buildOverviewMessage(
-	prd: PrdOverviewInfo,
-	resolved: ResolvedSettings,
-	issues: SettingsIssue[],
-	paths: SettingsPaths & { projectFileExists: boolean },
-): string {
-	const { settings, sources } = resolved;
-	const row = (label: string, value: string, source: SettingsSource, invalid: boolean) =>
-		`   ${invalid ? "⚠️ " : "   "}${label.padEnd(20)}${value.padEnd(44)} ${formatSource(source)}`;
+class MenuSelector extends Container {
+	private selectedIndex: number;
+	private readonly list = new Container();
 
-	const lines = [
-		`🚀 PRD Loop Pro`,
-		``,
-		`   PRD:   ${prd.title}`,
-		`   Tasks: ${prd.openTaskCount} open, ${prd.completedTaskCount} completed`,
-		``,
-		`   Settings:`,
-		`      global:  ${paths.globalPath}`,
-		`      project: ${paths.projectPath}${paths.projectFileExists ? "" : " (none)"}`,
-		``,
-	];
-
-	for (const field of OVERRIDE_FIELDS) {
-		lines.push(
-			row(
-				`${fieldLabel(field)}:`,
-				formatFieldValue(settings, field),
-				sources[field],
-				overrideFieldIssues(issues, field).length > 0,
+	constructor(
+		private readonly theme: Theme,
+		private readonly keybindings: KeybindingsManager,
+		title: string,
+		private readonly labels: string[],
+		initialIndex: number,
+		private readonly gapBefore: number | undefined,
+		private readonly onSelect: (index: number) => void,
+		private readonly onCancel: () => void,
+	) {
+		super();
+		this.selectedIndex = Math.max(0, Math.min(initialIndex, labels.length - 1));
+		const border = () => new DynamicBorder((text) => theme.fg("border", text));
+		const hint = (key: string, description: string) => theme.fg("dim", key) + theme.fg("muted", ` ${description}`);
+		this.addChild(border());
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(this.list);
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new Text(
+				`${hint("↑↓", "navigate")}  ${hint(keyText("tui.select.confirm") || "enter", "select")}  ` +
+					hint(keyText("tui.select.cancel") || "escape", "cancel"),
+				1,
+				0,
 			),
 		);
-	}
-	if (fieldIssues(issues, "projectFile").length > 0) {
-		lines.push(`   ⚠️ ${"Project file:".padEnd(20)}invalid — remove or overwrite it via "Change"`);
-	}
-
-	if (issues.length > 0) {
-		lines.push("", "⚠️  Invalid settings — change them before starting:");
-		for (const issue of issues) lines.push(`   • ${issue.message}`);
+		this.addChild(new Spacer(1));
+		this.addChild(border());
+		this.updateList();
 	}
 
-	return lines.join("\n");
+	private updateList(): void {
+		this.list.clear();
+		this.labels.forEach((label, index) => {
+			if (index > 0 && index === this.gapBefore) this.list.addChild(new Spacer(1));
+			const text = index === this.selectedIndex
+				? this.theme.fg("accent", `→ ${label}`)
+				: `  ${this.theme.fg("text", label)}`;
+			this.list.addChild(new Text(text, 1, 0));
+		});
+	}
+
+	handleInput(data: string): void {
+		if (this.keybindings.matches(data, "tui.select.up") || data === "k") {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.updateList();
+		} else if (this.keybindings.matches(data, "tui.select.down") || data === "j") {
+			this.selectedIndex = Math.min(this.labels.length - 1, this.selectedIndex + 1);
+			this.updateList();
+		} else if (this.keybindings.matches(data, "tui.select.confirm") || data === "\n") {
+			this.onSelect(this.selectedIndex);
+		} else if (this.keybindings.matches(data, "tui.select.cancel")) {
+			this.onCancel();
+		}
+	}
 }
 
-type OverviewChoice = "start" | "change" | "cancel";
-
-async function showOverview(
+/** Show a {@link MenuSelector}; resolves with the selected index, or undefined on cancel. */
+function selectMenuItem(
 	ctx: ExtensionCommandContext,
-	message: string,
-	valid: boolean,
-): Promise<OverviewChoice> {
-	const startOption = valid ? "Confirm & start" : "Confirm & start (fix ⚠️ entries first)";
-	const changeOption = "Change";
-	const cancelOption = "Cancel";
-	const choice = await ctx.ui.select(message, [startOption, changeOption, cancelOption]);
-	if (choice === startOption) return "start";
-	if (choice === changeOption) return "change";
-	return "cancel";
+	title: string,
+	labels: string[],
+	initialIndex: number,
+	gapBefore?: number,
+): Promise<number | undefined> {
+	return ctx.ui.custom<number | undefined>(
+		(_tui, theme, keybindings, done) =>
+			new MenuSelector(theme, keybindings, title, labels, initialIndex, gapBefore, done, () => done(undefined)),
+	);
 }
 
-// --- Change menu ---
+// --- Editing ---
 
 /** Edit a single entry in place. Returns false if the user cancelled. */
 async function editField(
@@ -469,111 +441,6 @@ async function editField(
 
 function notifyError(ctx: ExtensionCommandContext, prefix: string, err: unknown): void {
 	ctx.ui.notify(`${prefix}: ${err instanceof Error ? err.message : String(err)}`, "error");
-}
-
-/**
- * Change menu: one row per entry (with source and ⚠️ marker) plus the save
- * actions. Selecting a row edits only that entry and returns to the menu.
- *
- * Returns the new settings state after a save/remove action, or undefined if
- * the user went back to the overview without saving.
- */
-async function runChangeMenu(
-	ctx: ExtensionCommandContext,
-	catalog: ModelCatalog,
-	paths: SettingsPaths,
-	state: SettingsState,
-	projectFileError: string | undefined,
-): Promise<SettingsState | undefined> {
-	const before = mergeSettings(state.global, state.overrides);
-	const draft = cloneSettings(before.settings);
-
-	const SAVE_GLOBAL = "Save globally";
-	const SAVE_PROJECT = "Save for this project only";
-	const REMOVE_PROJECT = "Remove project overrides";
-	const BACK = "Back to overview (discard changes)";
-
-	while (true) {
-		const issues = validateSettings(draft, catalog.available, { knownModels: catalog.all });
-		const changed = changedFields(before.settings, draft);
-
-		const rows = OVERRIDE_FIELDS.map((field) => {
-			const invalid = overrideFieldIssues(issues, field).length > 0;
-			const modified = changed.includes(field) ? " • changed" : "";
-			return `${invalid ? "⚠️ " : ""}${fieldLabel(field)}: ${formatFieldValue(draft, field)} ${formatSource(before.sources[field])}${modified}`;
-		});
-
-		const canRemoveProject = hasOverrides(state.overrides) || projectFileError !== undefined;
-		const actions = [SAVE_GLOBAL, SAVE_PROJECT, ...(canRemoveProject ? [REMOVE_PROJECT] : []), BACK];
-
-		const titleLines = ["📝 Change PRD Loop Pro settings — select an entry or an action"];
-		if (changed.length > 0) titleLines.push(`   ${changed.length} unsaved change(s)`);
-		if (projectFileError) titleLines.push(`   ⚠️ ${projectFileError}`);
-		for (const issue of issues) titleLines.push(`   ⚠️ ${issue.message}`);
-
-		const choice = await ctx.ui.select(titleLines.join("\n"), [...rows, ...actions]);
-
-		if (choice === undefined || choice === BACK) {
-			if (changed.length === 0) return undefined;
-			const discard = await ctx.ui.confirm(
-				"Discard changes?",
-				`${changed.length} unsaved change(s) will be lost.`,
-			);
-			if (discard) return undefined;
-			continue;
-		}
-
-		const rowIndex = rows.indexOf(choice);
-		if (rowIndex !== -1) {
-			await editField(ctx, catalog, draft, OVERRIDE_FIELDS[rowIndex]!);
-			continue;
-		}
-
-		if (choice === SAVE_GLOBAL) {
-			try {
-				const next = saveGlobally(paths, state, before.settings, draft);
-				ctx.ui.notify(`Saved PRD Loop Pro settings globally (${paths.globalPath})`, "info");
-				return next;
-			} catch (err) {
-				notifyError(ctx, "Failed to save global settings", err);
-				continue;
-			}
-		}
-
-		if (choice === SAVE_PROJECT) {
-			try {
-				const next = saveProjectOnly(paths.projectPath, state.global, draft);
-				const count = OVERRIDE_FIELDS.filter((f) => mergeSettings(next.global, next.overrides).sources[f] === "project").length;
-				ctx.ui.notify(
-					count > 0
-						? `Saved ${count} project override(s) to ${paths.projectPath}`
-						: `No differences from global settings — removed ${paths.projectPath}`,
-					"info",
-				);
-				return next;
-			} catch (err) {
-				notifyError(ctx, "Failed to save project settings", err);
-				continue;
-			}
-		}
-
-		if (choice === REMOVE_PROJECT) {
-			const lost = changed.length > 0 ? ` ${changed.length} unsaved change(s) will be discarded.` : "";
-			const ok = await ctx.ui.confirm(
-				"Remove project overrides?",
-				`Deletes ${paths.projectPath}; this project will use the global settings.${lost}`,
-			);
-			if (!ok) continue;
-			try {
-				const next = removeProjectOverrides(paths.projectPath, state.global);
-				ctx.ui.notify(`Removed project overrides (${paths.projectPath})`, "info");
-				return next;
-			} catch (err) {
-				notifyError(ctx, "Failed to remove project settings", err);
-				continue;
-			}
-		}
-	}
 }
 
 // --- Start flow ---
@@ -651,28 +518,118 @@ export async function resolveStartSettings(
 
 	let project = loadProjectSettings(paths.projectPath);
 	let state: SettingsState = { global, overrides: project.overrides };
+	let saved = mergeSettings(state.global, state.overrides);
+	let draft = cloneSettings(saved.settings);
+	let cursor: number | undefined;
+
+	const reloadProject = (next: SettingsState) => {
+		project = loadProjectSettings(paths.projectPath);
+		state = project.error ? next : { global: next.global, overrides: project.overrides };
+		saved = mergeSettings(state.global, state.overrides);
+		draft = cloneSettings(saved.settings);
+	};
+	/** Issues of the draft, plus the project file error (if any). */
+	const currentIssues = (settings: PrdLoopProSettings) => {
+		const issues = validateSettings(settings, catalog.available, { knownModels: catalog.all });
+		if (project.error) issues.push({ field: "projectFile", message: project.error });
+		return issues;
+	};
 
 	while (true) {
-		const resolved = mergeSettings(state.global, state.overrides);
-		const issues = validateSettings(resolved.settings, catalog.available, { knownModels: catalog.all });
-		if (project.error) issues.push({ field: "projectFile", message: project.error });
+		const issues = currentIssues(draft);
+		const changed = changedFields(saved.settings, draft);
+		const menu = buildOverviewMenu({
+			prd,
+			paths: { ...paths, projectFileExists: project.exists },
+			draft,
+			sources: saved.sources,
+			issues,
+			changed,
+			canRemoveProject: hasOverrides(state.overrides) || project.error !== undefined,
+		});
 
-		const message = buildOverviewMessage(prd, resolved, issues, { ...paths, projectFileExists: project.exists });
-		const choice = await showOverview(ctx, message, issues.length === 0);
+		const index = await selectMenuItem(
+			ctx,
+			menu.title,
+			menu.items.map((item) => item.label),
+			cursor ?? menu.defaultIndex,
+			menu.rowCount,
+		);
+		const item = index === undefined ? undefined : menu.items[index];
+		const action: OverviewAction = item?.action ?? { kind: "cancel" };
+		cursor = undefined;
 
-		if (choice === "cancel") return undefined;
-
-		if (choice === "start") {
-			if (issues.length === 0) return resolved.settings;
-			ctx.ui.notify("Cannot start: fix the entries marked with ⚠️ first (choose \"Change\").", "warning");
+		if (action.kind === "edit") {
+			await editField(ctx, catalog, draft, action.field);
+			cursor = index; // stay on the edited row
 			continue;
 		}
 
-		const next = await runChangeMenu(ctx, catalog, paths, state, project.error);
-		if (!next) continue; // Back without saving — overview with unchanged settings
-		state = next;
-		// Re-read the project file so its existence / error state reflects what was written
-		project = loadProjectSettings(paths.projectPath);
-		if (!project.error) state = { global: state.global, overrides: project.overrides };
+		if (item?.blocked) {
+			ctx.ui.notify("Cannot start: fix the entries marked with ⚠️ first (select them to change them).", "warning");
+			cursor = index;
+			continue;
+		}
+
+		switch (action.kind) {
+			case "start":
+				return saved.settings;
+
+			case "save-global-start":
+			case "save-project-start": {
+				try {
+					if (action.kind === "save-global-start") {
+						reloadProject(saveGlobally(paths, state, saved.settings, draft));
+						ctx.ui.notify(`Saved PRD Loop Pro settings globally (${paths.globalPath})`, "info");
+					} else {
+						const next = saveProjectOnly(paths.projectPath, state.global, draft);
+						const count = OVERRIDE_FIELDS.filter((f) => mergeSettings(next.global, next.overrides).sources[f] === "project").length;
+						reloadProject(next);
+						ctx.ui.notify(
+							count > 0
+								? `Saved ${count} project override(s) to ${paths.projectPath}`
+								: `No differences from global settings — removed ${paths.projectPath}`,
+							"info",
+						);
+					}
+				} catch (err) {
+					notifyError(ctx, "Failed to save settings", err);
+					continue;
+				}
+				if (currentIssues(saved.settings).length === 0) return saved.settings;
+				ctx.ui.notify("Saved, but the settings are still invalid — fix the entries marked with ⚠️.", "warning");
+				continue;
+			}
+
+			case "discard":
+				draft = cloneSettings(saved.settings);
+				continue;
+
+			case "remove-project": {
+				const lost = changed.length > 0 ? ` ${changed.length} unsaved change(s) will be discarded.` : "";
+				const ok = await ctx.ui.confirm(
+					"Remove project overrides?",
+					`Deletes ${paths.projectPath}; this project will use the global settings.${lost}`,
+				);
+				if (!ok) continue;
+				try {
+					reloadProject(removeProjectOverrides(paths.projectPath, state.global));
+					ctx.ui.notify(`Removed project overrides (${paths.projectPath})`, "info");
+				} catch (err) {
+					notifyError(ctx, "Failed to remove project settings", err);
+				}
+				continue;
+			}
+
+			case "cancel": {
+				if (changed.length === 0) return undefined;
+				const discard = await ctx.ui.confirm(
+					"Discard changes?",
+					`${changed.length} unsaved change(s) will be lost and the loop will not start.`,
+				);
+				if (discard) return undefined;
+				continue;
+			}
+		}
 	}
 }

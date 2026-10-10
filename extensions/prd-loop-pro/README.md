@@ -34,7 +34,7 @@ in the saved [settings](#settings).
 3. **`needs-human` tasks first** — see [Needs-Human Resume Flow](#needs-human-resume-flow).
 4. **PRD selection** — argument, dialog, or the PRD of the resolved `needs-human` task.
 5. **Settings** — first start: setup wizard; afterwards global settings merged with project overrides and validated.
-6. **Overview** — PRD, task counts and all settings → `Confirm & start` / `Change` / `Cancel`.
+6. **Overview** — PRD, task counts and all settings; select an entry to change it, then `Confirm & start`.
 7. **Orchestrator loop** — runs the [pipeline](#pipeline) for each task in dependency order (topological sort over the
    tasks' "Blocked by" references).
 
@@ -130,28 +130,26 @@ The result is saved globally. If the global file is invalid, you're offered to r
 
 ### Overview
 
-Every start shows one overview dialog with the PRD, open/completed task counts, the paths of both settings files and
-every entry with its source (`[global]` or `[project]`):
+Every start shows one overview menu with the PRD, open/completed task counts, the paths of both settings files and
+every entry with its source (`[global]` or `[project]`). The cursor starts on **Confirm & start**; move up with `↑` to
+select an entry and change it in place (model + thinking for steps, the fix threshold, max review rounds and
+implementation retries). The model picker lists your scoped models first and offers **All available models…** as last
+option, so steps can mix providers. Changed entries are marked `• changed` and the cursor stays on the edited row.
 
-- **Confirm & start** — starts the loop
-- **Change** — opens the change menu
-- **Cancel**
+Actions:
+
+| Action | Shown | Effect |
+|--------|-------|--------|
+| Confirm & start | no unsaved changes | Starts the loop |
+| Save globally & start | unsaved changes | Writes the edited values to the global file, then starts |
+| Save for this project only & start | unsaved changes | Writes only the fields that differ from global to `.pi/prd-loop-pro.json` (removes the file if nothing differs), then starts |
+| Discard changes | unsaved changes | Reverts the edits |
+| Remove project overrides | overrides exist or the project file is invalid | Deletes the project file; the project uses the global settings again |
+| Cancel | always | Does not start (asks before dropping unsaved changes) |
 
 At start, each configured model must still be available (API key configured) and each thinking level must be valid for
 its model; numbers must be in range. Invalid entries are marked with ⚠️ and starting is blocked until they are fixed.
-
-### Change menu
-
-One row per entry (value, source, ⚠️ marker, `• changed` for unsaved edits). Selecting a row edits only that entry and
-returns to the menu. The model picker lists your scoped models first and offers **All available models…** as last
-option, so steps can mix providers. Save actions:
-
-| Action | Effect |
-|--------|--------|
-| Save globally | Writes the edited values to the global file |
-| Save for this project only | Writes only the fields that differ from global to `.pi/prd-loop-pro.json` (removes the file if nothing differs) |
-| Remove project overrides | Deletes the project file; the project uses the global settings again (only shown if overrides exist or the file is invalid) |
-| Back to overview | Discards unsaved changes (with confirmation) |
+An invalid project file blocks *Save globally & start*, but can be overwritten via *Save for this project only & start*.
 
 ## Fix Threshold & Round Limit
 
@@ -263,7 +261,8 @@ If both fail, the loop pauses (*JSON repair failed*).
 |------|---------|
 | `index.ts` | Commands, start flow, orchestrator loop, subagent runner, overlay |
 | `settings.ts` | Settings schema, load/merge/save (global, project-only, remove overrides), validation (pure) |
-| `settings-ui.ts` | Setup wizard, overview, change menu, model/thinking pickers |
+| `settings-ui.ts` | Setup wizard, overview menu (edit entries in place, save & start), model/thinking pickers |
+| `overview-menu.ts` | Overview menu model: title, settings rows and actions (pure) |
 | `subagent-result.ts` | Result schemas, deterministic parsing and LLM repair (pure) |
 | `review-cycle.ts` | Review-fix cycle state machine (pure) |
 | `reviewer-prompt.ts`, `fixer-prompt.ts`, `committer-prompt.ts` | Prompt builders (reviewer uses the shared [review rubric](../review/review-prompts.ts)) |

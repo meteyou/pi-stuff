@@ -18,7 +18,8 @@
  * 2b. PRD selection (dialog, argument or the PRD of the resolved task)
  * 3. Load global settings (wizard on first start), merge per-field project
  *    overrides (`.pi/prd-loop-pro.json`) and validate
- * 4. Overview dialog: Confirm & start / Change (per-entry menu) / Cancel
+ * 4. Overview menu: entries editable in place; Confirm & start, or with
+ *    unsaved changes Save globally & start / Save for this project only & start
  * 5. Orchestrator loop per task: Implement (prd-worker) → Review-fix cycle
  *    (./review-cycle.ts: fresh prd-reviewer per round, one fresh prd-fixer per
  *    finding at/above the fix threshold, sequentially P0 first; re-review only
