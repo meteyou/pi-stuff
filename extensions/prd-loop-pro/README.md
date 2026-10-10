@@ -133,9 +133,9 @@ The result is saved globally. If the global file is invalid, you're offered to r
 Every start shows one overview dialog with the PRD, open/completed task counts, the paths of both settings files and
 every entry with its source (`[global]` or `[project]`):
 
-- **🚀 Confirm & start** — starts the loop
-- **📝 Change** — opens the change menu
-- **❌ Cancel**
+- **Confirm & start** — starts the loop
+- **Change** — opens the change menu
+- **Cancel**
 
 At start, each configured model must still be available (API key configured) and each thinking level must be valid for
 its model; numbers must be in range. Invalid entries are marked with ⚠️ and starting is blocked until they are fixed.

@@ -400,9 +400,9 @@ async function showOverview(
 	message: string,
 	valid: boolean,
 ): Promise<OverviewChoice> {
-	const startOption = valid ? "🚀 Confirm & start" : "🚫 Confirm & start (fix ⚠️ entries first)";
-	const changeOption = "📝 Change";
-	const cancelOption = "❌ Cancel";
+	const startOption = valid ? "Confirm & start" : "Confirm & start (fix ⚠️ entries first)";
+	const changeOption = "Change";
+	const cancelOption = "Cancel";
 	const choice = await ctx.ui.select(message, [startOption, changeOption, cancelOption]);
 	if (choice === startOption) return "start";
 	if (choice === changeOption) return "change";
