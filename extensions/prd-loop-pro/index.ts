@@ -11,8 +11,9 @@
  * Start sequence:
  * 1. Git clean check
  * 2. PRD selection (dialog or argument)
- * 3. Load + validate global settings (wizard on first start)
- * 4. Overview dialog: Confirm & start / Change / Cancel
+ * 3. Load global settings (wizard on first start), merge per-field project
+ *    overrides (`.pi/prd-loop-pro.json`) and validate
+ * 4. Overview dialog: Confirm & start / Change (per-entry menu) / Cancel
  * 5. Orchestrator loop: resolve tasks → spawn subagents → commit → update todos
  */
 
@@ -2539,7 +2540,8 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		selectedPrd = activePrds[choiceIndex];
 	}
 
-	// Steps 3 + 4: Load/validate settings (wizard on first start) and show the overview
+	// Steps 3 + 4: Load/merge/validate settings (wizard on first start) and show the overview.
+	// The returned settings are the effective ones (global + project overrides).
 	const settings = await resolveStartSettings(ctx, pi, {
 		title: selectedPrd.prd.title,
 		openTaskCount: selectedPrd.openTaskCount,
