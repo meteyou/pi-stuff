@@ -1,23 +1,37 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
 	DEFAULT_FIX_THRESHOLD,
 	DEFAULT_IMPLEMENTATION_RETRIES,
 	DEFAULT_MAX_REVIEW_ROUNDS,
+	OVERRIDE_FIELDS,
 	SETTINGS_FILE_NAME,
 	SETTINGS_VERSION,
 	STEP_KEYS,
+	changedFields,
 	clampThinkingLevel,
+	computeProjectOverrides,
 	createDefaultSettings,
 	fieldIssues,
 	getGlobalSettingsPath,
+	getProjectSettingsPath,
 	getSupportedThinkingLevels,
+	hasOverrides,
+	loadProjectSettingsFile,
 	loadSettingsFile,
+	mergeSettings,
+	overrideFieldIssues,
 	parseIntegerInput,
+	planGlobalSave,
+	removeProjectOverrides,
+	removeProjectSettingsFile,
+	saveGlobally,
+	saveProjectOnly,
+	saveProjectSettingsFile,
 	saveSettingsFile,
 	stepIssues,
 	validateSettings,
@@ -306,5 +320,274 @@ describe("parseIntegerInput", () => {
 		assert.equal(parseIntegerInput("1.5", { min: 1, fallback: 3 }).ok, false);
 		assert.equal(parseIntegerInput("0", { min: 1, fallback: 3 }).ok, false);
 		assert.equal(parseIntegerInput("-1", { min: 0, fallback: 0 }).ok, false);
+	});
+});
+
+describe("project overrides: merge + source tracking", () => {
+	it("uses global values with source global when there are no overrides", () => {
+		const global = validSettings();
+		for (const overrides of [undefined, {}]) {
+			const { settings, sources } = mergeSettings(global, overrides);
+			assert.deepEqual(settings, global);
+			for (const field of OVERRIDE_FIELDS) assert.equal(sources[field], "global");
+		}
+	});
+
+	it("overrides only the review step; all other steps keep global values", () => {
+		const global = validSettings();
+		const { settings, sources } = mergeSettings(global, {
+			steps: { review: { model: "openai/gpt-5", thinking: "xhigh" } },
+		});
+		assert.deepEqual(settings.steps.review, { model: "openai/gpt-5", thinking: "xhigh" });
+		assert.equal(sources["steps.review"], "project");
+		for (const key of STEP_KEYS) {
+			if (key === "review") continue;
+			assert.deepEqual(settings.steps[key], global.steps[key]);
+			assert.equal(sources[`steps.${key}`], "global");
+		}
+		assert.equal(settings.fixThreshold, global.fixThreshold);
+		assert.equal(sources.fixThreshold, "global");
+		assert.equal(sources.maxReviewRounds, "global");
+		assert.equal(sources.implementationRetries, "global");
+	});
+
+	it("merges scalar fields individually", () => {
+		const global = validSettings();
+		const { settings, sources } = mergeSettings(global, { maxReviewRounds: 5 });
+		assert.equal(settings.maxReviewRounds, 5);
+		assert.equal(sources.maxReviewRounds, "project");
+		assert.equal(settings.implementationRetries, global.implementationRetries);
+		assert.equal(sources.implementationRetries, "global");
+		assert.equal(sources.fixThreshold, "global");
+	});
+
+	it("fills a partial step override from the global step", () => {
+		const global = validSettings();
+		const { settings, sources } = mergeSettings(global, { steps: { fix: { thinking: "low" } } });
+		assert.deepEqual(settings.steps.fix, { model: global.steps.fix.model, thinking: "low" });
+		assert.equal(sources["steps.fix"], "project");
+	});
+
+	it("does not mutate the global settings", () => {
+		const global = validSettings();
+		const copy = structuredClone(global);
+		mergeSettings(global, { steps: { review: { model: "openai/gpt-5" } }, maxReviewRounds: 9 });
+		assert.deepEqual(global, copy);
+	});
+
+	it("validation of merged settings flags an invalid project override", () => {
+		const global = validSettings();
+		const { settings, sources } = mergeSettings(global, {
+			steps: { review: { model: "acme/gone", thinking: "high" } },
+		});
+		const issues = validateSettings(settings, AVAILABLE);
+		assert.deepEqual(issues.map((i) => i.field), ["steps.review.model"]);
+		assert.equal(sources["steps.review"], "project");
+		assert.equal(overrideFieldIssues(issues, "steps.review").length, 1);
+		assert.equal(overrideFieldIssues(issues, "steps.implement").length, 0);
+	});
+});
+
+describe("project overrides: computeProjectOverrides / planGlobalSave", () => {
+	it("contains only fields that differ from global", () => {
+		const global = validSettings();
+		const draft = validSettings();
+		draft.steps.review = { model: "openai/gpt-5", thinking: "high" };
+		draft.maxReviewRounds = 4;
+		assert.deepEqual(computeProjectOverrides(global, draft), {
+			steps: { review: { model: "openai/gpt-5", thinking: "high" } },
+			maxReviewRounds: 4,
+		});
+		assert.deepEqual(computeProjectOverrides(global, validSettings()), {});
+		assert.equal(hasOverrides(computeProjectOverrides(global, validSettings())), false);
+	});
+
+	it("lists changed fields", () => {
+		const before = validSettings();
+		const after = validSettings();
+		after.steps.commit.thinking = "low";
+		after.fixThreshold = "P3";
+		assert.deepEqual(changedFields(before, after), ["steps.commit", "fixThreshold"]);
+	});
+
+	it("global save writes changed fields and drops only their project overrides", () => {
+		const global = validSettings();
+		const overrides = {
+			steps: { review: { model: "openai/gpt-5", thinking: "high" } },
+			maxReviewRounds: 5,
+		};
+		const before = mergeSettings(global, overrides).settings;
+		const draft = structuredClone(before);
+		draft.maxReviewRounds = 2; // was a project override
+		draft.steps.commit = { model: "openai/gpt-4o-mini", thinking: "off" }; // was global
+
+		const next = planGlobalSave({ global, overrides }, before, draft);
+		assert.equal(next.global.maxReviewRounds, 2);
+		assert.deepEqual(next.global.steps.commit, { model: "openai/gpt-4o-mini", thinking: "off" });
+		// Untouched project-overridden step is NOT copied into global
+		assert.deepEqual(next.global.steps.review, global.steps.review);
+		assert.deepEqual(next.overrides, { steps: { review: { model: "openai/gpt-5", thinking: "high" } } });
+
+		const merged = mergeSettings(next.global, next.overrides);
+		assert.deepEqual(merged.settings, draft);
+		assert.equal(merged.sources["steps.review"], "project");
+		assert.equal(merged.sources.maxReviewRounds, "global");
+	});
+});
+
+describe("project overrides: files", () => {
+	let dir: string;
+	let globalPath: string;
+	let projectPath: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "prd-loop-pro-project-test-"));
+		globalPath = join(dir, "agent", SETTINGS_FILE_NAME);
+		projectPath = getProjectSettingsPath(join(dir, "project"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("places the project settings file in the project's .pi directory", () => {
+		assert.equal(getProjectSettingsPath("/repo"), join("/repo", ".pi", SETTINGS_FILE_NAME));
+	});
+
+	it("reports a missing project file", () => {
+		assert.equal(loadProjectSettingsFile(projectPath).status, "missing");
+	});
+
+	it("reports an invalid project file", () => {
+		mkdirSync(dirname(projectPath), { recursive: true });
+		writeFileSync(projectPath, "{ nope", "utf-8");
+		assert.equal(loadProjectSettingsFile(projectPath).status, "invalid");
+		writeFileSync(projectPath, JSON.stringify({ version: SETTINGS_VERSION + 1 }), "utf-8");
+		assert.equal(loadProjectSettingsFile(projectPath).status, "invalid");
+	});
+
+	it("loads only the fields present in the project file", () => {
+		mkdirSync(dirname(projectPath), { recursive: true });
+		writeFileSync(
+			projectPath,
+			JSON.stringify({ version: 1, steps: { review: { model: "openai/gpt-5", thinking: "high" } } }),
+			"utf-8",
+		);
+		const result = loadProjectSettingsFile(projectPath);
+		assert.equal(result.status, "loaded");
+		if (result.status !== "loaded") return;
+		assert.deepEqual(result.overrides, {
+			version: 1,
+			steps: { review: { model: "openai/gpt-5", thinking: "high" } },
+		});
+		const { sources } = mergeSettings(validSettings(), result.overrides);
+		assert.deepEqual(
+			OVERRIDE_FIELDS.filter((f) => sources[f] === "project"),
+			["steps.review"],
+		);
+	});
+
+	it("keeps wrongly typed override values so validation flags them", () => {
+		mkdirSync(dirname(projectPath), { recursive: true });
+		writeFileSync(projectPath, JSON.stringify({ maxReviewRounds: "many", steps: { fix: "x" } }), "utf-8");
+		const result = loadProjectSettingsFile(projectPath);
+		assert.equal(result.status, "loaded");
+		if (result.status !== "loaded") return;
+		const { settings, sources } = mergeSettings(validSettings(), result.overrides);
+		const issues = validateSettings(settings, AVAILABLE);
+		assert.deepEqual(issues.map((i) => i.field).sort(), ["maxReviewRounds", "steps.fix.model"]);
+		assert.equal(sources.maxReviewRounds, "project");
+		assert.equal(sources["steps.fix"], "project");
+	});
+
+	it("project-only save writes only the fields that differ from global", () => {
+		const global = validSettings();
+		saveSettingsFile(globalPath, global);
+		const draft = validSettings();
+		draft.steps.review = { model: "openai/gpt-5", thinking: "xhigh" };
+		draft.implementationRetries = 2;
+
+		const state = saveProjectOnly(projectPath, global, draft);
+		const raw = JSON.parse(readFileSync(projectPath, "utf-8"));
+		assert.deepEqual(raw, {
+			version: SETTINGS_VERSION,
+			steps: { review: { model: "openai/gpt-5", thinking: "xhigh" } },
+			implementationRetries: 2,
+		});
+		// Global file untouched
+		const globalLoaded = loadSettingsFile(globalPath);
+		assert.equal(globalLoaded.status, "loaded");
+		if (globalLoaded.status === "loaded") assert.deepEqual(globalLoaded.settings, global);
+
+		// Reload → merged = draft
+		const loaded = loadProjectSettingsFile(projectPath);
+		assert.equal(loaded.status, "loaded");
+		if (loaded.status === "loaded") assert.deepEqual(mergeSettings(global, loaded.overrides).settings, draft);
+		assert.deepEqual(mergeSettings(state.global, state.overrides).settings, draft);
+	});
+
+	it("project-only save drops overrides that now equal global and removes an empty file", () => {
+		const global = validSettings();
+		const draft = validSettings();
+		draft.maxReviewRounds = 6;
+		saveProjectOnly(projectPath, global, draft);
+		assert.ok(existsSync(projectPath));
+
+		const state = saveProjectOnly(projectPath, global, validSettings());
+		assert.deepEqual(state.overrides, {});
+		assert.equal(existsSync(projectPath), false);
+	});
+
+	it("global save updates the global file and prunes overrides of changed fields", () => {
+		const global = validSettings();
+		saveSettingsFile(globalPath, global);
+		const overrides = { steps: { review: { model: "openai/gpt-5", thinking: "high" } }, fixThreshold: "P0" };
+		saveProjectSettingsFile(projectPath, overrides);
+
+		const before = mergeSettings(global, overrides).settings;
+		const draft = structuredClone(before);
+		draft.fixThreshold = "P2";
+
+		const next = saveGlobally({ globalPath, projectPath }, { global, overrides }, before, draft);
+		const globalLoaded = loadSettingsFile(globalPath);
+		assert.equal(globalLoaded.status, "loaded");
+		if (globalLoaded.status === "loaded") {
+			assert.equal(globalLoaded.settings.fixThreshold, "P2");
+			assert.deepEqual(globalLoaded.settings.steps.review, global.steps.review);
+		}
+		const projectLoaded = loadProjectSettingsFile(projectPath);
+		assert.equal(projectLoaded.status, "loaded");
+		if (projectLoaded.status === "loaded") {
+			assert.equal(projectLoaded.overrides.fixThreshold, undefined);
+			assert.deepEqual(projectLoaded.overrides.steps, { review: { model: "openai/gpt-5", thinking: "high" } });
+		}
+		assert.deepEqual(mergeSettings(next.global, next.overrides).settings, draft);
+	});
+
+	it("global save without project file does not create one", () => {
+		const global = validSettings();
+		const draft = validSettings();
+		draft.maxReviewRounds = 8;
+		saveGlobally({ globalPath, projectPath }, { global, overrides: {} }, global, draft);
+		assert.equal(existsSync(projectPath), false);
+		const loaded = loadSettingsFile(globalPath);
+		assert.equal(loaded.status, "loaded");
+		if (loaded.status === "loaded") assert.equal(loaded.settings.maxReviewRounds, 8);
+	});
+
+	it("removing project overrides deletes the file and falls back to global", () => {
+		const global = validSettings();
+		saveProjectSettingsFile(projectPath, { maxReviewRounds: 9 });
+		assert.ok(existsSync(projectPath));
+
+		const state = removeProjectOverrides(projectPath, global);
+		assert.equal(existsSync(projectPath), false);
+		assert.equal(loadProjectSettingsFile(projectPath).status, "missing");
+		const { settings, sources } = mergeSettings(state.global, state.overrides);
+		assert.deepEqual(settings, global);
+		for (const field of OVERRIDE_FIELDS) assert.equal(sources[field], "global");
+
+		// Removing again is a no-op
+		assert.equal(removeProjectSettingsFile(projectPath), false);
 	});
 });
