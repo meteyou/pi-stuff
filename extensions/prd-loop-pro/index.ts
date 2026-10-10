@@ -60,7 +60,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { keyText, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
+import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
 import type { ThinkingLevel as AiThinkingLevel } from "@earendil-works/pi-ai";
 import type { PrdLoopProSettings, StepSetting } from "./settings.ts";
 import { findModel } from "./settings.ts";
@@ -2108,6 +2108,9 @@ async function runOrchestratorLoop(
 	let overlayDone: ((reason: "finished" | "user-abort") => void) | undefined;
 	let overlayRequestRender = () => {};
 	let overlayComponent: PrdLoopOverlayComponent | undefined;
+	let overlayHandle: OverlayHandle | undefined;
+	/** Closes the output viewer overlay (set while it is open). */
+	let closeViewer: (() => void) | undefined;
 	let widgetTimer: ReturnType<typeof setInterval> | undefined;
 
 	const requestOverlayRender = () => {
@@ -2117,6 +2120,25 @@ async function runOrchestratorLoop(
 		if (overlayClosed) return;
 		overlayClosed = true;
 		overlayDone?.(reason);
+	};
+
+	/**
+	 * Show a dialog (pause menu) while the loop overlay is temporarily hidden.
+	 * pi renders select dialogs in the editor area below overlays, so a visible
+	 * overlay would cover the dialog and keep looking busy. Hiding it moves the
+	 * input focus to the dialog; showing it again restores the focus.
+	 */
+	const withOverlayHidden = async <T>(dialog: () => Promise<T>): Promise<T> => {
+		// The output viewer is an overlay as well; close it so the dialog is visible.
+		closeViewer?.();
+		const handle = overlayClosed ? undefined : overlayHandle;
+		handle?.setHidden(true);
+		try {
+			return await dialog();
+		} finally {
+			if (handle && !overlayClosed) handle.setHidden(false);
+			requestOverlayRender();
+		}
 	};
 	const updateStatus = () => {
 		const currentTask = loopState.tasks[loopState.currentTaskIndex];
@@ -2139,13 +2161,21 @@ async function runOrchestratorLoop(
 			await ctx.ui.custom<void>(
 				(tui, theme, _kb, done) => {
 					const refreshTimer = setInterval(() => tui.requestRender(), 500);
-					const viewer = new SubagentOutputViewer(tui, theme, selectedTask, (reason) => {
+					let closed = false;
+					const close = () => {
+						if (closed) return;
+						closed = true;
 						clearInterval(refreshTimer);
+						closeViewer = undefined;
+						done();
+					};
+					closeViewer = close;
+					const viewer = new SubagentOutputViewer(tui, theme, selectedTask, (reason) => {
 						if (reason === "pause") {
 							pauseRequested = true;
 							currentAbortController.abort();
 						}
-						done();
+						close();
 					});
 					return viewer;
 				},
@@ -2196,6 +2226,9 @@ async function runOrchestratorLoop(
 		},
 		{
 			overlay: true,
+			onHandle: (handle) => {
+				overlayHandle = handle;
+			},
 			overlayOptions: {
 				anchor: "center",
 				width: "90%",
@@ -2431,15 +2464,17 @@ async function runOrchestratorLoop(
 		requestOverlayRender();
 		if (widgetTimer) clearInterval(widgetTimer);
 		try {
-			return await showPauseMenu(ctx, {
-				taskLabel: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
-				phase,
-				phaseLabel: taskState.phaseLabel ?? phase,
-				reason: options.reason,
-				reasonText,
-				errors: options.errors,
-				details: options.details,
-			});
+			return await withOverlayHidden(() =>
+				showPauseMenu(ctx, {
+					taskLabel: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+					phase,
+					phaseLabel: taskState.phaseLabel ?? phase,
+					reason: options.reason,
+					reasonText,
+					errors: options.errors,
+					details: options.details,
+				}),
+			);
 		} finally {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = setInterval(requestOverlayRender, 1000);
