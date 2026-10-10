@@ -16,10 +16,15 @@
  * 3. Load global settings (wizard on first start), merge per-field project
  *    overrides (`.pi/prd-loop-pro.json`) and validate
  * 4. Overview dialog: Confirm & start / Change (per-entry menu) / Cancel
- * 5. Orchestrator loop per task: Implement (prd-worker) → Review (prd-reviewer,
- *    one round) → Commit (prd-committer; failure or hook failure pauses the
- *    loop, hooks are never bypassed) → Report (`## Execution Report` in the
- *    task todo incl. created commits, close todo, update PRD Task Index)
+ * 5. Orchestrator loop per task: Implement (prd-worker) → Review-fix cycle
+ *    (./review-cycle.ts: fresh prd-reviewer per round, one fresh prd-fixer per
+ *    finding at/above the fix threshold, sequentially P0 first; re-review only
+ *    if something was fixed; rejected findings + reasons go into the next
+ *    review prompt; round limit → pause menu) → Commit (prd-committer; failure
+ *    or hook failure pauses the loop, hooks are never bypassed) → Report
+ *    (`## Execution Report` in the task todo incl. rounds, fixed, rejected,
+ *    deferred, unresolved findings and created commits, close todo, update
+ *    PRD Task Index)
  */
 
 import { spawn } from "node:child_process";
@@ -37,6 +42,7 @@ import { findModel } from "./settings.ts";
 import { resolveStartSettings } from "./settings-ui.ts";
 import {
 	COMMITTER_RESULT_SCHEMA,
+	FIXER_RESULT_SCHEMA,
 	parseSubagentResult,
 	rawSnippet,
 	REVIEWER_RESULT_SCHEMA,
@@ -50,8 +56,21 @@ import type {
 	ReviewFinding,
 	WorkerResult,
 } from "./subagent-result.ts";
-import { appendSection, buildExecutionReport } from "./execution-report.ts";
-import type { CommitRef, CostPhase, ExecutionRecord, UnresolvedFinding } from "./execution-report.ts";
+import { appendSection, buildExecutionReport, formatLocation } from "./execution-report.ts";
+import type { CommitRef, CostPhase, ExecutionRecord, RejectedFinding } from "./execution-report.ts";
+import {
+	applyFixOutcome,
+	applyReview,
+	commitAsIs,
+	createReviewCycle,
+	cycleCounts,
+	extendRoundLimit,
+	nextStep,
+	rejectedForNextReview,
+	reportFields,
+} from "./review-cycle.ts";
+import type { CycleStep, FixOutcome, ReviewCycleState } from "./review-cycle.ts";
+import { buildFixerPrompt } from "./fixer-prompt.ts";
 import { buildReviewerPrompt, filterReviewableStatus, REVIEW_EXCLUDED_DIR, REVIEW_PATHSPEC } from "./reviewer-prompt.ts";
 import { buildCommitterPrompt, loadCommitRules } from "./committer-prompt.ts";
 import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
@@ -1284,7 +1303,7 @@ function extractShortTitle(title: string): string {
 type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
 
 /** Pipeline phase of a task (shown in the overlay while the task is active). */
-type TaskPhase = "Implement" | "Review" | "Commit";
+type TaskPhase = "Implement" | "Review" | "Fix" | "Commit";
 
 interface LoopTaskState {
 	id: string;
@@ -1293,6 +1312,8 @@ interface LoopTaskState {
 	status: TaskStatus;
 	/** Current pipeline phase (while running/retrying). */
 	phase?: TaskPhase;
+	/** Display label of the current phase incl. round progress (e.g. "Review 2/3", "Fix 2/4 [P1] Title"). */
+	phaseLabel?: string;
 	/** One-line review outcome (verdict + counts), once the review ran. */
 	reviewInfo?: string;
 	startTime?: number;
@@ -1357,6 +1378,12 @@ function taskStatusColor(status: TaskStatus): "accent" | "dim" | "error" | "succ
 /** True while a task is being worked on (phase is meaningful). */
 function isTaskActive(task: LoopTaskState): boolean {
 	return task.status === "running" || task.status === "retrying";
+}
+
+/** Phase label of an active task (incl. round progress), or undefined. */
+function activePhaseLabel(task: LoopTaskState): string | undefined {
+	if (!isTaskActive(task)) return undefined;
+	return task.phaseLabel ?? task.phase;
 }
 
 function padAnsi(text: string, width: number): string {
@@ -1573,7 +1600,7 @@ class PrdLoopOverlayComponent {
 			if (task.cost > 0) meta.push(`$${task.cost.toFixed(2)}`);
 			if (task.retries > 0) meta.push(`${task.retries} retry${task.retries === 1 ? "" : "s"}`);
 			const metaText = meta.length > 0 ? this.theme.fg("dim", ` • ${meta.join(" • ")}`) : "";
-			const activePhase = isTaskActive(task) ? task.phase : undefined;
+			const activePhase = activePhaseLabel(task);
 			const phaseText = activePhase ? this.theme.fg("accent", ` • ${activePhase}`) : "";
 
 			rows.push({
@@ -1888,7 +1915,8 @@ class SubagentOutputViewer {
 		const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
 		const eventCount = `${task.outputEvents.length} events`;
 
-		const phase = isTaskActive(task) && task.phase ? ` • ${task.phase}` : "";
+		const phaseLabel = activePhaseLabel(task);
+		const phase = phaseLabel ? ` • ${phaseLabel}` : "";
 		const line =
 			theme.fg("accent", `${icon} ${task.status}${phase}`) +
 			theme.fg("muted", " • ") +
@@ -1962,6 +1990,69 @@ async function showPauseMenu(
 	return index === -1 ? actions[0]! : actions[index]!;
 }
 
+type RoundLimitAction = "one-more-round" | "commit-as-is" | "skip" | "abort";
+
+/** Maximum number of open findings listed in the round-limit menu title. */
+const ROUND_LIMIT_MAX_LISTED_FINDINGS = 12;
+
+/** One line per open finding: `[P1] file:line — title`. */
+export function formatOpenFindingLine(finding: ReviewFinding): string {
+	const location = formatLocation(finding) || "(no file)";
+	const title = finding.title.replace(/\s+/g, " ").trim() || "(untitled)";
+	return `[${finding.priority}] ${location} — ${title}`;
+}
+
+/**
+ * Pause menu shown when the review round limit is reached with open findings
+ * at/above the fix threshold. Lists the open findings (priority, file:line,
+ * title). Cancelling the dialog shows it again (every option has a cost or
+ * consequence, so none is chosen implicitly).
+ */
+async function showRoundLimitMenu(
+	ctx: ExtensionCommandContext,
+	task: TaskInfo,
+	step: Extract<CycleStep, { kind: "pause" }>,
+): Promise<RoundLimitAction> {
+	const count = step.openFindings.length;
+	const listed = step.openFindings.slice(0, ROUND_LIMIT_MAX_LISTED_FINDINGS);
+	const titleLines = [
+		`⏸️  Review round limit reached (${step.round}/${step.roundLimit}) — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+		"",
+		`${count} open finding${count === 1 ? "" : "s"} at/above the fix threshold:`,
+		...listed.map((finding) => `  ${formatOpenFindingLine(finding)}`),
+	];
+	if (count > listed.length) titleLines.push(`  … and ${count - listed.length} more`);
+
+	const actions: RoundLimitAction[] = ["one-more-round", "commit-as-is", "skip", "abort"];
+	const labels: Record<RoundLimitAction, string> = {
+		"one-more-round": "🔁 One more round — fix the open findings and review again",
+		"commit-as-is": "✅ Commit as-is & close task — open findings go into the report",
+		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
+		abort: "❌ Abort loop — stop and keep changes on disk",
+	};
+	const menu = actions.map((action) => labels[action]);
+
+	while (true) {
+		const choice = await ctx.ui.select(titleLines.join("\n"), menu);
+		const index = choice === undefined ? -1 : menu.indexOf(choice);
+		if (index !== -1) return actions[index]!;
+	}
+}
+
+/** One-line review-fix cycle status for the task details. */
+function formatCycleInfo(cycle: ReviewCycleState): string {
+	const counts = cycleCounts(cycle);
+	const last = cycle.rounds.at(-1);
+	const parts = [`round ${counts.round}/${counts.roundLimit}`];
+	if (last) parts.push(last.verdict);
+	parts.push(
+		`${counts.fixed} fixed, ${counts.rejected} rejected, ${counts.deferred} deferred, ${counts.unresolved} unresolved`,
+	);
+	const callouts = cycle.callouts.length;
+	if (callouts > 0) parts.push(`${callouts} callout${callouts === 1 ? "" : "s"}`);
+	return parts.join(" • ");
+}
+
 // --- Git helpers ---
 
 /** Current HEAD commit SHA, or null if the repository has no commits yet. */
@@ -2008,13 +2099,6 @@ async function listExcludedFilesCommittedSince(pi: ExtensionAPI, cwd: string, be
 	return [...new Set(result.stdout.split("\n").map((line) => line.trim()).filter(Boolean))];
 }
 
-const PRIORITY_ORDER: readonly FindingPriority[] = ["P0", "P1", "P2", "P3"];
-
-/** True if `priority` is at or above (i.e. as severe as or more severe than) `threshold`. */
-function meetsFixThreshold(priority: FindingPriority, threshold: FindingPriority): boolean {
-	return PRIORITY_ORDER.indexOf(priority) <= PRIORITY_ORDER.indexOf(threshold);
-}
-
 // --- Orchestrator loop ---
 
 /**
@@ -2037,6 +2121,7 @@ async function runOrchestratorLoop(
 ): Promise<void> {
 	const agent = await loadPrdWorkerAgent(EXTENSION_DIR);
 	const reviewerAgent = await loadAgent(EXTENSION_DIR, "prd-reviewer");
+	const fixerAgent = await loadAgent(EXTENSION_DIR, "prd-fixer");
 	const committerAgent = await loadAgent(EXTENSION_DIR, "prd-committer");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
@@ -2119,7 +2204,8 @@ async function runOrchestratorLoop(
 	};
 	const updateStatus = () => {
 		const currentTask = loopState.tasks[loopState.currentTaskIndex];
-		const phaseText = currentTask && isTaskActive(currentTask) && currentTask.phase ? ` [${currentTask.phase}]` : "";
+		const currentPhase = currentTask ? activePhaseLabel(currentTask) : undefined;
+		const phaseText = currentPhase ? ` [${currentPhase}]` : "";
 		const statusText = currentTask
 			? `Ralph Pro: ${currentTask.sequenceLabel} ${extractShortTitle(currentTask.title)}${phaseText}`
 			: "Ralph Pro running";
@@ -2211,8 +2297,9 @@ async function runOrchestratorLoop(
 	// --- Pipeline helpers ---
 
 	/** Switch a task to a new pipeline phase (resets the live activity). */
-	const setPhase = (taskState: LoopTaskState, phase: TaskPhase) => {
+	const setPhase = (taskState: LoopTaskState, phase: TaskPhase, label?: string) => {
 		taskState.phase = phase;
+		taskState.phaseLabel = label;
 		taskState.currentActivity = undefined;
 		taskState.currentTurn = 0;
 		updateStatus();
@@ -2337,6 +2424,7 @@ async function runOrchestratorLoop(
 		task: TaskInfo,
 		taskState: LoopTaskState,
 		phaseCosts: Partial<Record<CostPhase, number>>,
+		options: { round: number; rejectedFindings: RejectedFinding[] },
 	): Promise<ReviewPhaseOutcome> => {
 		const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
 		if (status.code !== 0) {
@@ -2350,6 +2438,8 @@ async function runOrchestratorLoop(
 			taskBody: task.body,
 			changedFiles,
 			projectGuidelines: await loadProjectReviewGuidelines(ctx.cwd),
+			rejectedFindings: options.rejectedFindings,
+			round: options.round,
 		});
 
 		while (true) {
@@ -2398,6 +2488,96 @@ async function runOrchestratorLoop(
 			if (aborted) return { kind: "aborted" };
 			if (!parsed.ok) return { kind: "failed", error: parsed.error };
 			return { kind: "reviewed", review: parsed.value };
+		}
+	};
+
+	type FixPhaseOutcome =
+		| { kind: "result"; outcome: FixOutcome }
+		| { kind: "skipped" }
+		| { kind: "released" }
+		| { kind: "aborted" };
+
+	/**
+	 * Fix phase for exactly one finding: a fresh prd-fixer subagent (fix
+	 * model/thinking) gets the task title/body and the finding, fixes it (and
+	 * runs the relevant checks) or rejects it with a reason. A crashed fixer or
+	 * an unparseable result (even after JSON repair) counts the finding as
+	 * unresolved — it never stops the loop.
+	 */
+	const runFixPhase = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+		step: Extract<CycleStep, { kind: "fix" }>,
+	): Promise<FixPhaseOutcome> => {
+		const prompt = buildFixerPrompt({
+			taskTitle: task.title,
+			taskBody: task.body,
+			finding: step.finding,
+			round: step.round,
+			prdId,
+		});
+
+		while (true) {
+			if (aborted) return { kind: "aborted" };
+
+			const run = await spawnSubagent({
+				taskPrompt: prompt,
+				model: settings.steps.fix.model,
+				thinkingLevel: settings.steps.fix.thinking,
+				cwd: ctx.cwd,
+				agent: fixerAgent,
+				signal: currentAbortController.signal,
+				onActivity: createActivityHandler(taskState),
+			});
+			const parsed = await parseRunResult(run, FIXER_RESULT_SCHEMA, createRepairFactory(taskState));
+			addCost(taskState, phaseCosts, "fix", parsed.usage.cost);
+
+			if (pauseRequested) {
+				pauseRequested = false;
+				if (widgetTimer) clearInterval(widgetTimer);
+				const pauseAction = await showPauseMenu(ctx, task, {
+					phase: "Fix",
+					actions: ["resume", "release", "skip", "abort"],
+				});
+				widgetTimer = setInterval(requestOverlayRender, 1000);
+
+				switch (pauseAction) {
+					case "release":
+						return { kind: "released" };
+					case "skip":
+						await skipTask(task, taskState);
+						requestOverlayRender();
+						return { kind: "skipped" };
+					case "abort":
+						aborted = true;
+						return { kind: "aborted" };
+					default:
+						currentAbortController = new AbortController();
+						taskState.currentActivity = "▶ restarting fix…";
+						requestOverlayRender();
+						continue;
+				}
+			}
+
+			if (aborted) return { kind: "aborted" };
+
+			if (!parsed.ok) {
+				const what = parsed.status === "invalid-result" ? "returned no valid result" : parsed.status === "aborted" ? "was aborted" : "crashed";
+				return {
+					kind: "result",
+					outcome: { status: "unresolved", reason: `Fixer ${what}: ${truncateStr(parsed.error, 300)}` },
+				};
+			}
+
+			const value = parsed.value;
+			if (value.status === "fixed") {
+				const summary = [value.summary || value.reason, value.verification ? `Verification: ${value.verification}` : ""]
+					.filter((part) => part.trim())
+					.join(" — ");
+				return { kind: "result", outcome: { status: "fixed", summary, verification: value.verification } };
+			}
+			return { kind: "result", outcome: { status: "rejected", reason: value.reason || value.summary, summary: value.summary } };
 		}
 	};
 
@@ -2720,48 +2900,123 @@ Errors: ${result.errors.join("; ")}`,
 				const implementerSummary = result?.summary ?? "";
 				taskState.summary = implementerSummary;
 
-				// --- Review phase (one round; findings are recorded, not fixed yet) ---
-				setPhase(taskState, "Review");
-				const reviewOutcome = await runReviewPhase(task, taskState, phaseCosts);
+				// --- Review-fix cycle (see ./review-cycle.ts) ---
+				let cycle: ReviewCycleState = createReviewCycle({
+					fixThreshold: settings.fixThreshold as FindingPriority,
+					maxReviewRounds: settings.maxReviewRounds,
+				});
+				let reviewNote: string | undefined;
+				let cycleExit: "commit" | "skipped" | "released" | "aborted" | "failed" = "commit";
+				let cycleError = "";
+				const updateCycleInfo = () => {
+					taskState.reviewInfo = formatCycleInfo(cycle);
+					requestOverlayRender();
+				};
 
-				if (reviewOutcome.kind === "released") return releasedResult();
-				if (reviewOutcome.kind === "skipped") continue;
-				if (reviewOutcome.kind === "aborted" || aborted) {
+				cycleLoop: while (true) {
+					if (aborted) {
+						cycleExit = "aborted";
+						break;
+					}
+					const step = nextStep(cycle);
+
+					if (step.kind === "commit") break;
+
+					if (step.kind === "review") {
+						setPhase(taskState, "Review", `Review ${step.round}/${step.roundLimit}`);
+						const reviewOutcome = await runReviewPhase(task, taskState, phaseCosts, {
+							round: step.round,
+							rejectedFindings: rejectedForNextReview(cycle),
+						});
+						switch (reviewOutcome.kind) {
+							case "reviewed":
+								cycle = applyReview(cycle, reviewOutcome.review);
+								updateCycleInfo();
+								continue cycleLoop;
+							case "no-changes":
+								reviewNote = step.round === 1
+									? "No changes outside .pi/ — review skipped."
+									: `No changes outside .pi/ left for review round ${step.round} — review skipped.`;
+								if (step.round === 1) taskState.reviewInfo = "skipped (no changes outside .pi/)";
+								break cycleLoop;
+							case "failed":
+								cycleExit = "failed";
+								cycleError = reviewOutcome.error;
+								break cycleLoop;
+							default:
+								cycleExit = reviewOutcome.kind;
+								break cycleLoop;
+						}
+					}
+
+					if (step.kind === "fix") {
+						const findingTitle = step.finding.title.replace(/\s+/g, " ").trim();
+						setPhase(taskState, "Fix", `Fix ${step.index}/${step.total} [${step.finding.priority}] ${findingTitle}`);
+						const fixOutcome = await runFixPhase(task, taskState, phaseCosts, step);
+						if (fixOutcome.kind === "result") {
+							cycle = applyFixOutcome(cycle, fixOutcome.outcome);
+							updateCycleInfo();
+							continue;
+						}
+						cycleExit = fixOutcome.kind;
+						break;
+					}
+
+					// --- Pause: round limit reached with open findings ---
+					taskState.phaseLabel = `Review ${step.round}/${step.roundLimit} — round limit`;
+					taskState.currentActivity = `⏸ round limit reached (${step.openFindings.length} open)`;
+					requestOverlayRender();
+					if (widgetTimer) clearInterval(widgetTimer);
+					const roundLimitAction = await showRoundLimitMenu(ctx, task, step);
+					widgetTimer = setInterval(requestOverlayRender, 1000);
+
+					switch (roundLimitAction) {
+						case "one-more-round":
+							cycle = extendRoundLimit(cycle);
+							taskState.currentActivity = undefined;
+							updateCycleInfo();
+							continue;
+						case "commit-as-is":
+							cycle = commitAsIs(cycle);
+							taskState.currentActivity = undefined;
+							updateCycleInfo();
+							continue;
+						case "skip":
+							await skipTask(task, taskState, "Skipped at the review round limit.");
+							requestOverlayRender();
+							cycleExit = "skipped";
+							break cycleLoop;
+						case "abort":
+							aborted = true;
+							cycleExit = "aborted";
+							break cycleLoop;
+					}
+				}
+
+				if (cycleExit === "released") return releasedResult();
+				if (cycleExit === "skipped") continue;
+				if (cycleExit === "aborted" || aborted) {
 					aborted = true;
 					taskState.status = "aborted";
-					taskState.summary = "Task execution was cancelled during review.";
+					taskState.summary = "Task execution was cancelled during the review-fix cycle.";
 					taskState.endTime = Date.now();
 					break;
 				}
-				if (reviewOutcome.kind === "failed") {
+				if (cycleExit === "failed") {
 					taskState.status = "failed";
-					taskState.errors = [reviewOutcome.error];
+					taskState.errors = [cycleError];
 					taskState.endTime = Date.now();
 					requestOverlayRender();
 					return {
 						outcome: "failed",
 						notification: {
 							message:
-								`❌ Review failed: ${task.title}\n${reviewOutcome.error}\n` +
+								`❌ Review failed: ${task.title}\n${cycleError}\n` +
 								"Uncommitted changes left on disk. Commit or discard them, then re-run /prd-loop-pro.",
 							level: "error",
 						},
 					};
 				}
-
-				const review = reviewOutcome.kind === "reviewed" ? reviewOutcome.review : undefined;
-				const threshold = settings.fixThreshold as FindingPriority;
-				const reviewFindings: ReviewFinding[] = review?.findings ?? [];
-				const unresolved: UnresolvedFinding[] = reviewFindings
-					.filter((finding) => meetsFixThreshold(finding.priority, threshold))
-					.map((finding) => ({ finding, reason: "Not fixed (no fix phase yet)", round: 1 }));
-				const deferred = reviewFindings.filter((finding) => !meetsFixThreshold(finding.priority, threshold));
-				taskState.reviewInfo = review
-					? `${review.verdict} • ${reviewFindings.length} finding${reviewFindings.length === 1 ? "" : "s"}` +
-						` (${unresolved.length} ≥ threshold, ${deferred.length} deferred)` +
-						` • ${review.callouts.length} callout${review.callouts.length === 1 ? "" : "s"}`
-					: "skipped (no changes outside .pi/)";
-				requestOverlayRender();
 
 				// --- Commit phase ---
 				setPhase(taskState, "Commit");
@@ -2784,15 +3039,8 @@ Errors: ${result.errors.join("; ")}`,
 				// --- Report: append execution report, close todo, update PRD Task Index ---
 				const record: ExecutionRecord = {
 					implementerSummary,
-					reviewRounds: review ? 1 : 0,
-					finalVerdict: review?.verdict,
-					reviewSummary: review?.summary,
-					reviewNote: review ? undefined : "No changes outside .pi/ — review skipped.",
-					fixed: [],
-					rejected: [],
-					deferred,
-					unresolved,
-					callouts: review?.callouts ?? [],
+					...reportFields(cycle),
+					reviewNote,
 					commits,
 					cost: phaseCosts,
 				};
