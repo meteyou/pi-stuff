@@ -85,6 +85,14 @@ describe("phase groups", () => {
 		assert.equal(countPhaseEvents(groups), 3);
 	});
 
+	it("records the model a subagent run was started with", () => {
+		const groups: PhaseOutputGroup[] = [];
+		startPhaseGroup(groups, { phase: "fix", round: 1, count: 2 }, { now: 0, model: "anthropic/claude · high" });
+		startPhaseGroup(groups, { phase: "review", round: 2 }, { now: 10 });
+		assert.equal(groups[0]!.model, "anthropic/claude · high");
+		assert.equal("model" in groups[1]!, false);
+	});
+
 	it("creates a fallback group for activity without a phase", () => {
 		const groups: PhaseOutputGroup[] = [];
 		appendPhaseEvent(groups, { type: "tool_start", toolName: "ls", turn: 1 }, 5);

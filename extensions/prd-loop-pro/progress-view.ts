@@ -98,6 +98,8 @@ export interface PhaseOutputGroup {
 	header: string;
 	startTime: number;
 	endTime?: number;
+	/** Model + thinking level the subagent was started with (e.g. `anthropic/claude-sonnet · high`). */
+	model?: string;
 	events: OutputEvent[];
 	/** Cost of this run (incl. JSON repair), once known. */
 	cost?: number;
@@ -145,12 +147,13 @@ export function phaseHeader(ref: PhaseRef, note?: string): string {
 export function startPhaseGroup(
 	groups: PhaseOutputGroup[],
 	ref: PhaseRef,
-	options: { note?: string; now?: number } = {},
+	options: { note?: string; model?: string; now?: number } = {},
 ): PhaseOutputGroup {
 	const now = options.now ?? Date.now();
 	const previous = groups.at(-1);
 	if (previous && previous.endTime === undefined) previous.endTime = now;
 	const group: PhaseOutputGroup = { phase: ref.phase, header: phaseHeader(ref, options.note), startTime: now, events: [] };
+	if (options.model) group.model = options.model;
 	groups.push(group);
 	return group;
 }
