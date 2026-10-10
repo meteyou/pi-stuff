@@ -644,15 +644,20 @@ export async function spawnSubagent(options: {
 				}
 			};
 
-			proc.stdout.on("data", (data: Buffer) => {
-				buffer += data.toString();
+			// Decode as a UTF-8 stream: multi-byte characters split across chunk
+			// boundaries must not turn into U+FFFD (e.g. umlauts in the final JSON).
+			proc.stdout.setEncoding("utf8");
+			proc.stderr.setEncoding("utf8");
+
+			proc.stdout.on("data", (data: string) => {
+				buffer += data;
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
 			});
 
-			proc.stderr.on("data", (data: Buffer) => {
-				stderr += data.toString();
+			proc.stderr.on("data", (data: string) => {
+				stderr += data;
 			});
 
 			proc.on("close", (code: number | null) => {
