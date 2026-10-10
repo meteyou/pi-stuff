@@ -488,10 +488,10 @@ async function runChangeMenu(
 	const before = mergeSettings(state.global, state.overrides);
 	const draft = cloneSettings(before.settings);
 
-	const SAVE_GLOBAL = "💾 Save globally";
-	const SAVE_PROJECT = "📁 Save for this project only";
-	const REMOVE_PROJECT = "🧹 Remove project overrides";
-	const BACK = "🔙 Back to overview (discard changes)";
+	const SAVE_GLOBAL = "Save globally";
+	const SAVE_PROJECT = "Save for this project only";
+	const REMOVE_PROJECT = "Remove project overrides";
+	const BACK = "Back to overview (discard changes)";
 
 	while (true) {
 		const issues = validateSettings(draft, catalog.available, { knownModels: catalog.all });

@@ -148,10 +148,10 @@ option, so steps can mix providers. Save actions:
 
 | Action | Effect |
 |--------|--------|
-| 💾 Save globally | Writes the edited values to the global file |
-| 📁 Save for this project only | Writes only the fields that differ from global to `.pi/prd-loop-pro.json` (removes the file if nothing differs) |
-| 🧹 Remove project overrides | Deletes the project file; the project uses the global settings again (only shown if overrides exist or the file is invalid) |
-| 🔙 Back to overview | Discards unsaved changes (with confirmation) |
+| Save globally | Writes the edited values to the global file |
+| Save for this project only | Writes only the fields that differ from global to `.pi/prd-loop-pro.json` (removes the file if nothing differs) |
+| Remove project overrides | Deletes the project file; the project uses the global settings again (only shown if overrides exist or the file is invalid) |
+| Back to overview | Discards unsaved changes (with confirmation) |
 
 ## Fix Threshold & Round Limit
 
@@ -208,10 +208,10 @@ open findings manually (or with the main agent), then run `/prd-loop-pro` again.
 
 | Option | Effect |
 |--------|--------|
-| 📝 Commit changes (committer) & close | Runs only the commit phase on the current changes, then report + close |
-| ✅ Already committed – just close | Appends an execution report, closes the task and updates the PRD Task Index |
-| 🔍 Review again | Runs the review-fix cycle on the current changes, then commit + close |
-| 💤 Not now | Leaves the task as `needs-human` |
+| Commit changes (committer) & close | Runs only the commit phase on the current changes, then report + close |
+| Already committed – just close | Appends an execution report, closes the task and updates the PRD Task Index |
+| Review again | Runs the review-fix cycle on the current changes, then commit + close |
+| Not now | Leaves the task as `needs-human` |
 
 The git clean check allows uncommitted changes while a `needs-human` task is being resolved. Afterwards the loop
 continues with the next task of the PRD.

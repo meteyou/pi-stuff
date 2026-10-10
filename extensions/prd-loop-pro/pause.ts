@@ -85,7 +85,7 @@ export const PAUSE_MAX_LISTED_ERRORS = 5;
 export const PAUSE_MAX_ERROR_LENGTH = 300;
 
 /** Label of the "Release" option (shared by all pause menus). */
-export const RELEASE_LABEL = "🔧 Release (fix manually) — mark task needs-human, stop the loop, resolve at next start";
+export const RELEASE_LABEL = "Release (fix manually) — mark task needs-human, stop the loop, resolve at next start";
 
 /** Actions offered for a pause reason in a phase. */
 export function pauseActions(reason: PauseReasonKind, phase: PausePhase): PauseAction[] {
@@ -134,34 +134,34 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 	switch (action) {
 		case "resume":
 			switch (phase) {
-				case "Implement": return "🟢 Resume current phase — keep changes, continue the implementation where it left off";
-				case "Review": return "🟢 Resume current phase — keep changes, restart the review";
-				case "Fix": return "🟢 Resume current phase — keep changes, restart the fix of this finding";
-				case "Commit": return "🟢 Resume current phase — keep changes, run the committer again";
+				case "Implement": return "Resume current phase — keep changes, continue the implementation where it left off";
+				case "Review": return "Resume current phase — keep changes, restart the review";
+				case "Fix": return "Resume current phase — keep changes, restart the fix of this finding";
+				case "Commit": return "Resume current phase — keep changes, run the committer again";
 			}
 			break;
 		case "skip-phase":
 			switch (phase) {
-				case "Implement": return "⏩ Skip phase — keep changes, continue with the review";
-				case "Review": return "⏩ Skip phase — skip the review, continue with the commit";
-				case "Fix": return "⏩ Skip phase — leave this finding unresolved, continue with the next step";
-				case "Commit": return "⏩ Skip phase";
+				case "Implement": return "Skip phase — keep changes, continue with the review";
+				case "Review": return "Skip phase — skip the review, continue with the commit";
+				case "Fix": return "Skip phase — leave this finding unresolved, continue with the next step";
+				case "Commit": return "Skip phase";
 			}
 			break;
 		case "retry-phase":
-			return `🔁 Retry phase — keep changes, run the ${phaseAgentName(phase)} again`;
+			return `Retry phase — keep changes, run the ${phaseAgentName(phase)} again`;
 		case "retry-task":
-			return "🔄 Retry task — discard changes (except .pi/), restart at implement";
+			return "Retry task — discard changes (except .pi/), restart at implement";
 		case "one-more-round":
-			return "🔁 One more round — fix the open findings and review again";
+			return "One more round — fix the open findings and review again";
 		case "commit-as-is":
-			return "✅ Commit as-is & close task — open findings go into the report";
+			return "Commit as-is & close task — open findings go into the report";
 		case "release":
 			return RELEASE_LABEL;
 		case "skip-task":
-			return "🚮 Skip task — discard changes (except .pi/), mark done, continue with next";
+			return "Skip task — discard changes (except .pi/), mark done, continue with next";
 		case "abort":
-			return "❌ Abort loop — stop and keep changes on disk";
+			return "Abort loop — stop and keep changes on disk";
 	}
 	return action;
 }

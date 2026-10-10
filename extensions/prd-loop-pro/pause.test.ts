@@ -83,7 +83,7 @@ describe("pauseActions", () => {
 
 describe("pauseActionLabel", () => {
 	it("labels the manual pause options as specified", () => {
-		assert.match(pauseActionLabel("resume", "Review"), /^🟢 Resume current phase/);
+		assert.match(pauseActionLabel("resume", "Review"), /^Resume current phase/);
 		assert.match(pauseActionLabel("skip-phase", "Fix"), /Skip phase/);
 		assert.match(pauseActionLabel("retry-task", "Fix"), /Retry task — discard changes \(except \.pi\/\), restart at implement/);
 		assert.equal(pauseActionLabel("release", "Implement"), RELEASE_LABEL);
