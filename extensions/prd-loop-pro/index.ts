@@ -14,7 +14,9 @@
  * 3. Load global settings (wizard on first start), merge per-field project
  *    overrides (`.pi/prd-loop-pro.json`) and validate
  * 4. Overview dialog: Confirm & start / Change (per-entry menu) / Cancel
- * 5. Orchestrator loop: resolve tasks → spawn subagents → commit → update todos
+ * 5. Orchestrator loop per task: Implement (prd-worker) → Review (prd-reviewer,
+ *    one round) → Commit (prd-committer) → Report (`## Execution Report` in the
+ *    task todo, close todo, update PRD Task Index)
  */
 
 import { spawn } from "node:child_process";
@@ -34,9 +36,21 @@ import {
 	COMMITTER_RESULT_SCHEMA,
 	parseSubagentResult,
 	rawSnippet,
+	REVIEWER_RESULT_SCHEMA,
 	WORKER_RESULT_SCHEMA,
 } from "./subagent-result.ts";
-import type { RepairFunction, ResultSchema, WorkerResult } from "./subagent-result.ts";
+import type {
+	FindingPriority,
+	RepairFunction,
+	ResultSchema,
+	ReviewerResult,
+	ReviewFinding,
+	WorkerResult,
+} from "./subagent-result.ts";
+import { appendSection, buildExecutionReport } from "./execution-report.ts";
+import type { CommitRef, CostPhase, ExecutionRecord, UnresolvedFinding } from "./execution-report.ts";
+import { buildReviewerPrompt, filterReviewableStatus, REVIEW_PATHSPEC } from "./reviewer-prompt.ts";
+import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -350,16 +364,24 @@ function loadAgentDefinition(filePath: string, content: string): AgentDefinition
 }
 
 /**
- * Load the prd-worker agent definition from the extension's agents/ directory.
+ * Load an agent definition (e.g. "prd-worker", "prd-reviewer") from the
+ * extension's agents/ directory.
  */
-async function loadPrdWorkerAgent(extensionDir: string): Promise<AgentDefinition> {
-	const agentPath = join(extensionDir, "agents", "prd-worker.md");
+async function loadAgent(extensionDir: string, name: string): Promise<AgentDefinition> {
+	const agentPath = join(extensionDir, "agents", `${name}.md`);
 	const content = await readFile(agentPath, "utf-8");
 	const agent = loadAgentDefinition(agentPath, content);
 	if (!agent) {
-		throw new Error(`Failed to parse prd-worker agent at ${agentPath}`);
+		throw new Error(`Failed to parse ${name} agent at ${agentPath}`);
 	}
 	return agent;
+}
+
+/**
+ * Load the prd-worker agent definition from the extension's agents/ directory.
+ */
+async function loadPrdWorkerAgent(extensionDir: string): Promise<AgentDefinition> {
+	return loadAgent(extensionDir, "prd-worker");
 }
 
 /**
@@ -1292,11 +1314,18 @@ function deriveCommitScopeFromTitle(shortTitle: string, fallbackScope: string): 
 
 type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
 
+/** Pipeline phase of a task (shown in the overlay while the task is active). */
+type TaskPhase = "Implement" | "Review" | "Commit";
+
 interface LoopTaskState {
 	id: string;
 	title: string;
 	sequenceLabel: string;
 	status: TaskStatus;
+	/** Current pipeline phase (while running/retrying). */
+	phase?: TaskPhase;
+	/** One-line review outcome (verdict + counts), once the review ran. */
+	reviewInfo?: string;
 	startTime?: number;
 	endTime?: number;
 	cost: number;
@@ -1354,6 +1383,11 @@ function taskStatusColor(status: TaskStatus): "accent" | "dim" | "error" | "succ
 		case "retrying": return "warning";
 		case "aborted": return "warning";
 	}
+}
+
+/** True while a task is being worked on (phase is meaningful). */
+function isTaskActive(task: LoopTaskState): boolean {
+	return task.status === "running" || task.status === "retrying";
 }
 
 function padAnsi(text: string, width: number): string {
@@ -1570,11 +1604,13 @@ class PrdLoopOverlayComponent {
 			if (task.cost > 0) meta.push(`$${task.cost.toFixed(2)}`);
 			if (task.retries > 0) meta.push(`${task.retries} retry${task.retries === 1 ? "" : "s"}`);
 			const metaText = meta.length > 0 ? this.theme.fg("dim", ` • ${meta.join(" • ")}`) : "";
+			const activePhase = isTaskActive(task) ? task.phase : undefined;
+			const phaseText = activePhase ? this.theme.fg("accent", ` • ${activePhase}`) : "";
 
 			rows.push({
 				taskIndex: i,
 				kind: "header",
-				text: truncateToWidth(`${prefix} ${disclosure} ${icon} ${title}${metaText}`, width),
+				text: truncateToWidth(`${prefix} ${disclosure} ${icon} ${title}${phaseText}${metaText}`, width),
 			});
 
 			if (!isExpanded) continue;
@@ -1585,8 +1621,19 @@ class PrdLoopOverlayComponent {
 			rows.push({
 				taskIndex: i,
 				kind: "detail",
-				text: truncateToWidth(this.theme.fg("dim", `    Status: ${task.status}${attemptText}`), width),
+				text: truncateToWidth(
+					this.theme.fg("dim", `    Status: ${task.status}${activePhase ? ` • ${activePhase}` : ""}${attemptText}`),
+					width,
+				),
 			});
+
+			if (task.reviewInfo) {
+				rows.push({
+					taskIndex: i,
+					kind: "detail",
+					text: truncateToWidth(this.theme.fg("muted", `    Review: ${task.reviewInfo}`), width),
+				});
+			}
 
 			if ((task.status === "running" || task.status === "retrying") && task.currentActivity) {
 				const turnText = task.currentTurn > 0 ? ` [T${task.currentTurn}]` : "";
@@ -1872,8 +1919,9 @@ class SubagentOutputViewer {
 		const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
 		const eventCount = `${task.outputEvents.length} events`;
 
+		const phase = isTaskActive(task) && task.phase ? ` • ${task.phase}` : "";
 		const line =
-			theme.fg("accent", `${icon} ${task.status}`) +
+			theme.fg("accent", `${icon} ${task.status}${phase}`) +
 			theme.fg("muted", " • ") +
 			theme.fg("muted", elapsed) +
 			(turnInfo ? theme.fg("muted", ` • ${turnInfo}`) : "") +
@@ -1915,28 +1963,31 @@ type PauseAction = "resume" | "release" | "retry" | "skip" | "abort";
 /**
  * Show an interactive pause menu after Ctrl+C interrupts a running subagent.
  */
-async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Promise<PauseAction> {
-	const options = [
-		"▶️  Resume — keep changes, continue where it left off",
-		"🔧 Release session — fix manually, re-run /prd-loop-pro to continue",
-		"🔄 Retry task — discard changes, try again from scratch",
-		"⏭️  Skip task — discard changes, mark done, continue with next",
-		"❌ Abort loop — stop and keep changes on disk",
-	];
+async function showPauseMenu(
+	ctx: ExtensionCommandContext,
+	task: TaskInfo,
+	options: { phase?: TaskPhase; actions?: PauseAction[] } = {},
+): Promise<PauseAction> {
+	const phase = options.phase ?? "Implement";
+	const actions = options.actions ?? ["resume", "release", "retry", "skip", "abort"];
+	const labels: Record<PauseAction, string> = {
+		resume: phase === "Implement"
+			? "▶️  Resume — keep changes, continue where it left off"
+			: `▶️  Resume — keep changes, restart the ${phase.toLowerCase()} phase`,
+		release: "🔧 Release session — fix manually, re-run /prd-loop-pro to continue",
+		retry: "🔄 Retry task — discard changes, try again from scratch",
+		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
+		abort: "❌ Abort loop — stop and keep changes on disk",
+	};
+	const menu = actions.map((action) => labels[action]);
 
 	const choice = await ctx.ui.select(
-		`⏸️  Paused — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
-		options,
+		`⏸️  Paused (${phase}) — Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+		menu,
 	);
 
-	switch (choice) {
-		case options[0]: return "resume";
-		case options[1]: return "release";
-		case options[2]: return "retry";
-		case options[3]: return "skip";
-		case options[4]: return "abort";
-		default: return "resume";
-	}
+	const index = choice === undefined ? -1 : menu.indexOf(choice);
+	return index === -1 ? "resume" : actions[index]!;
 }
 
 // --- Commits (prd-committer agent) ---
@@ -2025,6 +2076,44 @@ async function simpleAutoCommit(
 	return { committed: true };
 }
 
+// --- Git helpers ---
+
+/** Current HEAD commit SHA, or null if the repository has no commits yet. */
+async function getHeadSha(pi: ExtensionAPI, cwd: string): Promise<string | null> {
+	const result = await pi.exec("git", ["rev-parse", "--verify", "--quiet", "HEAD"], { cwd });
+	if (result.code !== 0) return null;
+	const sha = result.stdout.trim();
+	return sha || null;
+}
+
+/**
+ * Commits created since `before` (oldest first). With `before === null`
+ * (no commits before), all commits reachable from HEAD are returned.
+ */
+async function listCommitsSince(pi: ExtensionAPI, cwd: string, before: string | null): Promise<CommitRef[]> {
+	const after = await getHeadSha(pi, cwd);
+	if (!after || after === before) return [];
+	const range = before ? `${before}..${after}` : after;
+	const result = await pi.exec("git", ["log", "--reverse", "--format=%h%x09%s", range], { cwd });
+	if (result.code !== 0) {
+		throw new Error(`git log ${range} failed: ${(result.stderr || result.stdout).trim()}`);
+	}
+	return result.stdout
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.map((line) => {
+			const tab = line.indexOf("\t");
+			return tab === -1 ? { sha: line.trim() } : { sha: line.slice(0, tab), subject: line.slice(tab + 1) };
+		});
+}
+
+const PRIORITY_ORDER: readonly FindingPriority[] = ["P0", "P1", "P2", "P3"];
+
+/** True if `priority` is at or above (i.e. as severe as or more severe than) `threshold`. */
+function meetsFixThreshold(priority: FindingPriority, threshold: FindingPriority): boolean {
+	return PRIORITY_ORDER.indexOf(priority) <= PRIORITY_ORDER.indexOf(threshold);
+}
+
 // --- Orchestrator loop ---
 
 /**
@@ -2045,6 +2134,7 @@ async function runOrchestratorLoop(
 	settings: PrdLoopProSettings,
 ): Promise<void> {
 	const agent = await loadPrdWorkerAgent(EXTENSION_DIR);
+	const reviewerAgent = await loadAgent(EXTENSION_DIR, "prd-reviewer");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resolution = resolveTaskOrder(tasks);
@@ -2126,8 +2216,9 @@ async function runOrchestratorLoop(
 	};
 	const updateStatus = () => {
 		const currentTask = loopState.tasks[loopState.currentTaskIndex];
+		const phaseText = currentTask && isTaskActive(currentTask) && currentTask.phase ? ` [${currentTask.phase}]` : "";
 		const statusText = currentTask
-			? `Ralph Pro: ${currentTask.sequenceLabel} ${extractShortTitle(currentTask.title)}`
+			? `Ralph Pro: ${currentTask.sequenceLabel} ${extractShortTitle(currentTask.title)}${phaseText}`
 			: "Ralph Pro running";
 		ctx.ui.setStatus("prd-loop-pro", statusText);
 	};
@@ -2214,6 +2305,199 @@ async function runOrchestratorLoop(
 		unexpectedError?: unknown;
 	};
 
+	// --- Pipeline helpers ---
+
+	/** Switch a task to a new pipeline phase (resets the live activity). */
+	const setPhase = (taskState: LoopTaskState, phase: TaskPhase) => {
+		taskState.phase = phase;
+		taskState.currentActivity = undefined;
+		taskState.currentTurn = 0;
+		updateStatus();
+		requestOverlayRender();
+	};
+
+	/** Live activity handler for a subagent working on `taskState`. */
+	const createActivityHandler = (taskState: LoopTaskState) => (activity: SubagentActivity) => {
+		taskState.currentTurn = activity.turn;
+
+		switch (activity.type) {
+			case "tool_start":
+				taskState.currentActivity = `▶ ${activity.toolName}${activity.argsSummary ? ` ${activity.argsSummary}` : ""}`;
+				break;
+			case "tool_end":
+				taskState.currentActivity = `${activity.toolSuccess ? "✓" : "✗"} ${activity.toolName}`;
+				break;
+			case "text_delta":
+				taskState.currentActivity = "💬 writing response…";
+				break;
+			case "thinking":
+				taskState.currentActivity = "🧠 thinking…";
+				break;
+		}
+
+		appendOutputEvent(taskState.outputEvents, activity);
+		requestOverlayRender();
+	};
+
+	/**
+	 * LLM repair factory for `parseRunResult`: one repair attempt with the
+	 * orchestrator model/thinking level, bound to the current abort signal.
+	 */
+	const createRepairFactory = (taskState: LoopTaskState) => {
+		const repairSignal = currentAbortController.signal;
+		return (onCost: (cost: number) => void): RepairFunction => {
+			const repair = createOrchestratorRepair(ctx.modelRegistry, settings.steps.orchestrator, {
+				signal: repairSignal,
+				onCost,
+			});
+			return async (request) => {
+				taskState.currentActivity = "🔧 repairing JSON result…";
+				requestOverlayRender();
+				return repair(request);
+			};
+		};
+	};
+
+	/** Book cost on the task, the loop total and the per-phase breakdown. */
+	const addCost = (
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+		phase: CostPhase,
+		cost: number,
+	) => {
+		taskState.cost += cost;
+		loopState.totalCost += cost;
+		phaseCosts[phase] = (phaseCosts[phase] ?? 0) + cost;
+		requestOverlayRender();
+	};
+
+	/** Discard all uncommitted changes (tracked + untracked). */
+	const discardChanges = async () => {
+		await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
+		await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+	};
+
+	/** Close a task todo and update the PRD Task Index (index errors are reported, not fatal). */
+	const closeTaskAndUpdateIndex = async (task: TaskInfo, options: { notifyIndexError: boolean }) => {
+		await updateTodoFileStatus(ctx.cwd, task.id, "closed");
+		task.status = "closed";
+		try {
+			const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
+			const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
+			await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
+		} catch (err) {
+			if (options.notifyIndexError) {
+				ctx.ui.notify(
+					`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
+					"warning",
+				);
+			}
+		}
+	};
+
+	/** Skip a task after a manual pause: discard changes and close the todo. */
+	const skipTask = async (task: TaskInfo, taskState: LoopTaskState) => {
+		await discardChanges();
+		currentAbortController = new AbortController();
+		taskState.status = "completed";
+		taskState.endTime = Date.now();
+		taskState.currentActivity = undefined;
+		taskState.summary = "Skipped after manual pause.";
+		taskState.errors = [];
+		await closeTaskAndUpdateIndex(task, { notifyIndexError: false });
+	};
+
+	const releasedResult = (): LoopRunResult => ({
+		outcome: "aborted",
+		notification: {
+			message:
+				"⏸️ Session released. Uncommitted changes left on disk.\n" +
+				"Fix issues and re-run /prd-loop-pro to continue from where you left off.",
+			level: "info",
+		},
+	});
+
+	type ReviewPhaseOutcome =
+		| { kind: "reviewed"; review: ReviewerResult }
+		| { kind: "no-changes" }
+		| { kind: "skipped" }
+		| { kind: "released" }
+		| { kind: "aborted" }
+		| { kind: "failed"; error: string };
+
+	/**
+	 * Review phase: one fresh prd-reviewer subagent (review model/thinking)
+	 * reviews the uncommitted changes outside `.pi/` against the task. The
+	 * result is parsed and, if needed, repaired with the reviewer schema.
+	 */
+	const runReviewPhase = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+	): Promise<ReviewPhaseOutcome> => {
+		const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
+		if (status.code !== 0) {
+			return { kind: "failed", error: `git status failed: ${(status.stderr || status.stdout).trim()}` };
+		}
+		const changedFiles = filterReviewableStatus(status.stdout);
+		if (changedFiles.length === 0) return { kind: "no-changes" };
+
+		const prompt = buildReviewerPrompt({
+			taskTitle: task.title,
+			taskBody: task.body,
+			changedFiles,
+			projectGuidelines: await loadProjectReviewGuidelines(ctx.cwd),
+		});
+
+		while (true) {
+			if (aborted) return { kind: "aborted" };
+
+			const run = await spawnSubagent({
+				taskPrompt: prompt,
+				model: settings.steps.review.model,
+				thinkingLevel: settings.steps.review.thinking,
+				cwd: ctx.cwd,
+				agent: reviewerAgent,
+				signal: currentAbortController.signal,
+				onActivity: createActivityHandler(taskState),
+			});
+			const parsed = await parseRunResult(run, REVIEWER_RESULT_SCHEMA, createRepairFactory(taskState));
+			addCost(taskState, phaseCosts, "review", parsed.usage.cost);
+
+			if (pauseRequested) {
+				pauseRequested = false;
+				if (widgetTimer) clearInterval(widgetTimer);
+				const pauseAction = await showPauseMenu(ctx, task, {
+					phase: "Review",
+					actions: ["resume", "release", "skip", "abort"],
+				});
+				widgetTimer = setInterval(requestOverlayRender, 1000);
+
+				switch (pauseAction) {
+					case "resume":
+						currentAbortController = new AbortController();
+						taskState.currentActivity = "▶ restarting review…";
+						requestOverlayRender();
+						continue;
+					case "release":
+						return { kind: "released" };
+					case "skip":
+						await skipTask(task, taskState);
+						requestOverlayRender();
+						return { kind: "skipped" };
+					case "retry": // not offered during review
+					case "abort":
+						aborted = true;
+						return { kind: "aborted" };
+				}
+			}
+
+			if (aborted) return { kind: "aborted" };
+			if (!parsed.ok) return { kind: "failed", error: parsed.error };
+			return { kind: "reviewed", review: parsed.value };
+		}
+	};
+
 	const runPromise = (async (): Promise<LoopRunResult> => {
 		widgetTimer = setInterval(requestOverlayRender, 1000);
 
@@ -2238,14 +2522,18 @@ async function runOrchestratorLoop(
 				taskState.currentActivity = undefined;
 				taskState.currentTurn = 0;
 				taskState.outputEvents = [];
-				requestOverlayRender();
+				taskState.reviewInfo = undefined;
+				setPhase(taskState, "Implement");
 
+				/** Cost per phase for the execution report. */
+				const phaseCosts: Partial<Record<CostPhase, number>> = {};
 				const initialPrompt = buildTaskPrompt(task, prdId);
 				let retriesRemaining = settings.implementationRetries;
 				let attempt = 1;
 				let result: SubagentResult | undefined;
 				let currentPrompt = initialPrompt;
 				let taskSucceeded = false;
+				let taskSkipped = false;
 
 				while (true) {
 					if (aborted) break;
@@ -2257,47 +2545,15 @@ async function runOrchestratorLoop(
 						cwd: ctx.cwd,
 						agent,
 						signal: currentAbortController.signal,
-						onActivity: (activity) => {
-							taskState.currentTurn = activity.turn;
-
-							switch (activity.type) {
-								case "tool_start":
-									taskState.currentActivity = `▶ ${activity.toolName}${activity.argsSummary ? ` ${activity.argsSummary}` : ""}`;
-									break;
-								case "tool_end":
-									taskState.currentActivity = `${activity.toolSuccess ? "✓" : "✗"} ${activity.toolName}`;
-									break;
-								case "text_delta":
-									taskState.currentActivity = "💬 writing response…";
-									break;
-								case "thinking":
-									taskState.currentActivity = "🧠 thinking…";
-									break;
-							}
-
-							appendOutputEvent(taskState.outputEvents, activity);
-							requestOverlayRender();
-						},
+						onActivity: createActivityHandler(taskState),
 					});
 
 					// Parse the raw final text: deterministic repair first, then one
 					// LLM repair attempt with the orchestrator model/thinking level.
-					const repairSignal = currentAbortController.signal;
-					const parsedRun = await parseRunResult(run, WORKER_RESULT_SCHEMA, (onCost) => {
-						const repair = createOrchestratorRepair(ctx.modelRegistry, settings.steps.orchestrator, {
-							signal: repairSignal,
-							onCost,
-						});
-						return async (request) => {
-							taskState.currentActivity = "🔧 repairing JSON result…";
-							requestOverlayRender();
-							return repair(request);
-						};
-					});
+					const parsedRun = await parseRunResult(run, WORKER_RESULT_SCHEMA, createRepairFactory(taskState));
 					result = toWorkerResult(parsedRun);
 
-					taskState.cost += result.usage.cost;
-					loopState.totalCost += result.usage.cost;
+					addCost(taskState, phaseCosts, "implement", result.usage.cost);
 					taskState.summary = result.summary;
 					requestOverlayRender();
 
@@ -2317,19 +2573,10 @@ async function runOrchestratorLoop(
 								continue;
 
 							case "release":
-								return {
-									outcome: "aborted",
-									notification: {
-										message:
-											"⏸️ Session released. Uncommitted changes left on disk.\n" +
-										"Fix issues and re-run /prd-loop-pro to continue from where you left off.",
-										level: "info",
-									},
-								};
+								return releasedResult();
 
 							case "retry":
-								await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+								await discardChanges();
 								currentAbortController = new AbortController();
 								currentPrompt = initialPrompt;
 								retriesRemaining = settings.implementationRetries;
@@ -2348,26 +2595,11 @@ async function runOrchestratorLoop(
 								continue;
 
 							case "skip": {
-								await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
-								currentAbortController = new AbortController();
-								taskState.status = "completed";
-								taskState.endTime = Date.now();
-								taskState.currentActivity = undefined;
-								taskState.summary = "Skipped after manual pause.";
-								taskState.errors = [];
-								await updateTodoFileStatus(ctx.cwd, task.id, "closed");
-								task.status = "closed";
-								try {
-									const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-									const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-									await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
-								} catch {
-									// Non-critical
-								}
+								await skipTask(task, taskState);
 								widgetTimer = setInterval(requestOverlayRender, 1000);
 								requestOverlayRender();
 								taskSucceeded = false;
+								taskSkipped = true;
 								break;
 							}
 
@@ -2380,7 +2612,7 @@ async function runOrchestratorLoop(
 						}
 
 						if (aborted) break;
-						if (taskState.status === "completed") break;
+						if (taskSkipped) break;
 						continue;
 					}
 
@@ -2432,13 +2664,56 @@ Errors: ${result.errors.join("; ")}`,
 
 				if (!taskSucceeded) continue;
 
-				taskState.status = "completed";
-				taskState.summary = result?.summary;
-				taskState.endTime = Date.now();
-				taskState.currentActivity = undefined;
+				const implementerSummary = result?.summary ?? "";
+				taskState.summary = implementerSummary;
+
+				// --- Review phase (one round; findings are recorded, not fixed yet) ---
+				setPhase(taskState, "Review");
+				const reviewOutcome = await runReviewPhase(task, taskState, phaseCosts);
+
+				if (reviewOutcome.kind === "released") return releasedResult();
+				if (reviewOutcome.kind === "skipped") continue;
+				if (reviewOutcome.kind === "aborted" || aborted) {
+					aborted = true;
+					taskState.status = "aborted";
+					taskState.summary = "Task execution was cancelled during review.";
+					taskState.endTime = Date.now();
+					break;
+				}
+				if (reviewOutcome.kind === "failed") {
+					taskState.status = "failed";
+					taskState.errors = [reviewOutcome.error];
+					taskState.endTime = Date.now();
+					requestOverlayRender();
+					return {
+						outcome: "failed",
+						notification: {
+							message:
+								`❌ Review failed: ${task.title}\n${reviewOutcome.error}\n` +
+								"Uncommitted changes left on disk. Commit or discard them, then re-run /prd-loop-pro.",
+							level: "error",
+						},
+					};
+				}
+
+				const review = reviewOutcome.kind === "reviewed" ? reviewOutcome.review : undefined;
+				const threshold = settings.fixThreshold as FindingPriority;
+				const reviewFindings: ReviewFinding[] = review?.findings ?? [];
+				const unresolved: UnresolvedFinding[] = reviewFindings
+					.filter((finding) => meetsFixThreshold(finding.priority, threshold))
+					.map((finding) => ({ finding, reason: "Not fixed (no fix phase yet)", round: 1 }));
+				const deferred = reviewFindings.filter((finding) => !meetsFixThreshold(finding.priority, threshold));
+				taskState.reviewInfo = review
+					? `${review.verdict} • ${reviewFindings.length} finding${reviewFindings.length === 1 ? "" : "s"}` +
+						` (${unresolved.length} ≥ threshold, ${deferred.length} deferred)` +
+						` • ${review.callouts.length} callout${review.callouts.length === 1 ? "" : "s"}`
+					: "skipped (no changes outside .pi/)";
 				requestOverlayRender();
 
+				// --- Commit phase ---
+				setPhase(taskState, "Commit");
 				const shortTitle = extractShortTitle(task.title);
+				const headBefore = await getHeadSha(pi, ctx.cwd);
 
 				// Committer agent is always used (smart-commit toggle removed).
 				// The simple fallback commit is kept until the committer rework.
@@ -2449,10 +2724,7 @@ Errors: ${result.errors.join("; ")}`,
 					settings.steps.commit.thinking,
 					currentAbortController.signal,
 				);
-
-				loopState.totalCost += committerResult.cost;
-				taskState.cost += committerResult.cost;
-				requestOverlayRender();
+				addCost(taskState, phaseCosts, "commit", committerResult.cost);
 
 				if (aborted) {
 					taskState.status = "aborted";
@@ -2461,16 +2733,16 @@ Errors: ${result.errors.join("; ")}`,
 					break;
 				}
 
-				if (committerResult.success) {
-					loopState.totalCommits += committerResult.commitCount;
-				} else {
+				if (!committerResult.success) {
 					const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-					if (fallback.committed) {
-						loopState.totalCommits++;
-					} else if (fallback.error) {
+					if (!fallback.committed && fallback.error) {
 						ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
 					}
 				}
+
+				// Commit SHAs are determined by the orchestrator (HEAD before vs. after).
+				const commits = await listCommitsSince(pi, ctx.cwd, headBefore);
+				loopState.totalCommits += commits.length;
 
 				if (aborted) {
 					taskState.status = "aborted";
@@ -2479,19 +2751,28 @@ Errors: ${result.errors.join("; ")}`,
 					break;
 				}
 
-				await updateTodoFileStatus(ctx.cwd, task.id, "closed");
-				task.status = "closed";
+				// --- Report: append execution report, close todo, update PRD Task Index ---
+				const record: ExecutionRecord = {
+					implementerSummary,
+					reviewRounds: review ? 1 : 0,
+					finalVerdict: review?.verdict,
+					reviewSummary: review?.summary,
+					reviewNote: review ? undefined : "No changes outside .pi/ — review skipped.",
+					fixed: [],
+					rejected: [],
+					deferred,
+					unresolved,
+					callouts: review?.callouts ?? [],
+					commits,
+					cost: phaseCosts,
+				};
+				const taskBody = await readTodoBody(ctx.cwd, task.id);
+				await updateTodoFileBody(ctx.cwd, task.id, appendSection(taskBody, buildExecutionReport(record)));
 
-				try {
-					const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-					const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-					await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
-				} catch (err) {
-					ctx.ui.notify(
-						`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
-						"warning",
-					);
-				}
+				taskState.status = "completed";
+				taskState.endTime = Date.now();
+				taskState.currentActivity = undefined;
+				await closeTaskAndUpdateIndex(task, { notifyIndexError: true });
 
 				requestOverlayRender();
 			}
