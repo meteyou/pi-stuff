@@ -152,6 +152,25 @@ At start, each configured model must still be available (API key configured) and
 its model; numbers must be in range. Invalid entries are marked with ⚠️ and starting is blocked until they are fixed.
 An invalid project file blocks *Save globally & start*, but can be overwritten via *Save for this project only & start*.
 
+### Changing models while the loop runs
+
+Press `s` in the live overlay to change the **model + thinking level** of any step (implement, review, fix, commit,
+orchestrator) without stopping the loop. The overlay is hidden while the dialog is open; the loop keeps running in the
+background and the overlay comes back when you confirm or leave the dialog.
+
+- Every subagent reads its step's model + thinking level **when it starts**. A running subagent is never interrupted
+  and keeps the model it was started with; the change applies from the next start of that step (e.g. the next fixer
+  of the current task, or a *Retry phase*). The orchestrator model applies to the next JSON repair.
+- The dialog shows which subagent is running right now (and with which model). Edited rows are marked `• changed`.
+- Actions with unsaved changes: **Apply to this run** (not saved), **Apply & save globally**, **Apply & save for this
+  project only** (only the steps edited in this dialog are written; earlier run-only edits stay unsaved) and
+  **Discard changes & back to loop**. `Esc` returns to the loop (asks before dropping unsaved changes).
+- If the loop needs a pause menu while the dialog is open, the pause menu is shown right after the dialog closes.
+- Fix threshold, max review rounds and implementation retries can only be changed at start.
+
+The model each subagent run used is shown in the output viewer's phase headers and, while it runs, in the task
+details (`Model:`).
+
 ## Fix Threshold & Round Limit
 
 - **Fix threshold** is an inclusive upper bound: `P1` fixes all P0 and P1 findings, P2/P3 findings are deferred.
@@ -220,9 +239,10 @@ continues with the next task of the PRD.
 - **Live overlay** — task rows show the current phase and round (e.g. `Review 2/3`, `Fix #1 • 3 findings`). Expanded
   task details show the review round counter, fixed/rejected/deferred/unresolved counts and the cost per phase.
   Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
-  `a` expand/collapse all, `o` output viewer, `Ctrl+C` pause, `Esc` (twice) abort.
+  `a` expand/collapse all, `o` output viewer, `s` change models/thinking while running (see
+  [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `Ctrl+C` pause, `Esc` (twice) abort.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
-  `Fix #1 • 3 findings`, `Commit`) with outcome, cost and duration.
+  `Fix #1 • 3 findings`, `Commit`) with the model + thinking level of the run, outcome, cost and duration.
 - **Finished view** — when the run is over (completed, failed, aborted by a pause action or released), the overlay
   stays open: the header shows the outcome, totals and the final notification; tasks can still be expanded and their
   output inspected. `Esc`/`q` closes it.
@@ -262,8 +282,8 @@ If both fail, the loop pauses (*JSON repair failed*).
 |------|---------|
 | `index.ts` | Commands, start flow, orchestrator loop, subagent runner, overlay |
 | `settings.ts` | Settings schema, load/merge/save (global, project-only, remove overrides), validation (pure) |
-| `settings-ui.ts` | Setup wizard, overview menu (edit entries in place, save & start), model/thinking pickers |
-| `overview-menu.ts` | Overview menu model: title, settings rows and actions (pure) |
+| `settings-ui.ts` | Setup wizard, overview menu (edit entries in place, save & start), run settings dialog (`s` while running), model/thinking pickers |
+| `overview-menu.ts` | Overview menu and run settings menu models: title, rows and actions (pure) |
 | `subagent-result.ts` | Result schemas, deterministic parsing and LLM repair (pure) |
 | `review-cycle.ts` | Review-fix cycle state machine (pure) |
 | `reviewer-prompt.ts`, `fixer-prompt.ts`, `committer-prompt.ts` | Prompt builders (reviewer uses the shared [review rubric](../review/review-prompts.ts)) |
