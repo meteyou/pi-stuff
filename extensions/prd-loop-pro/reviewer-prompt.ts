@@ -9,6 +9,8 @@
  * - task title + body (incl. acceptance criteria) with the instruction to
  *   report incomplete acceptance criteria and out-of-scope changes as findings
  * - project review guidelines (`REVIEW_GUIDELINES.md`), if any
+ * - from round 2: findings rejected by fixers (with their reasons) and the
+ *   instruction not to re-raise them unless explicitly disagreeing
  *
  * Intentionally free of pi imports so it can be unit-tested with `node --test`
  * (native TypeScript type stripping). Only erasable TypeScript syntax is used.
@@ -20,6 +22,7 @@ import {
 	appendProjectReviewGuidelines,
 	composeReviewPrompt,
 } from "../review/review-prompts.ts";
+import type { RejectedFinding } from "./execution-report.ts";
 
 /** Directory excluded from review (todo bookkeeping, settings). */
 export const REVIEW_EXCLUDED_DIR = ".pi";
@@ -42,6 +45,10 @@ export interface ReviewerPromptInput {
 	changedFiles?: string[];
 	/** Project review guidelines (`REVIEW_GUIDELINES.md`), or null. */
 	projectGuidelines: string | null;
+	/** Findings rejected by fixers in earlier rounds (with reasons). */
+	rejectedFindings?: RejectedFinding[];
+	/** Current review round (1-based), shown in the prompt from round 2. */
+	round?: number;
 }
 
 /**
@@ -127,6 +134,47 @@ const COMPLETENESS_SECTION = [
 	"4. Criteria that can only be verified manually (e.g. UI behavior) are not findings if the code plausibly implements them.",
 ].join("\n");
 
+function formatRejectedLocation(finding: RejectedFinding["finding"]): string {
+	const file = finding.file.trim();
+	if (!file) return "(no specific file)";
+	return finding.line !== undefined && finding.line > 0 ? `${file}:${finding.line}` : file;
+}
+
+function indentBlock(text: string, indent: string): string {
+	return text
+		.trim()
+		.split("\n")
+		.map((line) => (line.trim() ? `${indent}${line.trimEnd()}` : ""))
+		.join("\n");
+}
+
+/**
+ * Section listing the findings that fixers rejected in earlier rounds, with
+ * the instruction not to re-raise them unless explicitly disagreeing.
+ * Returns an empty string if there are none.
+ */
+export function buildRejectedFindingsSection(rejected: RejectedFinding[] | undefined): string {
+	if (!rejected || rejected.length === 0) return "";
+	const lines = [
+		"## Previously rejected findings",
+		"",
+		"In earlier review rounds the following findings were raised, but the engineer assigned to fix them rejected them with the reason given. " +
+			"**Do not re-raise these findings** (or close variants of them). Only re-raise one if you explicitly disagree with the rejection reason — " +
+			"in that case start the finding's `body` with `Disagreeing with the rejection: ` and explain concretely why the reason does not hold.",
+		"",
+	];
+	rejected.forEach((item, index) => {
+		const title = item.finding.title.replace(/\s+/g, " ").trim() || "(untitled)";
+		const round = item.round !== undefined ? ` (round ${item.round})` : "";
+		lines.push(`${index + 1}. [${item.finding.priority}] ${title} — \`${formatRejectedLocation(item.finding)}\`${round}`);
+		if (item.finding.body.trim()) {
+			lines.push("   Finding:", indentBlock(item.finding.body, "     "));
+		}
+		lines.push("   Rejection reason:", indentBlock(item.reason.trim() || "(no reason given)", "     "));
+	});
+	return lines.join("\n");
+}
+
 const FINAL_REMINDER =
 	"Remember: your final message must be a single raw JSON object matching the output format above — no prose, no code fences.";
 
@@ -134,7 +182,7 @@ const FINAL_REMINDER =
  * Build the full task prompt for the `prd-reviewer` subagent.
  */
 export function buildReviewerPrompt(input: ReviewerPromptInput): string {
-	const focus = [
+	const parts = [
 		UNCOMMITTED_PROMPT,
 		"",
 		buildScopeSection(input.changedFiles),
@@ -142,7 +190,18 @@ export function buildReviewerPrompt(input: ReviewerPromptInput): string {
 		buildTaskSection(input.taskTitle, input.taskBody),
 		"",
 		COMPLETENESS_SECTION,
-	].join("\n");
+	];
+	if (input.round !== undefined && input.round > 1) {
+		parts.push(
+			"",
+			`## Review round ${input.round}`,
+			"",
+			"This is a re-review: findings of earlier rounds were addressed by follow-up fixes. Review the current state of all uncommitted changes from scratch.",
+		);
+	}
+	const rejectedSection = buildRejectedFindingsSection(input.rejectedFindings);
+	if (rejectedSection) parts.push("", rejectedSection);
+	const focus = parts.join("\n");
 
 	const prompt = appendProjectReviewGuidelines(composeReviewPrompt(REVIEW_RUBRIC_JSON, focus), input.projectGuidelines);
 	return `${prompt}\n\n---\n\n${FINAL_REMINDER}`;
