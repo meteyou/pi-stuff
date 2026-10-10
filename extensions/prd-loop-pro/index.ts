@@ -42,6 +42,14 @@
  * `needs-human`, appends the open findings and stops the loop. `needs-human`
  * is not closed: dependent tasks stay blocked until the task is resolved at
  * the next start.
+ *
+ * UI (view model in ./progress-view.ts): task rows show the current phase and
+ * round; task details show the review round counter, fixed/rejected/deferred/
+ * unresolved counts and the cost per phase. The output viewer (`o`) groups the
+ * events per subagent run under phase headers (`Implement`, `Review #1`,
+ * `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and duration. The
+ * final summary widget lists rounds and counts per task and marks
+ * `needs-human` tasks with ⚠️.
  */
 
 import { spawn } from "node:child_process";
@@ -106,6 +114,31 @@ import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
 import { buildPauseMenu, defaultReasonText, releaseReasonFor, skipSummaryFor } from "./pause.ts";
 import type { PauseAction, PauseReasonKind, PauseRequest } from "./pause.ts";
 import { discardChanges } from "./discard.ts";
+import {
+	appendOutputEvent,
+	appendPhaseEvent,
+	buildSummaryLines,
+	buildTaskDetailLines,
+	countPhaseEvents,
+	finishPhaseGroup,
+	formatElapsed,
+	formatFixOutcome,
+	formatReviewOutcome,
+	phaseGroupMeta,
+	startPhaseGroup,
+	statusIcon,
+} from "./progress-view.ts";
+import type {
+	OutputEvent,
+	PhaseOutputGroup,
+	PhaseRef,
+	SubagentActivity,
+	TaskReviewProgress,
+	TaskStatus,
+} from "./progress-view.ts";
+
+export { appendOutputEvent };
+export type { OutputEvent, SubagentActivity };
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -281,64 +314,6 @@ export interface SubagentRunResult {
 	events: OutputEvent[];
 	/** Error description for aborted/failed runs. */
 	error?: string;
-}
-
-/** Activity update from a running subagent. */
-export interface SubagentActivity {
-	/** Type of activity */
-	type: "tool_start" | "tool_end" | "text_delta" | "thinking";
-	/** Tool name (for tool_start/tool_end) */
-	toolName?: string;
-	/** Tool arguments summary (for tool_start) */
-	argsSummary?: string;
-	/** Whether tool succeeded (for tool_end) */
-	toolSuccess?: boolean;
-	/** Text snippet (for text_delta) */
-	text?: string;
-	/** Current turn number */
-	turn: number;
-	/** Preview of tool result (for tool_end) */
-	resultPreview?: string;
-}
-
-/** Structured event from a running subagent, stored for the output viewer. */
-export interface OutputEvent {
-	time: number;
-	kind: "tool_start" | "tool_end" | "text" | "thinking";
-	tool?: string;
-	args?: string;
-	result?: string;
-	error?: boolean;
-	text?: string;
-	turn: number;
-}
-
-/**
- * Append a subagent activity to an output event list. Consecutive text/thinking
- * deltas are collapsed into a single event.
- */
-export function appendOutputEvent(events: OutputEvent[], activity: SubagentActivity, now: number = Date.now()): void {
-	switch (activity.type) {
-		case "tool_start":
-			events.push({ time: now, kind: "tool_start", tool: activity.toolName, args: activity.argsSummary, turn: activity.turn });
-			break;
-		case "tool_end":
-			events.push({
-				time: now,
-				kind: "tool_end",
-				tool: activity.toolName,
-				error: !activity.toolSuccess,
-				result: activity.resultPreview,
-				turn: activity.turn,
-			});
-			break;
-		case "text_delta":
-			if (events.at(-1)?.kind !== "text") events.push({ time: now, kind: "text", turn: activity.turn });
-			break;
-		case "thinking":
-			if (events.at(-1)?.kind !== "thinking") events.push({ time: now, kind: "thinking", turn: activity.turn });
-			break;
-	}
 }
 
 /**
@@ -1209,9 +1184,6 @@ function extractShortTitle(title: string): string {
 
 // --- Loop state and UI ---
 
-/** `needs-human` = released to a human (todo status `needs-human`), resolved at the next start. */
-type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted" | "needs-human";
-
 /** Pipeline phase of a task (shown in the overlay while the task is active). */
 type TaskPhase = "Implement" | "Review" | "Fix" | "Commit";
 
@@ -1224,8 +1196,12 @@ interface LoopTaskState {
 	phase?: TaskPhase;
 	/** Display label of the current phase incl. round progress (e.g. "Review 2/3", "Fix 2/4 [P1] Title"). */
 	phaseLabel?: string;
-	/** One-line review outcome (verdict + counts), once the review ran. */
-	reviewInfo?: string;
+	/** Review-fix cycle progress (round counter + finding counts), once a review round completed. */
+	review?: TaskReviewProgress;
+	/** Why the review didn't run / was cut short (e.g. no changes, skipped manually). */
+	reviewNote?: string;
+	/** Cost per pipeline phase (kept across "Retry task"). */
+	phaseCosts: Partial<Record<CostPhase, number>>;
 	startTime?: number;
 	endTime?: number;
 	cost: number;
@@ -1236,8 +1212,8 @@ interface LoopTaskState {
 	currentActivity?: string;
 	/** Current turn of the subagent */
 	currentTurn: number;
-	/** Collected output events for the viewer overlay */
-	outputEvents: OutputEvent[];
+	/** Output events for the viewer overlay, grouped per subagent run (phase). */
+	outputGroups: PhaseOutputGroup[];
 }
 
 interface LoopState {
@@ -1248,31 +1224,6 @@ interface LoopState {
 	currentTaskIndex: number;
 	currentRetry: number;
 	maxRetries: number;
-}
-
-/**
- * Format elapsed milliseconds as "M:SS".
- */
-function formatElapsed(ms: number): string {
-	const totalSec = Math.floor(ms / 1000);
-	const min = Math.floor(totalSec / 60);
-	const sec = totalSec % 60;
-	return `${min}:${sec.toString().padStart(2, "0")}`;
-}
-
-/**
- * Get the status icon for a task state.
- */
-function statusIcon(status: TaskStatus): string {
-	switch (status) {
-		case "pending": return "⏳";
-		case "running": return "🔄";
-		case "completed": return "✅";
-		case "failed": return "❌";
-		case "retrying": return "🔁";
-		case "aborted": return "⚠️";
-		case "needs-human": return "🔧";
-	}
 }
 
 function taskStatusColor(status: TaskStatus): "accent" | "dim" | "error" | "success" | "warning" {
@@ -1535,12 +1486,17 @@ class PrdLoopOverlayComponent {
 				),
 			});
 
-			if (task.reviewInfo) {
-				rows.push({
-					taskIndex: i,
-					kind: "detail",
-					text: truncateToWidth(this.theme.fg("muted", `    Review: ${task.reviewInfo}`), width),
-				});
+			// Round counter, finding counts and cost per phase
+			const detailLines = buildTaskDetailLines({
+				review: task.review,
+				reviewNote: task.reviewNote,
+				phaseCosts: task.phaseCosts,
+			});
+			for (const detail of detailLines) {
+				const label = this.theme.fg("dim", `    ${detail.label}: `);
+				for (const line of wrapTextWithAnsi(label + this.theme.fg("muted", detail.text), width)) {
+					rows.push({ taskIndex: i, kind: "detail", text: truncateToWidth(line, width) });
+				}
 			}
 
 			if ((task.status === "running" || task.status === "retrying") && task.currentActivity) {
@@ -1588,45 +1544,22 @@ function buildSummaryWidget(
 	outcome: LoopOutcome,
 ): string[] {
 	const width = process.stdout.columns || 80;
-	const lines: string[] = [];
-
-	const outcomeIcon = { completed: "✅", failed: "❌", aborted: "⚠️", released: "🔧" }[outcome];
-	const outcomeText = {
-		completed: "Loop completed",
-		failed: "Loop failed",
-		aborted: "Loop aborted",
-		released: "Loop stopped — task released to a human (needs-human)",
-	}[outcome];
-	lines.push(`${outcomeIcon} ${prdTitle} — ${outcomeText}`);
-	lines.push("");
-
-	for (const task of state.tasks) {
-		const icon = statusIcon(task.status);
-		const label = `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`;
-
-		let timePart = "     ";
-		if (task.endTime && task.startTime) {
-			timePart = formatElapsed(task.endTime - task.startTime).padStart(5);
-		}
-
-		const costPart = task.cost > 0 ? `  $${task.cost.toFixed(2)}` : "";
-		const retryPart = task.retries > 0 ? `  (${task.retries} retry${task.retries > 1 ? "s" : ""})` : "";
-
-		lines.push(`${label}  ${icon}  ${timePart}${costPart}${retryPart}`);
-	}
-
-	lines.push("");
-
-	const totalElapsed = formatElapsed((state.tasks.at(-1)?.endTime ?? Date.now()) - state.startTime);
-	const totalRetries = state.tasks.reduce((sum, t) => sum + t.retries, 0);
-	const parts = [
-		`Total: ${totalElapsed}`,
-		`$${state.totalCost.toFixed(2)}`,
-		`${totalRetries} retry${totalRetries !== 1 ? "s" : ""}`,
-		`${state.totalCommits} commit${state.totalCommits !== 1 ? "s" : ""}`,
-	];
-	lines.push(parts.join(" | "));
-
+	const lines = buildSummaryLines({
+		prdTitle,
+		outcome,
+		tasks: state.tasks.map((task) => ({
+			label: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+			status: task.status,
+			elapsedMs: task.endTime && task.startTime ? task.endTime - task.startTime : undefined,
+			cost: task.cost,
+			retries: task.retries,
+			review: task.review,
+			reviewNote: task.review ? undefined : task.reviewNote,
+		})),
+		totalElapsedMs: Date.now() - state.startTime,
+		totalCost: state.totalCost,
+		totalCommits: state.totalCommits,
+	});
 	return lines.map((line) => truncateToWidth(line, width));
 }
 
@@ -1717,11 +1650,12 @@ class SubagentOutputViewer {
 		this.totalLines = eventLines.length;
 		this.viewHeight = contentHeight;
 
-		if (this.autoScroll || task.outputEvents.length !== this.prevEventCount) {
+		const eventCount = countPhaseEvents(task.outputGroups);
+		if (this.autoScroll || eventCount !== this.prevEventCount) {
 			if (this.autoScroll) {
 				this.scrollOffset = Math.max(0, this.totalLines - contentHeight);
 			}
-			this.prevEventCount = task.outputEvents.length;
+			this.prevEventCount = eventCount;
 		}
 
 		const maxScroll = Math.max(0, this.totalLines - contentHeight);
@@ -1757,7 +1691,7 @@ class SubagentOutputViewer {
 	}
 
 	invalidate(): void {
-		// No caching — always renders fresh from outputEvents
+		// No caching — always renders fresh from outputGroups
 	}
 
 	private getMaxHeight(): number {
@@ -1765,47 +1699,73 @@ class SubagentOutputViewer {
 		return Math.max(10, Math.floor(rows * 0.85));
 	}
 
+	/**
+	 * Events grouped by phase: one header per subagent run (`Implement`,
+	 * `Review #1`, `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and
+	 * duration, followed by the run's events.
+	 */
 	private formatEvents(maxWidth: number): string[] {
 		const theme = this.theme;
-		const events = this.taskState.outputEvents;
-		if (events.length === 0) {
+		const groups = this.taskState.outputGroups;
+		if (groups.length === 0) {
 			return [theme.fg("muted", "  Waiting for subagent output…")];
 		}
 
+		const now = Date.now();
 		const lines: string[] = [];
-		for (const ev of events) {
-			const turnLabel = theme.fg("dim", `T${ev.turn}`);
-			switch (ev.kind) {
-				case "tool_start": {
-					const toolName = theme.fg("toolTitle", theme.bold(ev.tool ?? "?"));
-					const args = ev.args ? theme.fg("muted", ` ${ev.args}`) : "";
-					lines.push(truncateToWidth(`  ${turnLabel} ▶ ${toolName}${args}`, maxWidth));
-					break;
-				}
-				case "tool_end": {
-					const icon = ev.error ? theme.fg("error", "✗") : theme.fg("success", "✓");
-					const toolName = ev.error
-						? theme.fg("error", ev.tool ?? "?")
-						: theme.fg("success", ev.tool ?? "?");
-					lines.push(truncateToWidth(`  ${turnLabel} ${icon} ${toolName}`, maxWidth));
-					if (ev.result) {
-						const previewLines = ev.result.split("\n").slice(0, 3);
-						for (const pLine of previewLines) {
-							const sanitized = pLine.replace(/\t/g, " ");
-							lines.push(truncateToWidth(`       ${theme.fg("dim", sanitized)}`, maxWidth));
-						}
-					}
-					break;
-				}
-				case "thinking":
-					lines.push(truncateToWidth(`  ${turnLabel} ${theme.fg("muted", "🧠 thinking…")}`, maxWidth));
-					break;
-				case "text":
-					lines.push(truncateToWidth(`  ${turnLabel} ${theme.fg("muted", "💬 writing response…")}`, maxWidth));
-					break;
+		groups.forEach((group, index) => {
+			if (index > 0) lines.push("");
+			lines.push(truncateToWidth(this.formatGroupHeader(group, maxWidth, now), maxWidth));
+			if (group.events.length === 0) {
+				const empty = group.endTime === undefined ? "Waiting for subagent output…" : "(no output)";
+				lines.push(truncateToWidth(`  ${theme.fg("muted", empty)}`, maxWidth));
+				return;
 			}
-		}
+			for (const ev of group.events) lines.push(...this.formatEvent(ev, maxWidth));
+		});
 		return lines;
+	}
+
+	/** `── Review #1 ─── needs attention • 3 findings • $0.12 • 0:45` */
+	private formatGroupHeader(group: PhaseOutputGroup, maxWidth: number, now: number): string {
+		const theme = this.theme;
+		const title = theme.fg("accent", theme.bold(group.header));
+		const metaText = phaseGroupMeta(group, now);
+		const meta = group.failed ? theme.fg("warning", metaText) : theme.fg("muted", metaText);
+		const head = `${theme.fg("borderMuted", "──")} ${title} `;
+		const tail = ` ${meta}`;
+		const fill = Math.max(2, maxWidth - visibleWidth(head) - visibleWidth(tail));
+		return head + theme.fg("borderMuted", "─".repeat(Math.min(fill, 6))) + tail;
+	}
+
+	private formatEvent(ev: OutputEvent, maxWidth: number): string[] {
+		const theme = this.theme;
+		const turnLabel = theme.fg("dim", `T${ev.turn}`);
+		switch (ev.kind) {
+			case "tool_start": {
+				const toolName = theme.fg("toolTitle", theme.bold(ev.tool ?? "?"));
+				const args = ev.args ? theme.fg("muted", ` ${ev.args}`) : "";
+				return [truncateToWidth(`  ${turnLabel} ▶ ${toolName}${args}`, maxWidth)];
+			}
+			case "tool_end": {
+				const icon = ev.error ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const toolName = ev.error
+					? theme.fg("error", ev.tool ?? "?")
+					: theme.fg("success", ev.tool ?? "?");
+				const lines = [truncateToWidth(`  ${turnLabel} ${icon} ${toolName}`, maxWidth)];
+				if (ev.result) {
+					for (const pLine of ev.result.split("\n").slice(0, 3)) {
+						const sanitized = pLine.replace(/\t/g, " ");
+						lines.push(truncateToWidth(`       ${theme.fg("dim", sanitized)}`, maxWidth));
+					}
+				}
+				return lines;
+			}
+			case "thinking":
+				return [truncateToWidth(`  ${turnLabel} ${theme.fg("muted", "🧠 thinking…")}`, maxWidth)];
+			case "text":
+				return [truncateToWidth(`  ${turnLabel} ${theme.fg("muted", "💬 writing response…")}`, maxWidth)];
+		}
 	}
 
 	private buildTitleLine(width: number): string {
@@ -1830,10 +1790,11 @@ class SubagentOutputViewer {
 		const task = this.taskState;
 		const now = Date.now();
 
-		const icon = task.status === "running" ? "🔄" : task.status === "retrying" ? "🔁" : statusIconFn(task.status);
-		const elapsed = task.startTime ? formatElapsed(now - task.startTime) : "0:00";
+		const icon = task.status === "running" ? "🔄" : task.status === "retrying" ? "🔁" : statusIcon(task.status);
+		const elapsed = task.startTime ? formatElapsed((task.endTime ?? now) - task.startTime) : "0:00";
 		const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
-		const eventCount = `${task.outputEvents.length} events`;
+		const phaseCount = task.outputGroups.length;
+		const eventCount = `${phaseCount} phase${phaseCount === 1 ? "" : "s"} • ${countPhaseEvents(task.outputGroups)} events`;
 
 		const phaseLabel = activePhaseLabel(task);
 		const phase = phaseLabel ? ` • ${phaseLabel}` : "";
@@ -1866,11 +1827,6 @@ class SubagentOutputViewer {
 		const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
 		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset + delta, maxScroll));
 	}
-}
-
-/** statusIcon wrapper to avoid name collision with the existing function */
-function statusIconFn(status: TaskStatus): string {
-	return statusIcon(status);
 }
 
 // --- Pause menu (reasons, offered actions and titles: see ./pause.ts) ---
@@ -1914,18 +1870,13 @@ async function showPauseMenu(ctx: ExtensionCommandContext, request: PauseRequest
 	}
 }
 
-/** One-line review-fix cycle status for the task details. */
-function formatCycleInfo(cycle: ReviewCycleState): string {
-	const counts = cycleCounts(cycle);
-	const last = cycle.rounds.at(-1);
-	const parts = [`round ${counts.round}/${counts.roundLimit}`];
-	if (last) parts.push(last.verdict);
-	parts.push(
-		`${counts.fixed} fixed, ${counts.rejected} rejected, ${counts.deferred} deferred, ${counts.unresolved} unresolved`,
-	);
-	const callouts = cycle.callouts.length;
-	if (callouts > 0) parts.push(`${callouts} callout${callouts === 1 ? "" : "s"}`);
-	return parts.join(" • ");
+/** Review-fix cycle progress (round counter + finding counts) for task details and summary. */
+function cycleProgress(cycle: ReviewCycleState): TaskReviewProgress {
+	return {
+		...cycleCounts(cycle),
+		verdict: cycle.rounds.at(-1)?.verdict,
+		callouts: cycle.callouts.length,
+	};
 }
 
 // --- Git helpers ---
@@ -2058,7 +2009,8 @@ async function runOrchestratorLoop(
 			summary: undefined,
 			currentActivity: undefined,
 			currentTurn: 0,
-			outputEvents: [],
+			outputGroups: [],
+			phaseCosts: {},
 		})),
 		totalCost: 0,
 		totalCommits: 0,
@@ -2209,7 +2161,7 @@ async function runOrchestratorLoop(
 				break;
 		}
 
-		appendOutputEvent(taskState.outputEvents, activity);
+		appendPhaseEvent(taskState.outputGroups, activity);
 		requestOverlayRender();
 	};
 
@@ -2242,6 +2194,22 @@ async function runOrchestratorLoop(
 		taskState.cost += cost;
 		loopState.totalCost += cost;
 		phaseCosts[phase] = (phaseCosts[phase] ?? 0) + cost;
+		finishPhaseGroup(taskState.outputGroups, { cost });
+		requestOverlayRender();
+	};
+
+	/**
+	 * Start a new output group for the next subagent run (header in the output
+	 * viewer, e.g. `Review #1` or `Fix #1.1 [P1] <title>`).
+	 */
+	const beginPhaseOutput = (taskState: LoopTaskState, ref: PhaseRef, note?: string) => {
+		startPhaseGroup(taskState.outputGroups, ref, { note });
+		requestOverlayRender();
+	};
+
+	/** Record the one-line outcome of the latest subagent run (output viewer header). */
+	const endPhaseOutput = (taskState: LoopTaskState, outcome: string, failed = false) => {
+		finishPhaseGroup(taskState.outputGroups, { outcome, failed });
 		requestOverlayRender();
 	};
 
@@ -2375,6 +2343,10 @@ async function runOrchestratorLoop(
 		pauseRequested = false;
 		const reasonText = options.reasonText ?? defaultReasonText(options.reason, phase);
 		taskState.currentActivity = `⏸ ${reasonText}`;
+		const lastGroup = taskState.outputGroups.at(-1);
+		if (lastGroup && lastGroup.outcome === undefined) {
+			finishPhaseGroup(taskState.outputGroups, { outcome: `⏸ paused — ${reasonText}`, failed: true });
+		}
 		requestOverlayRender();
 		if (widgetTimer) clearInterval(widgetTimer);
 		try {
@@ -2424,6 +2396,10 @@ async function runOrchestratorLoop(
 		}
 	};
 
+	/** ` • JSON repaired` if the result was repaired by the orchestrator model. */
+	const repairedSuffix = (parsed: { ok: boolean; repaired?: boolean }) =>
+		parsed.ok && parsed.repaired ? " • JSON repaired" : "";
+
 	type ImplementPhaseOutcome =
 		| { kind: "implemented"; summary: string }
 		| PhaseExit;
@@ -2443,10 +2419,14 @@ async function runOrchestratorLoop(
 		let prompt = buildTaskPrompt(task, prdId);
 		let retriesRemaining = settings.implementationRetries;
 		let attempt = 1;
+		/** Qualifier of the next output group header (`resumed`, `retry`). */
+		let runNote: string | undefined;
 
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
+			beginPhaseOutput(taskState, { phase: "implement", attempt }, runNote);
+			runNote = undefined;
 			const run = await spawnSubagent({
 				taskPrompt: prompt,
 				model: settings.steps.implement.model,
@@ -2471,6 +2451,7 @@ async function runOrchestratorLoop(
 				const action = await pause(task, taskState, "Implement", options);
 				if (action === "resume") {
 					prompt = buildContinuePrompt(task, prdId);
+					runNote = "resumed";
 					taskState.currentActivity = "▶ resuming…";
 					requestOverlayRender();
 					continue;
@@ -2490,9 +2471,11 @@ async function runOrchestratorLoop(
 			if (!parsedRun.ok && parsedRun.status === "invalid-result") {
 				const options: PauseOptions = { reason: "invalid-result", errors: [parsedRun.error] };
 				taskState.errors = options.errors!;
+				endPhaseOutput(taskState, "invalid JSON result (repair failed)", true);
 				const action = await pause(task, taskState, "Implement", options);
 				if (action === "retry-phase") {
 					prompt = buildContinuePrompt(task, prdId);
+					runNote = "retry";
 					taskState.errors = [];
 					taskState.currentActivity = "▶ retrying implementation…";
 					requestOverlayRender();
@@ -2502,12 +2485,14 @@ async function runOrchestratorLoop(
 			}
 
 			if (result.success) {
+				endPhaseOutput(taskState, `success${repairedSuffix(parsedRun)}`);
 				taskState.errors = [];
 				taskState.status = "running";
 				return { kind: "implemented", summary: result.summary };
 			}
 
 			taskState.errors = result.errors;
+			endPhaseOutput(taskState, `failed — ${result.errors[0] ?? result.summary}`, true);
 
 			// --- Pause: still failing after all retries ---
 			if (retriesRemaining <= 0) {
@@ -2549,6 +2534,8 @@ async function runOrchestratorLoop(
 		phaseCosts: Partial<Record<CostPhase, number>>,
 		options: { round: number; rejectedFindings: RejectedFinding[] },
 	): Promise<ReviewPhaseOutcome> => {
+		/** Qualifier of the next output group header (`restarted`, `retry`). */
+		let runNote: string | undefined;
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
@@ -2573,6 +2560,8 @@ async function runOrchestratorLoop(
 					round: options.round,
 				});
 
+				beginPhaseOutput(taskState, { phase: "review", round: options.round }, runNote);
+				runNote = undefined;
 				const run = await spawnSubagent({
 					taskPrompt: prompt,
 					model: settings.steps.review.model,
@@ -2590,6 +2579,7 @@ async function runOrchestratorLoop(
 					const pauseOptions: PauseOptions = { reason: "manual" };
 					const action = await pause(task, taskState, "Review", pauseOptions);
 					if (action === "resume") {
+						runNote = "restarted";
 						taskState.currentActivity = "▶ restarting review…";
 						requestOverlayRender();
 						continue;
@@ -2599,8 +2589,19 @@ async function runOrchestratorLoop(
 				}
 
 				if (aborted) return { kind: "aborted" };
-				if (parsed.ok) return { kind: "reviewed", review: parsed.value };
+				if (parsed.ok) {
+					endPhaseOutput(
+						taskState,
+						`${formatReviewOutcome(parsed.value.verdict, parsed.value.findings)}${repairedSuffix(parsed)}`,
+					);
+					return { kind: "reviewed", review: parsed.value };
+				}
 
+				endPhaseOutput(
+					taskState,
+					parsed.status === "invalid-result" ? "invalid JSON result (repair failed)" : `reviewer ${parsed.status}`,
+					true,
+				);
 				failure = parsed.status === "invalid-result"
 					? { reason: "invalid-result", errors: [parsed.error] }
 					: {
@@ -2614,6 +2615,7 @@ async function runOrchestratorLoop(
 			taskState.errors = failure.errors ?? [];
 			const action = await pause(task, taskState, "Review", failure);
 			if (action === "retry-phase") {
+				runNote = "retry";
 				taskState.errors = [];
 				taskState.currentActivity = "▶ retrying review…";
 				requestOverlayRender();
@@ -2649,9 +2651,26 @@ async function runOrchestratorLoop(
 			prdId,
 		});
 
+		const fixRef: PhaseRef = {
+			phase: "fix",
+			round: step.round,
+			index: step.index,
+			priority: step.finding.priority,
+			title: step.finding.title,
+		};
+		/** Qualifier of the next output group header (`restarted`). */
+		let runNote: string | undefined;
+		/** Record the fixer outcome in the output group and return it. */
+		const fixResult = (outcome: FixOutcome): FixPhaseOutcome => {
+			endPhaseOutput(taskState, formatFixOutcome(outcome), outcome.status === "unresolved");
+			return { kind: "result", outcome };
+		};
+
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
+			beginPhaseOutput(taskState, fixRef, runNote);
+			runNote = undefined;
 			const run = await spawnSubagent({
 				taskPrompt: prompt,
 				model: settings.steps.fix.model,
@@ -2669,12 +2688,13 @@ async function runOrchestratorLoop(
 				const pauseOptions: PauseOptions = { reason: "manual" };
 				const action = await pause(task, taskState, "Fix", pauseOptions);
 				if (action === "resume") {
+					runNote = "restarted";
 					taskState.currentActivity = "▶ restarting fix…";
 					requestOverlayRender();
 					continue;
 				}
 				if (action === "skip-phase") {
-					return { kind: "result", outcome: { status: "unresolved", reason: "Fix skipped manually (pause)" } };
+					return fixResult({ status: "unresolved", reason: "Fix skipped manually (pause)" });
 				}
 				return handleCommonPauseAction(task, taskState, "Fix", pauseOptions, action);
 			}
@@ -2683,10 +2703,7 @@ async function runOrchestratorLoop(
 
 			if (!parsed.ok) {
 				const what = parsed.status === "invalid-result" ? "returned no valid result" : parsed.status === "aborted" ? "was aborted" : "crashed";
-				return {
-					kind: "result",
-					outcome: { status: "unresolved", reason: `Fixer ${what}: ${truncateStr(parsed.error, 300)}` },
-				};
+				return fixResult({ status: "unresolved", reason: `Fixer ${what}: ${truncateStr(parsed.error, 300)}` });
 			}
 
 			const value = parsed.value;
@@ -2694,9 +2711,9 @@ async function runOrchestratorLoop(
 				const summary = [value.summary || value.reason, value.verification ? `Verification: ${value.verification}` : ""]
 					.filter((part) => part.trim())
 					.join(" — ");
-				return { kind: "result", outcome: { status: "fixed", summary, verification: value.verification } };
+				return fixResult({ status: "fixed", summary, verification: value.verification });
 			}
-			return { kind: "result", outcome: { status: "rejected", reason: value.reason || value.summary, summary: value.summary } };
+			return fixResult({ status: "rejected", reason: value.reason || value.summary, summary: value.summary });
 		}
 	};
 
@@ -2722,12 +2739,16 @@ async function runOrchestratorLoop(
 		phaseCosts: Partial<Record<CostPhase, number>>,
 	): Promise<CommitPhaseOutcome> => {
 		const headBefore = await getHeadSha(pi, ctx.cwd);
+		/** Qualifier of the next output group header (`restarted`, `retry`). */
+		let runNote: string | undefined;
 
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
 			let errors: string[] = [];
 			let reason: PauseReasonKind = "committer-failed";
+			/** True if a committer subagent ran in this iteration (has an output group). */
+			let spawned = false;
 
 			const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
 			if (status.code !== 0) {
@@ -2737,6 +2758,9 @@ async function runOrchestratorLoop(
 				if (changedFiles.length > 0) {
 					taskState.currentActivity = undefined;
 					taskState.currentTurn = 0;
+					beginPhaseOutput(taskState, { phase: "commit" }, runNote);
+					runNote = undefined;
+					spawned = true;
 					const run = await spawnSubagent({
 						taskPrompt: buildCommitterPrompt({ commitRules, taskTitle: task.title, changedFiles }),
 						model: settings.steps.commit.model,
@@ -2754,6 +2778,7 @@ async function runOrchestratorLoop(
 						const pauseOptions: PauseOptions = { reason: "manual" };
 						const action = await pause(task, taskState, "Commit", pauseOptions);
 						if (action === "resume") {
+							runNote = "restarted";
 							taskState.currentActivity = "▶ restarting commit…";
 							requestOverlayRender();
 							continue;
@@ -2800,14 +2825,21 @@ async function runOrchestratorLoop(
 
 			if (errors.length === 0) {
 				taskState.errors = [];
-				return { kind: "committed", commits: await listCommitsSince(pi, ctx.cwd, headBefore) };
+				const commits = await listCommitsSince(pi, ctx.cwd, headBefore);
+				if (spawned) endPhaseOutput(taskState, `${commits.length} commit${commits.length === 1 ? "" : "s"} created`);
+				return { kind: "committed", commits };
 			}
 
 			// --- Pause: committer failed, invalid result or a hook rejected the commit (never bypassed) ---
 			const failure: PauseOptions = { reason, errors };
 			taskState.errors = errors;
+			if (spawned) {
+				const what = reason === "hook-failed" ? "hook failed" : reason === "invalid-result" ? "invalid JSON result" : "failed";
+				endPhaseOutput(taskState, `${what} — ${errors[0] ?? ""}`, true);
+			}
 			const action = await pause(task, taskState, "Commit", failure);
 			if (action === "retry-phase") {
+				runNote = "retry";
 				taskState.errors = [];
 				taskState.currentActivity = "▶ retrying commit…";
 				requestOverlayRender();
@@ -2877,7 +2909,7 @@ async function runOrchestratorLoop(
 			? "Resolved by a human (needs-human) — changes committed without another automated review."
 			: undefined;
 		const updateCycleInfo = () => {
-			taskState.reviewInfo = formatCycleInfo(cycle);
+			taskState.review = cycleProgress(cycle);
 			requestOverlayRender();
 		};
 
@@ -2904,13 +2936,13 @@ async function runOrchestratorLoop(
 							? "No changes outside .pi/ — review skipped."
 							: `No changes outside .pi/ left for review round ${step.round} — review skipped.`;
 						if (resumeMode === "review") reviewNote = `Re-reviewed after release to a human (needs-human). ${reviewNote}`;
-						if (step.round === 1) taskState.reviewInfo = "skipped (no changes outside .pi/)";
+						taskState.reviewNote = reviewNote;
 						break cycleLoop;
 					case "skip-phase":
 						reviewNote = step.round === 1
 							? "Review skipped manually (pause) — committed without an automated review."
 							: `Review round ${step.round} skipped manually (pause) — the last fixes were committed without a re-review.`;
-						if (step.round === 1) taskState.reviewInfo = "skipped manually";
+						taskState.reviewNote = reviewNote;
 						break cycleLoop;
 					default:
 						return exitToTaskOutcome(reviewOutcome, { cycle }, cycleAbortSummary);
@@ -3010,6 +3042,7 @@ async function runOrchestratorLoop(
 				let resumeMode = resume && resume.taskId === task.id ? resume.mode : undefined;
 				/** Cost per phase for the execution report (kept across "Retry task"). */
 				const phaseCosts: Partial<Record<CostPhase, number>> = {};
+				taskState.phaseCosts = phaseCosts;
 				taskState.startTime = Date.now();
 
 				let outcome: TaskOutcome;
@@ -3022,8 +3055,9 @@ async function runOrchestratorLoop(
 					taskState.summary = undefined;
 					taskState.currentActivity = undefined;
 					taskState.currentTurn = 0;
-					taskState.outputEvents = [];
-					taskState.reviewInfo = undefined;
+					taskState.outputGroups = [];
+					taskState.review = undefined;
+					taskState.reviewNote = undefined;
 					taskState.phase = undefined;
 					taskState.phaseLabel = undefined;
 					updateStatus();
