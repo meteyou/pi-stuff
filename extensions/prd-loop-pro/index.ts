@@ -5,11 +5,14 @@
  * - /prd-loop-pro [prd-N] — Execute all tasks of a PRD autonomously
  * - /ralph-pro [prd-N]    — Alias for /prd-loop-pro
  *
+ * `prd-N` is the only argument. All other configuration lives in persisted
+ * settings (see ./settings.ts and ./settings-ui.ts).
+ *
  * Start sequence:
  * 1. Git clean check
  * 2. PRD selection (dialog or argument)
- * 3. Configuration dialogs (retry fixes, smart commits, model selection)
- * 4. Confirmation dialog
+ * 3. Load + validate global settings (wizard on first start)
+ * 4. Overview dialog: Confirm & start / Change / Cancel
  * 5. Orchestrator loop: resolve tasks → spawn subagents → commit → update todos
  */
 
@@ -20,8 +23,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { parseFrontmatter, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
+import type { PrdLoopProSettings } from "./settings.ts";
+import { resolveStartSettings } from "./settings-ui.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -142,112 +147,33 @@ async function getActivePrds(cwd: string): Promise<{ prd: TodoItem; openTaskCoun
 	return result;
 }
 
-// --- Configuration types and flag parsing ---
+// --- Command argument parsing ---
 
-/** Configuration for the orchestrator loop. */
-export interface LoopConfig {
-	retryFixes: number;
-	smartCommits: boolean;
-	model: string; // "provider/model-id" format
-	commitModel?: string; // Optional dedicated model for smart commits
-	thinkingLevel?: string; // "minimal" | "low" | "medium" | "high" | "xhigh" | undefined
-	commitThinkingLevel?: string; // Optional separate thinking level for smart commits
-}
-
-/** Parsed flags from the command args string. */
-interface ParsedFlags {
+/** Parsed command arguments: `prd-N` is the only supported argument. */
+interface ParsedArgs {
 	prdTag: string | null;
-	retryFixes: number | null;
-	smartCommits: boolean | null;
-	model: string | null;
-	commitModel: string | null;
-	thinkingLevel: string | null;
-	commitThinkingLevel: string | null;
 	error: string | null;
 }
 
+const USAGE = "Usage: /prd-loop-pro [prd-N]";
+
 /**
- * Parse command args string for the prd-N argument and flags.
- *
- * Format: /prd-loop-pro [prd-N] [--retry-fixes=N] [--smart-commits] [--model=<id>] [--commit-model=<id>]
+ * Parse the command args string. Accepts an optional `prd-N` argument and
+ * nothing else; all other configuration lives in the persisted settings.
  */
-export function parseCommandArgs(args: string): ParsedFlags {
-	const result: ParsedFlags = {
-		prdTag: null,
-		retryFixes: null,
-		smartCommits: null,
-		model: null,
-		commitModel: null,
-		thinkingLevel: null,
-		commitThinkingLevel: null,
-		error: null,
-	};
-
-	if (!args.trim()) return result;
-
-	const tokens = args.trim().split(/\s+/);
+export function parseCommandArgs(args: string): ParsedArgs {
+	const tokens = args.trim().split(/\s+/).filter(Boolean);
+	let prdTag: string | null = null;
 
 	for (const token of tokens) {
-		if (/^prd-\d+$/i.test(token)) {
-			result.prdTag = token.toLowerCase();
-		} else if (token.startsWith("--retry-fixes=")) {
-			const value = token.slice("--retry-fixes=".length);
-			const num = parseInt(value, 10);
-			if (isNaN(num) || num < 0) {
-				result.error = `Invalid --retry-fixes value: "${value}" (must be a non-negative integer)`;
-				return result;
-			}
-			result.retryFixes = num;
-		} else if (token === "--smart-commits") {
-			result.smartCommits = true;
-		} else if (token.startsWith("--model=")) {
-			const value = token.slice("--model=".length);
-			if (!value) {
-				result.error = `Invalid --model value: empty string`;
-				return result;
-			}
-			result.model = value;
-		} else if (token.startsWith("--commit-model=")) {
-			const value = token.slice("--commit-model=".length);
-			if (!value) {
-				result.error = `Invalid --commit-model value: empty string`;
-				return result;
-			}
-			result.commitModel = value;
-		} else if (token.startsWith("--thinking=")) {
-			const value = token.slice("--thinking=".length);
-			const validLevels = ["minimal", "low", "medium", "high", "xhigh"];
-			if (!validLevels.includes(value)) {
-				result.error = `Invalid --thinking value: "${value}" (must be one of: ${validLevels.join(", ")})`;
-				return result;
-			}
-			result.thinkingLevel = value;
-		} else if (token.startsWith("--commit-thinking=")) {
-			const value = token.slice("--commit-thinking=".length);
-			const validLevels = ["minimal", "low", "medium", "high", "xhigh"];
-			if (!validLevels.includes(value)) {
-				result.error = `Invalid --commit-thinking value: "${value}" (must be one of: ${validLevels.join(", ")})`;
-				return result;
-			}
-			result.commitThinkingLevel = value;
-		} else if (token.startsWith("--")) {
-			result.error = `Unknown flag: "${token}"`;
-			return result;
+		if (/^prd-\d+$/i.test(token) && prdTag === null) {
+			prdTag = token.toLowerCase();
 		} else {
-			// Ignore other tokens (could be partial PRD names etc.)
+			return { prdTag: null, error: `Unexpected argument: "${token}". ${USAGE}` };
 		}
 	}
 
-	return result;
-}
-
-/**
- * Parse the `prd-N` argument from the command args string.
- * @deprecated Use parseCommandArgs() instead — kept for backward compat in tests.
- */
-function parsePrdArg(args: string): string | null {
-	const parsed = parseCommandArgs(args);
-	return parsed.prdTag;
+	return { prdTag, error: null };
 }
 
 // --- Subagent types and spawning ---
@@ -1943,7 +1869,7 @@ async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Prom
 	}
 }
 
-// --- Smart commits (prd-committer agent) ---
+// --- Commits (prd-committer agent) ---
 
 /**
  * Load the prd-committer agent definition from the extension's agents/ directory.
@@ -2036,7 +1962,7 @@ async function simpleAutoCommit(
  * - Live overlay with task navigation and expandable details
  * - Output viewer overlay for the currently selected task
  * - Ctrl+C pauses the current subagent and opens the pause menu
- * - Smart commits via prd-committer subagent
+ * - Commits via prd-committer subagent (commit model/thinking from settings)
  * - Final summary widget on completion/failure/abort
  */
 async function runOrchestratorLoop(
@@ -2044,7 +1970,7 @@ async function runOrchestratorLoop(
 	pi: ExtensionAPI,
 	prd: TodoItem,
 	prdTag: string,
-	config: LoopConfig,
+	settings: PrdLoopProSettings,
 ): Promise<void> {
 	const agent = await loadPrdWorkerAgent(EXTENSION_DIR);
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
@@ -2104,7 +2030,7 @@ async function runOrchestratorLoop(
 		totalCommits: 0,
 		currentTaskIndex: 0,
 		currentRetry: 0,
-		maxRetries: config.retryFixes,
+		maxRetries: settings.implementationRetries,
 	};
 
 	const prdTitle = prd.title;
@@ -2243,7 +2169,7 @@ async function runOrchestratorLoop(
 				requestOverlayRender();
 
 				const initialPrompt = buildTaskPrompt(task, prdId);
-				let retriesRemaining = config.retryFixes;
+				let retriesRemaining = settings.implementationRetries;
 				let attempt = 1;
 				let result: SubagentResult | undefined;
 				let currentPrompt = initialPrompt;
@@ -2254,8 +2180,8 @@ async function runOrchestratorLoop(
 
 					result = await spawnSubagent({
 						taskPrompt: currentPrompt,
-						model: config.model,
-						thinkingLevel: config.thinkingLevel,
+						model: settings.steps.implement.model,
+						thinkingLevel: settings.steps.implement.thinking,
 						cwd: ctx.cwd,
 						agent,
 						signal: currentAbortController.signal,
@@ -2358,7 +2284,7 @@ async function runOrchestratorLoop(
 								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
 								currentAbortController = new AbortController();
 								currentPrompt = initialPrompt;
-								retriesRemaining = config.retryFixes;
+								retriesRemaining = settings.implementationRetries;
 								attempt = 1;
 								taskState.retries = 0;
 								taskState.errors = [];
@@ -2466,42 +2392,35 @@ Errors: ${result.errors.join("; ")}`,
 
 				const shortTitle = extractShortTitle(task.title);
 
-				if (config.smartCommits) {
-					const committerResult = await spawnCommitterSubagent(
-						ctx.cwd,
-						prdTag,
-						config.commitModel ?? config.model,
-						config.commitThinkingLevel ?? config.thinkingLevel,
-						currentAbortController.signal,
-					);
+				// Committer agent is always used (smart-commit toggle removed).
+				// The simple fallback commit is kept until the committer rework.
+				const committerResult = await spawnCommitterSubagent(
+					ctx.cwd,
+					prdTag,
+					settings.steps.commit.model,
+					settings.steps.commit.thinking,
+					currentAbortController.signal,
+				);
 
-					loopState.totalCost += committerResult.cost;
-					taskState.cost += committerResult.cost;
-					requestOverlayRender();
+				loopState.totalCost += committerResult.cost;
+				taskState.cost += committerResult.cost;
+				requestOverlayRender();
 
-					if (aborted) {
-						taskState.status = "aborted";
-						taskState.summary = "Task execution was cancelled during commit.";
-						if (!taskState.endTime) taskState.endTime = Date.now();
-						break;
-					}
+				if (aborted) {
+					taskState.status = "aborted";
+					taskState.summary = "Task execution was cancelled during commit.";
+					if (!taskState.endTime) taskState.endTime = Date.now();
+					break;
+				}
 
-					if (committerResult.success) {
-						loopState.totalCommits += committerResult.commitCount;
-					} else {
-						const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-						if (fallback.committed) {
-							loopState.totalCommits++;
-						} else if (fallback.error) {
-							ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
-						}
-					}
+				if (committerResult.success) {
+					loopState.totalCommits += committerResult.commitCount;
 				} else {
-					const commitResult = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-					if (commitResult.committed) {
+					const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
+					if (fallback.committed) {
 						loopState.totalCommits++;
-					} else if (commitResult.error) {
-						ctx.ui.notify(`⚠️ Git commit warning: ${commitResult.error}`, "warning");
+					} else if (fallback.error) {
+						ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
 					}
 				}
 
@@ -2568,61 +2487,11 @@ Errors: ${result.errors.join("; ")}`,
 
 // --- Main command handler ---
 
-/**
- * Get a display string for a model in "provider/id" format.
- */
-function modelDisplayId(model: { provider: string; id: string }): string {
-	return `${model.provider}/${model.id}`;
-}
-
-type AvailableModelOption = { provider: string; id: string; name: string; reasoning: boolean };
-
-function stripThinkingSuffix(modelPattern: string): string {
-	const validThinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
-	const trimmed = modelPattern.trim();
-	const lastColon = trimmed.lastIndexOf(":");
-	if (lastColon === -1) return trimmed;
-	const suffix = trimmed.slice(lastColon + 1).toLowerCase();
-	if (!validThinkingLevels.has(suffix)) return trimmed;
-	return trimmed.slice(0, lastColon);
-}
-
-function wildcardToRegex(pattern: string): RegExp {
-	const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-	return new RegExp(`^${escaped}$`, "i");
-}
-
-function matchesModelPattern(pattern: string, model: AvailableModelOption): boolean {
-	const normalized = stripThinkingSuffix(pattern);
-	if (!normalized) return false;
-
-	const fullId = modelDisplayId(model);
-	const matcher = wildcardToRegex(normalized);
-	if (matcher.test(fullId)) return true;
-	if (!normalized.includes("/")) {
-		if (matcher.test(model.id)) return true;
-		if (matcher.test(model.name)) return true;
-	}
-	return false;
-}
-
-function getScopedModelsFromSettings(cwd: string, availableModels: AvailableModelOption[]): AvailableModelOption[] {
-	try {
-		const settings = SettingsManager.create(cwd);
-		const patterns = settings.getEnabledModels();
-		if (!patterns || patterns.length === 0) return [];
-		const scoped = availableModels.filter((model) => patterns.some((pattern) => matchesModelPattern(pattern, model)));
-		return scoped;
-	} catch {
-		return [];
-	}
-}
-
 async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
-	// Step 0: Parse flags
-	const flags = parseCommandArgs(args);
-	if (flags.error) {
-		ctx.ui.notify(flags.error, "error");
+	// Step 0: Parse arguments (`prd-N` is the only supported argument)
+	const parsedArgs = parseCommandArgs(args);
+	if (parsedArgs.error) {
+		ctx.ui.notify(parsedArgs.error, "error");
 		return;
 	}
 
@@ -2646,11 +2515,11 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		return;
 	}
 
-	if (flags.prdTag) {
+	if (parsedArgs.prdTag) {
 		// Direct selection via argument
-		selectedPrd = activePrds.find((p) => p.prd.tags.includes(flags.prdTag!));
+		selectedPrd = activePrds.find((p) => p.prd.tags.includes(parsedArgs.prdTag!));
 		if (!selectedPrd) {
-			ctx.ui.notify(`No active PRD found with tag "${flags.prdTag}".`, "error");
+			ctx.ui.notify(`No active PRD found with tag "${parsedArgs.prdTag}".`, "error");
 			return;
 		}
 	} else {
@@ -2670,165 +2539,17 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		selectedPrd = activePrds[choiceIndex];
 	}
 
-	// Step 3: Configuration dialogs (skip if corresponding flag is set)
-
-	// 3a. Retry fixes
-	let retryFixes: number;
-	if (flags.retryFixes !== null) {
-		retryFixes = flags.retryFixes;
-	} else {
-		const retryInput = await ctx.ui.input("Retry fixes", "0");
-		if (retryInput === undefined) return; // User cancelled
-		const parsed = parseInt(retryInput, 10);
-		if (isNaN(parsed) || parsed < 0) {
-			ctx.ui.notify(`Invalid retry fixes value: "${retryInput}" (must be a non-negative integer)`, "error");
-			return;
-		}
-		retryFixes = parsed;
-	}
-
-	// 3b. Smart commits
-	let smartCommits: boolean;
-	if (flags.smartCommits !== null) {
-		smartCommits = flags.smartCommits;
-	} else {
-		smartCommits = await ctx.ui.confirm("Smart commits", "Use a subagent for granular conventional commits?");
-	}
-
-	// 3c. Model selection (prefer scoped models from settings, fallback to current provider)
-	let selectedModelId: string;
-	let selectedModelObj: AvailableModelOption | undefined;
-	let commitModelId: string | undefined;
-	const currentModel = ctx.model;
-	const currentModelId = currentModel ? modelDisplayId(currentModel) : undefined;
-	const currentProvider = currentModel?.provider;
-
-	const allAvailableModels = ctx.modelRegistry.getAvailable() as AvailableModelOption[];
-	if (allAvailableModels.length === 0) {
-		ctx.ui.notify("No models available. Please configure an API key.", "error");
-		return;
-	}
-
-	const scopedModels = getScopedModelsFromSettings(ctx.cwd, allAvailableModels);
-	const providerModels = currentProvider
-		? allAvailableModels.filter((m) => m.provider === currentProvider)
-		: allAvailableModels;
-	const preferredModels = scopedModels.length > 0 ? scopedModels : providerModels;
-
-	if (preferredModels.length === 0) {
-		ctx.ui.notify(`No models available for provider "${currentProvider}".`, "error");
-		return;
-	}
-
-	if (flags.model !== null) {
-		const match = allAvailableModels.find((m) => modelDisplayId(m) === flags.model || m.id === flags.model);
-		if (!match) {
-			ctx.ui.notify(`Model not found: "${flags.model}"`, "error");
-			return;
-		}
-		selectedModelId = modelDisplayId(match);
-		selectedModelObj = match;
-	} else {
-		const modelOptions = preferredModels.map((m) => {
-			const id = modelDisplayId(m);
-			return currentModelId === id ? `${m.name} (${id}) ★` : `${m.name} (${id})`;
-		});
-
-		const title = scopedModels.length > 0
-			? `Model (scoped, ${scopedModels.length})`
-			: `Model (${currentProvider ?? "all providers"})`;
-		const modelChoice = await ctx.ui.select(title, modelOptions);
-		if (modelChoice === undefined) return; // User cancelled
-
-		const modelIndex = modelOptions.indexOf(modelChoice);
-		if (modelIndex === -1) return;
-		selectedModelId = modelDisplayId(preferredModels[modelIndex]);
-		selectedModelObj = preferredModels[modelIndex];
-	}
-
-	// 3d. Thinking level selection (only for reasoning models)
-	let thinkingLevel: string | undefined;
-	if (flags.thinkingLevel !== null) {
-		thinkingLevel = flags.thinkingLevel;
-	} else if (selectedModelObj?.reasoning) {
-		const thinkingLevels = ["minimal", "low", "medium", "high", "xhigh"];
-		const currentThinking = pi.getThinkingLevel();
-
-		const thinkingOptions = thinkingLevels.map((level) =>
-			level === currentThinking ? `${level} ★` : level,
-		);
-
-		const thinkingChoice = await ctx.ui.select("Thinking level", thinkingOptions);
-		if (thinkingChoice === undefined) return; // User cancelled
-
-		const thinkingIndex = thinkingOptions.indexOf(thinkingChoice);
-		if (thinkingIndex === -1) return;
-		thinkingLevel = thinkingLevels[thinkingIndex];
-	}
-
-	// 3e. Optional dedicated model for smart commits
-	if (smartCommits) {
-		if (flags.commitModel !== null) {
-			const match = allAvailableModels.find((m) => modelDisplayId(m) === flags.commitModel || m.id === flags.commitModel);
-			if (!match) {
-				ctx.ui.notify(`Commit model not found: "${flags.commitModel}"`, "error");
-				return;
-			}
-			commitModelId = modelDisplayId(match);
-		} else {
-			const commitSelectionModels = preferredModels.some((m) => modelDisplayId(m) === selectedModelId)
-				? preferredModels
-				: (selectedModelObj ? [selectedModelObj, ...preferredModels] : preferredModels);
-
-			const commitOptions = commitSelectionModels.map((m) => {
-				const id = modelDisplayId(m);
-				return id === selectedModelId ? `${m.name} (${id}) ★` : `${m.name} (${id})`;
-			});
-
-			const commitChoice = await ctx.ui.select("Commit model", commitOptions);
-			if (commitChoice === undefined) return; // User cancelled
-			const commitIndex = commitOptions.indexOf(commitChoice);
-			if (commitIndex === -1) return;
-			commitModelId = modelDisplayId(commitSelectionModels[commitIndex]);
-		}
-	}
-
-	// Build the config object
-	const config: LoopConfig = {
-		retryFixes,
-		smartCommits,
-		model: selectedModelId,
-		commitModel: commitModelId,
-		thinkingLevel,
-	};
-
-	// Step 4: Confirmation dialog
-	const completedCount = selectedPrd.totalTaskCount - selectedPrd.openTaskCount;
-	const taskThinking = config.thinkingLevel ?? "off";
-	const commitModelDisplay = config.smartCommits ? (config.commitModel ?? config.model) : "-";
-	const commitThinkingDisplay = config.smartCommits
-		? (config.commitThinkingLevel ?? config.thinkingLevel ?? "off")
-		: "-";
-	const confirmMessage = [
-		`🚀 Loop Configuration:`,
-		`   PRD:           ${selectedPrd.prd.title}`,
-		`   Tasks:         ${selectedPrd.openTaskCount} open, ${completedCount} completed`,
-		`   Retry Fixes:   ${config.retryFixes}`,
-		`   Smart Commits: ${config.smartCommits ? "Yes" : "No"}`,
-		`   Task Model:    ${config.model} - ${taskThinking}`,
-		`   Commit Model:  ${commitModelDisplay} - ${commitThinkingDisplay}`,
-		``,
-		`Start loop?`,
-	].join("\n");
-
-	const confirmed = await ctx.ui.confirm("PRD Loop Pro", confirmMessage);
-	if (!confirmed) {
-		return;
-	}
+	// Steps 3 + 4: Load/validate settings (wizard on first start) and show the overview
+	const settings = await resolveStartSettings(ctx, pi, {
+		title: selectedPrd.prd.title,
+		openTaskCount: selectedPrd.openTaskCount,
+		completedTaskCount: selectedPrd.totalTaskCount - selectedPrd.openTaskCount,
+	});
+	if (!settings) return;
 
 	// Step 5: Run the orchestrator loop
 	const selectedPrdTag = selectedPrd.prd.tags.find((t) => /^prd-\d+$/.test(t))!;
-	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, config);
+	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, settings);
 }
 
 // --- Extension entry point ---
