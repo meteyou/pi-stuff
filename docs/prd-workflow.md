@@ -105,8 +105,8 @@ The extension:
    - Returns structured JSON result (`{success, errors, summary}`)
    - On success: auto-commits, updates task todo to closed, updates PRD Task Index
    - On failure: retries with error context (if retries configured), or stops the loop
-6. **Shows a live overlay** — per-task status, elapsed time, cost, retries, with ↑/↓ navigation and expandable task
-   details (`a` expands/collapses all, `o` opens the subagent output)
+6. **Shows a live overlay** — per-task status, elapsed time, cost, retries, with ↑/↓ navigation (scrolls through long
+   task details first) and expandable task details (`a` expands/collapses all, `o` opens the subagent output)
 7. **Keeps the overlay open after the run** — the header shows the outcome and totals; tasks can still be expanded and
    inspected. `Esc`/`q` closes it
 8. **Posts a final summary to the chat** — a collapsible entry (not sent to the LLM): collapsed it shows failed/aborted
