@@ -1,21 +1,24 @@
 /**
  * PRD Loop Pro — Settings module (pure, no pi imports).
  *
- * Schema, defaults, load/save of the global settings file and validation
- * against an injected list of available models.
+ * Schema, defaults, load/save of the global settings file, per-project
+ * overrides (per-field merge with source tracking, project-only save, removal)
+ * and validation against an injected list of available models.
  *
  * This file is intentionally free of pi imports so it can be unit-tested with
  * `node --test` (native TypeScript type stripping). Only erasable TypeScript
  * syntax is allowed here (no enums, no parameter properties, no namespaces).
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 // --- Constants ---
 
 export const SETTINGS_VERSION = 1;
 export const SETTINGS_FILE_NAME = "prd-loop-pro.json";
+/** Project config directory (relative to the project root) holding the project settings file. */
+export const PROJECT_CONFIG_DIR_NAME = ".pi";
 
 /** Thinking levels selectable per step (ordered from none to deepest). */
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -94,7 +97,49 @@ export type SettingsField =
 	| "version"
 	| "fixThreshold"
 	| "maxReviewRounds"
-	| "implementationRetries";
+	| "implementationRetries"
+	/** The project settings file itself cannot be used (unreadable / invalid JSON). */
+	| "projectFile";
+
+/**
+ * A field that can be overridden per project. Steps are overridden as a unit
+ * (model + thinking belong together), all other fields individually.
+ */
+export type OverrideField = `steps.${StepKey}` | "fixThreshold" | "maxReviewRounds" | "implementationRetries";
+
+/** All overridable fields in display order. */
+export const OVERRIDE_FIELDS: readonly OverrideField[] = [
+	...STEP_KEYS.map((key) => `steps.${key}` as const),
+	"fixThreshold",
+	"maxReviewRounds",
+	"implementationRetries",
+];
+
+/** Where a resolved field value comes from. */
+export type SettingsSource = "global" | "project";
+
+/**
+ * Contents of the project settings file: only the overridden fields.
+ * A step override may be partial; missing parts are taken from the global step.
+ */
+export interface SettingsOverrides {
+	version?: number;
+	steps?: Partial<Record<StepKey, Partial<StepSetting>>>;
+	fixThreshold?: string;
+	maxReviewRounds?: number;
+	implementationRetries?: number;
+}
+
+/** Effective settings (global merged with project overrides) plus the source of every field. */
+export interface ResolvedSettings {
+	settings: PrdLoopProSettings;
+	sources: Record<OverrideField, SettingsSource>;
+}
+
+export type LoadOverridesResult =
+	| { status: "missing"; path: string }
+	| { status: "invalid"; path: string; error: string }
+	| { status: "loaded"; path: string; overrides: SettingsOverrides };
 
 export interface SettingsIssue {
 	field: SettingsField;
@@ -111,6 +156,11 @@ export type LoadSettingsResult =
 /** Path of the global settings file inside the pi agent directory. */
 export function getGlobalSettingsPath(agentDir: string): string {
 	return join(agentDir, SETTINGS_FILE_NAME);
+}
+
+/** Path of the project settings file inside the project's `.pi` directory. */
+export function getProjectSettingsPath(projectDir: string): string {
+	return join(projectDir, PROJECT_CONFIG_DIR_NAME, SETTINGS_FILE_NAME);
 }
 
 // --- Model helpers ---
@@ -233,39 +283,333 @@ export function normalizeSettings(raw: Record<string, unknown>): PrdLoopProSetti
 	};
 }
 
+/**
+ * Normalize raw parsed JSON of a project settings file into overrides.
+ *
+ * Only fields present in the file become overrides. Values of the wrong type are
+ * kept in a form that validation of the merged settings will flag.
+ */
+export function normalizeOverrides(raw: Record<string, unknown>): SettingsOverrides {
+	const overrides: SettingsOverrides = {};
+	if (typeof raw.version === "number") overrides.version = raw.version;
+
+	if (isPlainObject(raw.steps)) {
+		const steps: Partial<Record<StepKey, Partial<StepSetting>>> = {};
+		for (const key of STEP_KEYS) {
+			if (!(key in raw.steps)) continue;
+			const step = raw.steps[key];
+			if (!isPlainObject(step)) {
+				// Unusable step override: flagged as "no model configured" by validation
+				steps[key] = { model: "" };
+				continue;
+			}
+			const override: Partial<StepSetting> = {};
+			if ("model" in step) override.model = typeof step.model === "string" ? step.model.trim() : "";
+			if ("thinking" in step) {
+				override.thinking = typeof step.thinking === "string" ? step.thinking : String(step.thinking);
+			}
+			if (override.model !== undefined || override.thinking !== undefined) steps[key] = override;
+		}
+		if (Object.keys(steps).length > 0) overrides.steps = steps;
+	}
+
+	if (raw.fixThreshold !== undefined) {
+		overrides.fixThreshold = typeof raw.fixThreshold === "string" ? raw.fixThreshold : String(raw.fixThreshold);
+	}
+	if (raw.maxReviewRounds !== undefined) {
+		overrides.maxReviewRounds = normalizeNumber(raw.maxReviewRounds, DEFAULT_MAX_REVIEW_ROUNDS);
+	}
+	if (raw.implementationRetries !== undefined) {
+		overrides.implementationRetries = normalizeNumber(raw.implementationRetries, DEFAULT_IMPLEMENTATION_RETRIES);
+	}
+
+	return overrides;
+}
+
 // --- Load / save ---
 
-/** Load a settings file. Never throws. */
-export function loadSettingsFile(path: string): LoadSettingsResult {
+type ReadJsonResult =
+	| { status: "missing" }
+	| { status: "invalid"; error: string }
+	| { status: "loaded"; data: Record<string, unknown> };
+
+function readJsonObject(path: string): ReadJsonResult {
 	let content: string;
 	try {
 		content = readFileSync(path, "utf-8");
 	} catch (err) {
-		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return { status: "missing", path };
-		return { status: "invalid", path, error: `Cannot read ${path}: ${errorMessage(err)}` };
+		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return { status: "missing" };
+		return { status: "invalid", error: `Cannot read ${path}: ${errorMessage(err)}` };
 	}
 
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(content);
 	} catch (err) {
-		return { status: "invalid", path, error: `Invalid JSON in ${path}: ${errorMessage(err)}` };
+		return { status: "invalid", error: `Invalid JSON in ${path}: ${errorMessage(err)}` };
 	}
 
 	if (!isPlainObject(parsed)) {
-		return { status: "invalid", path, error: `Invalid settings in ${path}: expected a JSON object` };
+		return { status: "invalid", error: `Invalid settings in ${path}: expected a JSON object` };
 	}
+	return { status: "loaded", data: parsed };
+}
 
-	return { status: "loaded", path, settings: normalizeSettings(parsed) };
+/** Load a settings file. Never throws. */
+export function loadSettingsFile(path: string): LoadSettingsResult {
+	const result = readJsonObject(path);
+	if (result.status === "missing") return { status: "missing", path };
+	if (result.status === "invalid") return { status: "invalid", path, error: result.error };
+	return { status: "loaded", path, settings: normalizeSettings(result.data) };
+}
+
+/** Load a project settings file (overrides only). Never throws. */
+export function loadProjectSettingsFile(path: string): LoadOverridesResult {
+	const result = readJsonObject(path);
+	if (result.status === "missing") return { status: "missing", path };
+	if (result.status === "invalid") return { status: "invalid", path, error: result.error };
+	const overrides = normalizeOverrides(result.data);
+	if (overrides.version !== undefined && overrides.version > SETTINGS_VERSION) {
+		return {
+			status: "invalid",
+			path,
+			error: `Project settings version ${overrides.version} in ${path} is newer than supported (${SETTINGS_VERSION})`,
+		};
+	}
+	return { status: "loaded", path, overrides };
 }
 
 /** Write a settings file (creates parent directories, atomic rename). */
 export function saveSettingsFile(path: string, settings: PrdLoopProSettings): void {
-	mkdirSync(dirname(path), { recursive: true });
 	const data: PrdLoopProSettings = { ...cloneSettings(settings), version: SETTINGS_VERSION };
+	writeJsonAtomic(path, data);
+}
+
+function writeJsonAtomic(path: string, data: unknown): void {
+	mkdirSync(dirname(path), { recursive: true });
 	const tmpPath = `${path}.${process.pid}.tmp`;
 	writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
 	renameSync(tmpPath, path);
+}
+
+/**
+ * Write the project settings file with the given overrides. If there are no
+ * overrides, the file is removed instead (project files stay minimal).
+ */
+export function saveProjectSettingsFile(path: string, overrides: SettingsOverrides): "written" | "removed" {
+	if (!hasOverrides(overrides)) {
+		removeProjectSettingsFile(path);
+		return "removed";
+	}
+	const data: SettingsOverrides = { version: SETTINGS_VERSION };
+	if (overrides.steps) {
+		const steps: Partial<Record<StepKey, Partial<StepSetting>>> = {};
+		for (const key of STEP_KEYS) {
+			const step = overrides.steps[key];
+			if (step) steps[key] = { ...step };
+		}
+		if (Object.keys(steps).length > 0) data.steps = steps;
+	}
+	if (overrides.fixThreshold !== undefined) data.fixThreshold = overrides.fixThreshold;
+	if (overrides.maxReviewRounds !== undefined) data.maxReviewRounds = overrides.maxReviewRounds;
+	if (overrides.implementationRetries !== undefined) data.implementationRetries = overrides.implementationRetries;
+	writeJsonAtomic(path, data);
+	return "written";
+}
+
+/** Delete the project settings file. Returns true if a file was removed. */
+export function removeProjectSettingsFile(path: string): boolean {
+	try {
+		rmSync(path);
+		return true;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+		throw err;
+	}
+}
+
+// --- Project overrides: merge, diff, save targets ---
+
+/** Whether the overrides contain at least one overridden field. */
+export function hasOverrides(overrides: SettingsOverrides | undefined): boolean {
+	if (!overrides) return false;
+	if (overrides.steps && STEP_KEYS.some((key) => overrides.steps![key] !== undefined)) return true;
+	return (
+		overrides.fixThreshold !== undefined ||
+		overrides.maxReviewRounds !== undefined ||
+		overrides.implementationRetries !== undefined
+	);
+}
+
+/** Step key of a `steps.*` override field, or undefined for scalar fields. */
+export function overrideFieldStep(field: OverrideField): StepKey | undefined {
+	return field.startsWith("steps.") ? (field.slice("steps.".length) as StepKey) : undefined;
+}
+
+/** Whether a single field is overridden. */
+function isOverridden(overrides: SettingsOverrides, field: OverrideField): boolean {
+	const step = overrideFieldStep(field);
+	if (step) return overrides.steps?.[step] !== undefined;
+	return overrides[field as Exclude<OverrideField, `steps.${StepKey}`>] !== undefined;
+}
+
+/** Copy a field value from `source` settings into `target` settings. */
+function copyField(target: PrdLoopProSettings, source: PrdLoopProSettings, field: OverrideField): void {
+	const step = overrideFieldStep(field);
+	if (step) {
+		target.steps[step] = { ...source.steps[step] };
+	} else if (field === "fixThreshold") {
+		target.fixThreshold = source.fixThreshold;
+	} else if (field === "maxReviewRounds") {
+		target.maxReviewRounds = source.maxReviewRounds;
+	} else if (field === "implementationRetries") {
+		target.implementationRetries = source.implementationRetries;
+	}
+}
+
+/** Whether a field has the same value in both settings objects. */
+export function fieldEquals(a: PrdLoopProSettings, b: PrdLoopProSettings, field: OverrideField): boolean {
+	const step = overrideFieldStep(field);
+	if (step) return a.steps[step].model === b.steps[step].model && a.steps[step].thinking === b.steps[step].thinking;
+	const key = field as "fixThreshold" | "maxReviewRounds" | "implementationRetries";
+	return Object.is(a[key], b[key]);
+}
+
+/** Fields whose value differs between `before` and `after`. */
+export function changedFields(before: PrdLoopProSettings, after: PrdLoopProSettings): OverrideField[] {
+	return OVERRIDE_FIELDS.filter((field) => !fieldEquals(before, after, field));
+}
+
+/**
+ * Merge global settings with project overrides (per field) and record the
+ * source of every field. A partial step override takes the missing part from
+ * the global step and counts as a project value.
+ */
+export function mergeSettings(global: PrdLoopProSettings, overrides?: SettingsOverrides): ResolvedSettings {
+	const settings = cloneSettings(global);
+	const sources = {} as Record<OverrideField, SettingsSource>;
+	for (const field of OVERRIDE_FIELDS) sources[field] = "global";
+	if (!overrides) return { settings, sources };
+
+	for (const key of STEP_KEYS) {
+		const step = overrides.steps?.[key];
+		if (!step) continue;
+		settings.steps[key] = {
+			model: step.model ?? global.steps[key].model,
+			thinking: step.thinking ?? global.steps[key].thinking,
+		};
+		sources[`steps.${key}`] = "project";
+	}
+	if (overrides.fixThreshold !== undefined) {
+		settings.fixThreshold = overrides.fixThreshold;
+		sources.fixThreshold = "project";
+	}
+	if (overrides.maxReviewRounds !== undefined) {
+		settings.maxReviewRounds = overrides.maxReviewRounds;
+		sources.maxReviewRounds = "project";
+	}
+	if (overrides.implementationRetries !== undefined) {
+		settings.implementationRetries = overrides.implementationRetries;
+		sources.implementationRetries = "project";
+	}
+	return { settings, sources };
+}
+
+/**
+ * Overrides containing only the fields of `target` that differ from `global`
+ * (used for "Save for this project only"). Steps are stored as a whole.
+ */
+export function computeProjectOverrides(global: PrdLoopProSettings, target: PrdLoopProSettings): SettingsOverrides {
+	const overrides: SettingsOverrides = {};
+	for (const field of OVERRIDE_FIELDS) {
+		if (fieldEquals(global, target, field)) continue;
+		const step = overrideFieldStep(field);
+		if (step) {
+			overrides.steps = { ...overrides.steps, [step]: { ...target.steps[step] } };
+		} else if (field === "fixThreshold") {
+			overrides.fixThreshold = target.fixThreshold;
+		} else if (field === "maxReviewRounds") {
+			overrides.maxReviewRounds = target.maxReviewRounds;
+		} else if (field === "implementationRetries") {
+			overrides.implementationRetries = target.implementationRetries;
+		}
+	}
+	return overrides;
+}
+
+/** Copy of the overrides without the given fields. */
+export function withoutOverrides(overrides: SettingsOverrides, fields: readonly OverrideField[]): SettingsOverrides {
+	const result: SettingsOverrides = {};
+	if (overrides.version !== undefined) result.version = overrides.version;
+	for (const field of OVERRIDE_FIELDS) {
+		if (fields.includes(field) || !isOverridden(overrides, field)) continue;
+		const step = overrideFieldStep(field);
+		if (step) {
+			result.steps = { ...result.steps, [step]: { ...overrides.steps![step] } };
+		} else if (field === "fixThreshold") {
+			result.fixThreshold = overrides.fixThreshold;
+		} else if (field === "maxReviewRounds") {
+			result.maxReviewRounds = overrides.maxReviewRounds;
+		} else if (field === "implementationRetries") {
+			result.implementationRetries = overrides.implementationRetries;
+		}
+	}
+	return result;
+}
+
+/** Current settings state of a project: global settings + optional project overrides. */
+export interface SettingsState {
+	global: PrdLoopProSettings;
+	/** Project overrides (empty object if there is no project file). */
+	overrides: SettingsOverrides;
+}
+
+/**
+ * "Save globally": the fields changed between `before` (effective settings when
+ * editing started) and `draft` are written to the global settings, and project
+ * overrides of exactly those fields are dropped so the change takes effect here
+ * too. Untouched project overrides stay in place.
+ */
+export function planGlobalSave(state: SettingsState, before: PrdLoopProSettings, draft: PrdLoopProSettings): SettingsState {
+	const changed = changedFields(before, draft);
+	const global = cloneSettings(state.global);
+	for (const field of changed) copyField(global, draft, field);
+	return { global, overrides: withoutOverrides(state.overrides, changed) };
+}
+
+/**
+ * Write "Save globally" to disk: global file always, project file only if it
+ * had overrides of changed fields. Returns the new state.
+ */
+export function saveGlobally(
+	paths: { globalPath: string; projectPath: string },
+	state: SettingsState,
+	before: PrdLoopProSettings,
+	draft: PrdLoopProSettings,
+): SettingsState {
+	const next = planGlobalSave(state, before, draft);
+	saveSettingsFile(paths.globalPath, next.global);
+	const projectChanged = OVERRIDE_FIELDS.some(
+		(field) => isOverridden(state.overrides, field) !== isOverridden(next.overrides, field),
+	);
+	if (projectChanged) saveProjectSettingsFile(paths.projectPath, next.overrides);
+	return next;
+}
+
+/**
+ * "Save for this project only": writes only the fields of `draft` that differ
+ * from the global settings (removes the file if nothing differs). Returns the new state.
+ */
+export function saveProjectOnly(projectPath: string, global: PrdLoopProSettings, draft: PrdLoopProSettings): SettingsState {
+	const overrides = computeProjectOverrides(global, draft);
+	saveProjectSettingsFile(projectPath, overrides);
+	return { global: cloneSettings(global), overrides };
+}
+
+/** "Remove project overrides": deletes the project file. Returns the new state. */
+export function removeProjectOverrides(projectPath: string, global: PrdLoopProSettings): SettingsState {
+	removeProjectSettingsFile(projectPath);
+	return { global: cloneSettings(global), overrides: {} };
 }
 
 function errorMessage(err: unknown): string {
@@ -388,4 +732,10 @@ export function stepIssues(issues: readonly SettingsIssue[], step: StepKey): Set
 /** Issues for a single field. */
 export function fieldIssues(issues: readonly SettingsIssue[], field: SettingsField): SettingsIssue[] {
 	return issues.filter((issue) => issue.field === field);
+}
+
+/** Issues belonging to an overridable field (a step's model + thinking, or a scalar field). */
+export function overrideFieldIssues(issues: readonly SettingsIssue[], field: OverrideField): SettingsIssue[] {
+	const step = overrideFieldStep(field);
+	return step ? stepIssues(issues, step) : fieldIssues(issues, field as SettingsField);
 }
