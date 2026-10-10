@@ -114,6 +114,8 @@ import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
 import { buildPauseMenu, defaultReasonText, releaseReasonFor, skipSummaryFor } from "./pause.ts";
 import type { PauseAction, PauseReasonKind, PauseRequest } from "./pause.ts";
 import { discardChanges } from "./discard.ts";
+import { arrowNavigation, clampScroll, findTaskBlock, revealBlock } from "./overlay-scroll.ts";
+import type { RowBlock } from "./overlay-scroll.ts";
 import {
 	appendOutputEvent,
 	appendPhaseEvent,
@@ -1287,6 +1289,10 @@ class PrdLoopOverlayComponent {
 	private selectedIndex = 0;
 	private expanded = new Set<number>();
 	private scrollOffset = 0;
+	/** Bring the selected task block into view at the next render (set when the selection/expansion changes). */
+	private revealSelected = true;
+	/** Layout of the last render, used by ↑/↓ to scroll within the selected block. */
+	private lastView: { viewHeight: number; totalRows: number; block: RowBlock } | undefined;
 
 	private confirmingAbort = false;
 	private finished: FinishedOverlayInfo | undefined;
@@ -1316,6 +1322,7 @@ class PrdLoopOverlayComponent {
 		if (this.state.tasks.length === 0) return;
 		this.selectedIndex = Math.max(0, Math.min(index, this.state.tasks.length - 1));
 		this.expanded.add(this.selectedIndex);
+		this.revealSelected = true;
 	}
 
 	getSelectedTaskIndex(): number {
@@ -1363,30 +1370,47 @@ class PrdLoopOverlayComponent {
 			// Toggle all: expand everything unless everything is already expanded.
 			if (this.expanded.size === this.state.tasks.length) this.expanded.clear();
 			else for (let i = 0; i < this.state.tasks.length; i++) this.expanded.add(i);
+			this.revealSelected = true;
 			this.requestRender();
 			return;
 		}
 
-		if (matchesKey(data, Key.up)) {
-			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-			this.requestRender();
-			return;
-		}
-
-		if (matchesKey(data, Key.down)) {
-			this.selectedIndex = Math.min(this.state.tasks.length - 1, this.selectedIndex + 1);
+		if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+			const direction = matchesKey(data, Key.up) ? "up" : "down";
+			if (!this.lastView) {
+				const step = direction === "up" ? -1 : 1;
+				this.selectedIndex = Math.max(0, Math.min(this.state.tasks.length - 1, this.selectedIndex + step));
+				this.revealSelected = true;
+			} else {
+				const result = arrowNavigation(
+					direction,
+					{ offset: this.scrollOffset, viewHeight: this.lastView.viewHeight, totalRows: this.lastView.totalRows },
+					this.lastView.block,
+					this.selectedIndex,
+					this.state.tasks.length,
+				);
+				if (result.kind === "none") return;
+				if (result.kind === "scroll") {
+					this.scrollOffset = result.offset;
+				} else {
+					this.selectedIndex = result.index;
+					this.revealSelected = true;
+				}
+			}
 			this.requestRender();
 			return;
 		}
 
 		if (matchesKey(data, Key.pageUp)) {
 			this.selectedIndex = Math.max(0, this.selectedIndex - 5);
+			this.revealSelected = true;
 			this.requestRender();
 			return;
 		}
 
 		if (matchesKey(data, Key.pageDown)) {
 			this.selectedIndex = Math.min(this.state.tasks.length - 1, this.selectedIndex + 5);
+			this.revealSelected = true;
 			this.requestRender();
 			return;
 		}
@@ -1394,12 +1418,14 @@ class PrdLoopOverlayComponent {
 		if (matchesKey(data, Key.enter) || matchesKey(data, Key.space) || matchesKey(data, Key.right)) {
 			if (this.expanded.has(this.selectedIndex)) this.expanded.delete(this.selectedIndex);
 			else this.expanded.add(this.selectedIndex);
+			this.revealSelected = true;
 			this.requestRender();
 			return;
 		}
 
 		if (matchesKey(data, Key.left)) {
 			this.expanded.delete(this.selectedIndex);
+			this.revealSelected = true;
 			this.requestRender();
 		}
 	}
@@ -1412,16 +1438,16 @@ class PrdLoopOverlayComponent {
 		const footerHeight = 2;
 		const contentHeight = Math.max(3, maxHeight - headerLines.length - footerHeight - 2);
 
-		const selectedRowIndex = rows.findIndex((row) => row.taskIndex === this.selectedIndex && row.kind === "header");
-		if (selectedRowIndex !== -1) {
-			if (selectedRowIndex < this.scrollOffset) this.scrollOffset = selectedRowIndex;
-			if (selectedRowIndex >= this.scrollOffset + contentHeight) {
-				this.scrollOffset = selectedRowIndex - contentHeight + 1;
-			}
-		}
-
-		const maxScroll = Math.max(0, rows.length - contentHeight);
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+		// Selection/expansion changed: show the whole selected task block (header
+		// on top if it is taller than the view). Otherwise keep the offset, so
+		// ↑/↓ can scroll through blocks line by line.
+		const block = findTaskBlock(rows, this.selectedIndex);
+		const view = { offset: this.scrollOffset, viewHeight: contentHeight, totalRows: rows.length };
+		this.scrollOffset = this.revealSelected
+			? revealBlock(view, block)
+			: clampScroll(this.scrollOffset, contentHeight, rows.length);
+		this.revealSelected = false;
+		this.lastView = { viewHeight: contentHeight, totalRows: rows.length, block };
 
 		const visibleRows = rows
 			.slice(this.scrollOffset, this.scrollOffset + contentHeight)
@@ -1495,10 +1521,10 @@ class PrdLoopOverlayComponent {
 	private buildFooter(width: number, totalRows: number, contentHeight: number): string[] {
 		const end = Math.min(totalRows, this.scrollOffset + contentHeight);
 		const hint = this.finished
-			? this.theme.fg("dim", "↑↓ select • enter expand • a expand all • o output • esc/q close & post summary to chat")
+			? this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • esc/q close & post summary to chat")
 			: this.confirmingAbort
 				? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
-				: this.theme.fg("dim", "↑↓ select • enter expand • a expand all • o output • ← collapse • ctrl+c pause • esc abort");
+				: this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • ← collapse • ctrl+c pause • esc abort");
 		const scroll = totalRows > contentHeight
 			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
 			: "";

@@ -220,8 +220,8 @@ continues with the next task of the PRD.
 
 - **Live overlay** — task rows show the current phase and round (e.g. `Review 2/3`, `Fix 2/4 [P1] <title>`). Expanded
   task details show the review round counter, fixed/rejected/deferred/unresolved counts and the cost per phase.
-  Keys: `↑/↓` select, `Enter` expand, `←` collapse, `a` expand/collapse all, `o` output viewer, `Ctrl+C` pause,
-  `Esc` (twice) abort.
+  Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
+  `a` expand/collapse all, `o` output viewer, `Ctrl+C` pause, `Esc` (twice) abort.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
   `Fix #1.1 [P1] <title>`, `Commit`) with outcome, cost and duration.
 - **Finished view** — when the run is over (completed, failed, aborted by a pause action or released), the overlay
