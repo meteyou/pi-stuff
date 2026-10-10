@@ -9,10 +9,13 @@
  * settings (see ./settings.ts and ./settings-ui.ts).
  *
  * Start sequence:
- * 1. Git clean check
+ * 1. Git status (uncommitted changes are only allowed while resolving a
+ *    `needs-human` task, see ./task-index.ts `checkGitClean`)
  * 1b. Load the commit rules from the package's `/commit` prompt template
  *     (missing template = hard error)
- * 2. PRD selection (dialog or argument)
+ * 2. `needs-human` tasks first: "Commit changes (committer) & close",
+ *    "Already committed – just close", "Review again", "Not now"
+ * 2b. PRD selection (dialog, argument or the PRD of the resolved task)
  * 3. Load global settings (wizard on first start), merge per-field project
  *    overrides (`.pi/prd-loop-pro.json`) and validate
  * 4. Overview dialog: Confirm & start / Change (per-entry menu) / Cancel
@@ -25,6 +28,11 @@
  *    (`## Execution Report` in the task todo incl. rounds, fixed, rejected,
  *    deferred, unresolved findings and created commits, close todo, update
  *    PRD Task Index)
+ *
+ * "Release (fix manually)" (round limit, commit failure, manual pause) sets the
+ * task todo to `needs-human`, appends the open findings and stops the loop.
+ * `needs-human` is not closed: dependent tasks stay blocked until the task is
+ * resolved at the next start.
  */
 
 import { spawn } from "node:child_process";
@@ -56,8 +64,18 @@ import type {
 	ReviewFinding,
 	WorkerResult,
 } from "./subagent-result.ts";
-import { appendSection, buildExecutionReport, formatLocation } from "./execution-report.ts";
-import type { CommitRef, CostPhase, ExecutionRecord, RejectedFinding } from "./execution-report.ts";
+import { appendSection, buildExecutionReport, buildOpenFindingsSection, formatLocation } from "./execution-report.ts";
+import type { CommitRef, CostPhase, ExecutionRecord, RejectedFinding, UnresolvedFinding } from "./execution-report.ts";
+import {
+	checkGitClean,
+	isNeedsHuman,
+	isTaskClosed,
+	NEEDS_HUMAN_STATUS,
+	parseBlockedBy,
+	resolveTaskOrder,
+	syncPrdTaskIndex,
+} from "./task-index.ts";
+import type { TaskInfo } from "./task-index.ts";
 import {
 	applyFixOutcome,
 	applyReview,
@@ -66,8 +84,10 @@ import {
 	cycleCounts,
 	extendRoundLimit,
 	nextStep,
+	openFindings,
 	rejectedForNextReview,
 	reportFields,
+	unresolvedFindings,
 } from "./review-cycle.ts";
 import type { CycleStep, FixOutcome, ReviewCycleState } from "./review-cycle.ts";
 import { buildFixerPrompt } from "./fixer-prompt.ts";
@@ -130,14 +150,6 @@ function parseTodoFile(content: string): TodoItem | null {
 	} catch {
 		return null;
 	}
-}
-
-/**
- * Check whether a task status represents a completed/closed state.
- * Recognises "closed" (set by the loop) and "done" (set manually or by other tools).
- */
-function isTaskClosed(status: string): boolean {
-	return status === "closed" || status === "done";
 }
 
 /**
@@ -813,47 +825,6 @@ function toWorkerResult(parsed: ParsedRunResult<WorkerResult>): SubagentResult {
 
 // --- Task resolution and dependency graph ---
 
-export interface TaskInfo {
-	id: string;
-	title: string;
-	status: string;
-	body: string;
-	blockedBy: string[];
-	sequenceLabel: string; // e.g. "1/8"
-}
-
-/**
- * Parse the "Blocked by" section from a task body to extract blocker TODO-IDs.
- *
- * Handles:
- * - "None — can start immediately" → []
- * - "- TODO-abc123 (PRD #1 - Task 1/8: ...)" → ["TODO-abc123"]
- * - Multiple "- TODO-xxx" lines → ["TODO-xxx", ...]
- */
-export function parseBlockedBy(body: string): string[] {
-	const blockers: string[] = [];
-
-	// Find the "## Blocked by" section
-	const sectionMatch = body.match(/##\s*Blocked by\s*\n([\s\S]*?)(?=\n##\s|\n---|\s*$)/i);
-	if (!sectionMatch) return blockers;
-
-	const section = sectionMatch[1];
-
-	// Check for "None" indicator
-	if (/none/i.test(section) && /can start/i.test(section)) {
-		return blockers;
-	}
-
-	// Extract TODO-IDs from list items
-	const todoIdPattern = /TODO-([0-9a-f]+)/gi;
-	let match: RegExpExecArray | null;
-	while ((match = todoIdPattern.exec(section)) !== null) {
-		blockers.push(`TODO-${match[1]}`);
-	}
-
-	return blockers;
-}
-
 /**
  * Extract the sequence label (e.g. "2/8") from a task title.
  */
@@ -878,112 +849,6 @@ export async function fetchPrdTasks(cwd: string, prdTag: string): Promise<TaskIn
 			blockedBy: parseBlockedBy(t.body),
 			sequenceLabel: parseSequenceLabel(t.title),
 		}));
-}
-
-export interface TaskResolutionResult {
-	/** Ordered list of open, actionable tasks to execute */
-	actionable: TaskInfo[];
-	/** All tasks (including closed and blocked) */
-	allTasks: TaskInfo[];
-	/** Error message if circular dependency detected */
-	error?: string;
-}
-
-/**
- * Resolve task dependencies and produce an ordered execution list.
- *
- * Uses Kahn's algorithm (BFS topological sort):
- * 1. Build adjacency list and in-degree count from dependency relationships
- * 2. Start with tasks that have no unresolved dependencies
- * 3. Process tasks in topological order
- * 4. Skip closed tasks (they're already done)
- * 5. Detect circular dependencies
- *
- * A dependency is "resolved" if the blocker task is closed.
- */
-export function resolveTaskOrder(tasks: TaskInfo[]): TaskResolutionResult {
-	const taskMap = new Map<string, TaskInfo>();
-	for (const task of tasks) {
-		taskMap.set(task.id, task);
-	}
-
-	// Filter to open tasks only
-	const openTasks = tasks.filter((t) => !isTaskClosed(t.status));
-
-	if (openTasks.length === 0) {
-		return { actionable: [], allTasks: tasks };
-	}
-
-	// Build in-degree count for open tasks only
-	// A dependency counts toward in-degree ONLY if the blocker is also open
-	// (closed blockers are already satisfied)
-	const inDegree = new Map<string, number>();
-	const dependents = new Map<string, string[]>(); // blocker → [tasks that depend on it]
-
-	for (const task of openTasks) {
-		inDegree.set(task.id, 0);
-	}
-
-	for (const task of openTasks) {
-		for (const blockerId of task.blockedBy) {
-			const blocker = taskMap.get(blockerId);
-
-			// If blocker doesn't exist in this PRD or is closed, it's resolved
-			if (!blocker || isTaskClosed(blocker.status)) {
-				continue;
-			}
-
-			// Blocker is open → this creates a real dependency
-			inDegree.set(task.id, (inDegree.get(task.id) || 0) + 1);
-
-			if (!dependents.has(blockerId)) {
-				dependents.set(blockerId, []);
-			}
-			dependents.get(blockerId)!.push(task.id);
-		}
-	}
-
-	// Kahn's algorithm
-	const queue: string[] = [];
-	for (const task of openTasks) {
-		if ((inDegree.get(task.id) || 0) === 0) {
-			queue.push(task.id);
-		}
-	}
-
-	const sorted: TaskInfo[] = [];
-	let processed = 0;
-
-	while (queue.length > 0) {
-		const taskId = queue.shift()!;
-		const task = taskMap.get(taskId)!;
-		sorted.push(task);
-		processed++;
-
-		const deps = dependents.get(taskId) || [];
-		for (const depId of deps) {
-			const newDegree = (inDegree.get(depId) || 1) - 1;
-			inDegree.set(depId, newDegree);
-			if (newDegree === 0) {
-				queue.push(depId);
-			}
-		}
-	}
-
-	// Circular dependency detection
-	if (processed < openTasks.length) {
-		const stuck = openTasks
-			.filter((t) => !sorted.some((s) => s.id === t.id))
-			.map((t) => t.title)
-			.join(", ");
-		return {
-			actionable: [],
-			allTasks: tasks,
-			error: `Circular dependency detected among tasks: ${stuck}`,
-		};
-	}
-
-	return { actionable: sorted, allTasks: tasks };
 }
 
 // --- Todo file manipulation ---
@@ -1072,153 +937,185 @@ async function updateTodoFileBody(cwd: string, todoId: string, newBody: string):
 	writeFileSync(filePath, split.jsonStr + "\n\n" + newBody + "\n", "utf-8");
 }
 
-// --- PRD Task Index update ---
+// --- PRD Task Index ---
 
-/**
- * Update the PRD Task Index body after a task is completed.
- *
- * - Marks the completed task as ✅ closed
- * - Updates blocked tasks to 🔄 open if all their blockers are now closed
- * - Updates the "Start with" pointer to the next actionable task
- */
-function updateTaskIndexBody(
-	body: string,
-	completedTaskId: string,
-	allTasks: TaskInfo[],
-): string {
-	// Build the set of all closed task IDs (including the just-completed one)
-	const closedIds = new Set<string>();
-	for (const t of allTasks) {
-		if (isTaskClosed(t.status)) closedIds.add(t.id);
+/** Re-sync the PRD Task Index (status column + "Next up" pointer) with the given task statuses. */
+async function syncPrdTaskIndexFile(cwd: string, prdId: string, tasks: TaskInfo[]): Promise<void> {
+	const currentPrdBody = await readTodoBody(cwd, prdId);
+	const syncedBody = syncPrdTaskIndex(currentPrdBody, tasks);
+	if (syncedBody !== currentPrdBody) {
+		await updateTodoFileBody(cwd, prdId, syncedBody);
 	}
-	closedIds.add(completedTaskId);
+}
 
-	const lines = body.split("\n");
-	const updatedLines: string[] = [];
+/** One-line description of held tasks (`needs-human` + their dependents). */
+function formatHeldTasks(held: TaskInfo[]): string {
+	const needsHuman = held.filter((t) => isNeedsHuman(t.status));
+	const blocked = held.length - needsHuman.length;
+	const names = needsHuman.map((t) => `${t.id} (Task ${t.sequenceLabel})`).join(", ");
+	return (
+		`${needsHuman.length} task${needsHuman.length === 1 ? " needs" : "s need"} a human: ${names}` +
+		(blocked > 0 ? `; ${blocked} dependent task${blocked === 1 ? " is" : "s are"} blocked` : "") +
+		". Re-run /prd-loop-pro to resolve."
+	);
+}
 
-	for (const line of lines) {
-		// Match Task Index table rows: contain a TODO-xxx reference and a status indicator
-		const todoMatch = line.match(/TODO-[0-9a-f]+/i);
-		const isTableRow = line.includes("|") && todoMatch &&
-			(line.includes("✅") || line.includes("🔄") || line.includes("⏳") || line.includes("❌"));
+// --- Needs-human resolution ---
 
-		if (isTableRow && todoMatch) {
-			const taskId = todoMatch[0];
+/** How a `needs-human` task is resolved at start. */
+type NeedsHumanAction = "commit" | "close" | "review" | "not-now";
 
-			if (closedIds.has(taskId)) {
-				// Mark as closed
-				updatedLines.push(
-					line.replace(/🔄 open|⏳ blocked|❌ failed/, "✅ closed"),
-				);
-			} else {
-				// Check if this task's blockers are all resolved
-				const task = allTasks.find((t) => t.id === taskId);
-				if (task && task.blockedBy.every((b) => closedIds.has(b))) {
-					updatedLines.push(line.replace(/⏳ blocked/, "🔄 open"));
-				} else {
-					updatedLines.push(line);
-				}
-			}
-		} else if (line.startsWith("Start with:")) {
-			// Find the next actionable open task (not closed, all blockers resolved)
-			const nextTask = allTasks
-				.filter((t) => !closedIds.has(t.id))
-				.find((t) => t.blockedBy.every((b) => closedIds.has(b)));
+/** A `needs-human` task to resolve inside the orchestrator loop (runs first). */
+interface NeedsHumanResume {
+	taskId: string;
+	/** "commit" = commit phase only; "review" = review-fix cycle, then commit. */
+	mode: "commit" | "review";
+}
 
-			if (nextTask) {
-				updatedLines.push(`Start with: **${nextTask.id}** (${nextTask.title})`);
-			} else {
-				updatedLines.push("Start with: All tasks completed! 🎉");
-			}
-		} else {
-			updatedLines.push(line);
-		}
+interface NeedsHumanTask {
+	task: TodoItem;
+	/** TODO-xxx id */
+	taskId: string;
+	prdTag: string;
+	/** PRD todo (if found) */
+	prd?: TodoItem;
+}
+
+/** All `needs-human` task todos (optionally restricted to one PRD), with their PRD. */
+async function getNeedsHumanTasks(cwd: string, prdTag: string | null): Promise<NeedsHumanTask[]> {
+	const todos = await readAllTodos(cwd);
+	const result: NeedsHumanTask[] = [];
+	for (const todo of todos) {
+		if (!todo.tags.includes("task") || !isNeedsHuman(todo.status)) continue;
+		const tag = todo.tags.find((t) => /^prd-\d+$/.test(t));
+		if (!tag || (prdTag && tag !== prdTag)) continue;
+		result.push({
+			task: todo,
+			taskId: todo.id.startsWith("TODO-") ? todo.id : `TODO-${todo.id}`,
+			prdTag: tag,
+			prd: todos.find((t) => t.tags.includes("prd") && t.tags.includes(tag)),
+		});
 	}
-
-	return updatedLines.join("\n");
+	return result.sort((a, b) => a.prdTag.localeCompare(b.prdTag) || a.task.title.localeCompare(b.task.title));
 }
 
 /**
- * Sync the PRD Task Index body with the actual todo file statuses.
- *
- * Called once at loop start so that tasks completed outside the loop
- * (e.g. via `/todos`) are reflected in the PRD table before execution begins.
- *
- * For each table row referencing a TODO-xxx:
- * - Closed/done tasks  → "✅ done"
- * - Open, all blockers resolved → "🔓 ready"
- * - Open, unresolved blockers   → "⏳ blocked"
- *
- * Also updates the "Next up:" / "Start with:" pointer.
+ * Ask how to resolve a `needs-human` task. Cancelling the dialog = "Not now".
  */
-function syncPrdTaskIndex(body: string, allTasks: TaskInfo[]): string {
-	const taskMap = new Map<string, TaskInfo>();
-	for (const t of allTasks) {
-		taskMap.set(t.id, t);
+async function showNeedsHumanMenu(
+	ctx: ExtensionCommandContext,
+	entry: NeedsHumanTask,
+	dirty: boolean,
+): Promise<NeedsHumanAction> {
+	const titleLines = [
+		`🔧 Task needs a human — ${entry.task.title}`,
+		entry.prd ? `PRD: ${entry.prd.title}` : `PRD: ${entry.prdTag}`,
+		"",
+		dirty
+			? "The working tree has uncommitted changes (assumed to be your work on this task)."
+			: "The working tree is clean.",
+	];
+	const actions: NeedsHumanAction[] = ["commit", "close", "review", "not-now"];
+	const labels: Record<NeedsHumanAction, string> = {
+		commit: "📝 Commit changes (committer) & close — then continue with the next task",
+		close: "✅ Already committed – just close — then continue with the next task",
+		review: "🔍 Review again — run the review-fix cycle on the current changes, then commit & close",
+		"not-now": "⏭️  Not now — leave the task as needs-human",
+	};
+	const menu = actions.map((action) => labels[action]);
+	const choice = await ctx.ui.select(titleLines.join("\n"), menu);
+	const index = choice === undefined ? -1 : menu.indexOf(choice);
+	return index === -1 ? "not-now" : actions[index]!;
+}
+
+/**
+ * "Already committed – just close": append the execution report, close the
+ * todo and update the PRD Task Index (closes the PRD if all tasks are closed).
+ */
+async function closeNeedsHumanTask(cwd: string, entry: NeedsHumanTask): Promise<void> {
+	const record: ExecutionRecord = {
+		implementerSummary: "Resolved manually after the task was released to a human (needs-human).",
+		reviewRounds: 0,
+		reviewNote: "Closed as already committed — no automated review or commit after the manual resolution.",
+		fixed: [],
+		rejected: [],
+		deferred: [],
+		unresolved: [],
+		callouts: [],
+		commits: [],
+		cost: {},
+	};
+	const body = await readTodoBody(cwd, entry.taskId);
+	await updateTodoFileBody(cwd, entry.taskId, appendSection(body, buildExecutionReport(record)));
+	await updateTodoFileStatus(cwd, entry.taskId, "closed");
+
+	if (!entry.prd) return;
+	const prdId = entry.prd.id.startsWith("TODO-") ? entry.prd.id : `TODO-${entry.prd.id}`;
+	const tasks = await fetchPrdTasks(cwd, entry.prdTag);
+	await syncPrdTaskIndexFile(cwd, prdId, tasks);
+	if (tasks.every((t) => isTaskClosed(t.status)) && !isTaskClosed(entry.prd.status)) {
+		await updateTodoFileStatus(cwd, prdId, "closed");
 	}
+}
 
-	const closedIds = new Set<string>();
-	for (const t of allTasks) {
-		if (isTaskClosed(t.status)) closedIds.add(t.id);
-	}
+/** Outcome of offering the `needs-human` tasks at start. */
+interface NeedsHumanStartResult {
+	/** Task to resolve inside the loop ("Commit changes" / "Review again"). */
+	resume?: { entry: NeedsHumanTask; mode: NeedsHumanResume["mode"] };
+	/** PRD tag of the last task closed via "Already committed – just close". */
+	closedPrdTag?: string;
+}
 
-	const lines = body.split("\n");
-	const updatedLines: string[] = [];
+/**
+ * Offer `needs-human` tasks first (before PRD selection). With several
+ * tasks, the user picks one (or continues without resolving); every task gets
+ * the four options. "Just close" is handled here and the remaining tasks are
+ * offered again; "Commit" / "Review again" end the dialog and are resolved
+ * inside the orchestrator loop.
+ */
+async function offerNeedsHumanTasks(
+	ctx: ExtensionCommandContext,
+	candidates: NeedsHumanTask[],
+	dirty: boolean,
+): Promise<NeedsHumanStartResult> {
+	const result: NeedsHumanStartResult = {};
+	const remaining = [...candidates];
 
-	for (const line of lines) {
-		const todoMatch = line.match(/TODO-[0-9a-f]+/i);
-		// Table data rows have multiple pipes and a TODO reference
-		const pipeCount = (line.match(/\|/g) || []).length;
-		const isTableRow = pipeCount >= 4 && todoMatch;
-
-		if (isTableRow && todoMatch) {
-			const taskId = todoMatch[0];
-			const task = taskMap.get(taskId);
-
-			if (!task) {
-				updatedLines.push(line);
-				continue;
-			}
-
-			// Replace the last meaningful cell (Status column)
-			const cells = line.split("|");
-			const statusCellIndex = cells.length - 2; // last cell before trailing "\n"
-
-			if (statusCellIndex < 1) {
-				updatedLines.push(line);
-				continue;
-			}
-
-			let newStatus: string;
-			if (isTaskClosed(task.status)) {
-				newStatus = " ✅ done ";
-			} else if (task.blockedBy.every((b) => closedIds.has(b))) {
-				newStatus = " 🔓 ready ";
-			} else {
-				newStatus = " ⏳ blocked ";
-			}
-
-			cells[statusCellIndex] = newStatus;
-			updatedLines.push(cells.join("|"));
-		} else if (/^(Next up|Start with)\s*:/i.test(line)) {
-			// Update the pointer to the next actionable task
-			const nextTask = allTasks
-				.filter((t) => !isTaskClosed(t.status))
-				.find((t) => t.blockedBy.every((b) => closedIds.has(b)));
-
-			if (nextTask) {
-				updatedLines.push(`Next up: **${nextTask.id}** (${nextTask.title})`);
-			} else if (allTasks.every((t) => isTaskClosed(t.status))) {
-				updatedLines.push(`Next up: All tasks completed! 🎉`);
-			} else {
-				updatedLines.push(line);
-			}
+	while (remaining.length > 0) {
+		let entry: NeedsHumanTask;
+		if (remaining.length === 1) {
+			entry = remaining[0]!;
 		} else {
-			updatedLines.push(line);
+			const skipAll = "⏭️  Not now — continue without resolving";
+			const options = remaining.map((e) => `🔧 ${e.task.title}`);
+			const choice = await ctx.ui.select(
+				`🔧 ${remaining.length} tasks need a human — pick one to resolve:`,
+				[...options, skipAll],
+			);
+			const index = choice === undefined ? -1 : options.indexOf(choice);
+			if (index === -1) break;
+			entry = remaining[index]!;
+		}
+
+		const action = await showNeedsHumanMenu(ctx, entry, dirty);
+		remaining.splice(remaining.indexOf(entry), 1);
+
+		switch (action) {
+			case "not-now":
+				continue;
+			case "close":
+				await closeNeedsHumanTask(ctx.cwd, entry);
+				result.closedPrdTag = entry.prdTag;
+				ctx.ui.notify(`✅ Closed ${entry.taskId} (${extractShortTitle(entry.task.title)}).`, "info");
+				continue;
+			case "commit":
+			case "review":
+				result.resume = { entry, mode: action };
+				return result;
 		}
 	}
 
-	return updatedLines.join("\n");
+	return result;
 }
 
 // --- Prompt builders ---
@@ -1300,7 +1197,8 @@ function extractShortTitle(title: string): string {
 
 // --- Loop state and UI ---
 
-type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
+/** `needs-human` = released to a human (todo status `needs-human`), resolved at the next start. */
+type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted" | "needs-human";
 
 /** Pipeline phase of a task (shown in the overlay while the task is active). */
 type TaskPhase = "Implement" | "Review" | "Fix" | "Commit";
@@ -1361,6 +1259,7 @@ function statusIcon(status: TaskStatus): string {
 		case "failed": return "❌";
 		case "retrying": return "🔁";
 		case "aborted": return "⚠️";
+		case "needs-human": return "🔧";
 	}
 }
 
@@ -1372,6 +1271,7 @@ function taskStatusColor(status: TaskStatus): "accent" | "dim" | "error" | "succ
 		case "failed": return "error";
 		case "retrying": return "warning";
 		case "aborted": return "warning";
+		case "needs-human": return "warning";
 	}
 }
 
@@ -1664,19 +1564,27 @@ class PrdLoopOverlayComponent {
 	}
 }
 
+/** Final outcome of a loop run (`released` = a task was released to a human). */
+type LoopOutcome = "completed" | "failed" | "aborted" | "released";
+
 /**
  * Build the final summary widget lines.
  */
 function buildSummaryWidget(
 	state: LoopState,
 	prdTitle: string,
-	outcome: "completed" | "failed" | "aborted",
+	outcome: LoopOutcome,
 ): string[] {
 	const width = process.stdout.columns || 80;
 	const lines: string[] = [];
 
-	const outcomeIcon = outcome === "completed" ? "✅" : outcome === "failed" ? "❌" : "⚠️";
-	const outcomeText = outcome === "completed" ? "Loop completed" : outcome === "failed" ? "Loop failed" : "Loop aborted";
+	const outcomeIcon = { completed: "✅", failed: "❌", aborted: "⚠️", released: "🔧" }[outcome];
+	const outcomeText = {
+		completed: "Loop completed",
+		failed: "Loop failed",
+		aborted: "Loop aborted",
+		released: "Loop stopped — task released to a human (needs-human)",
+	}[outcome];
 	lines.push(`${outcomeIcon} ${prdTitle} — ${outcomeText}`);
 	lines.push("");
 
@@ -1717,7 +1625,7 @@ function printSummary(
 	ctx: ExtensionCommandContext,
 	state: LoopState,
 	prdTitle: string,
-	outcome: "completed" | "failed" | "aborted",
+	outcome: LoopOutcome,
 ): void {
 	const lines = buildSummaryWidget(state, prdTitle, outcome);
 	ctx.ui.setWidget("prd-loop-pro-summary", lines);
@@ -1958,6 +1866,13 @@ function statusIconFn(status: TaskStatus): string {
 type PauseAction = "resume" | "release" | "retry" | "retry-commit" | "skip" | "abort";
 
 /**
+ * Label of the "Release" option: the task todo is set to `needs-human`, the
+ * open findings are appended to it and the loop stops. The task is offered
+ * first at the next start.
+ */
+const RELEASE_LABEL = "🔧 Release (fix manually) — mark task needs-human, stop the loop, resolve at next start";
+
+/**
  * Show an interactive pause menu (after Ctrl+C interrupts a running subagent
  * or when a phase fails, e.g. committer failure / pre-commit hook failure).
  * Cancelling the dialog selects the first offered action.
@@ -1973,7 +1888,7 @@ async function showPauseMenu(
 		resume: phase === "Implement"
 			? "▶️  Resume — keep changes, continue where it left off"
 			: `▶️  Resume — keep changes, restart the ${phase.toLowerCase()} phase`,
-		release: "🔧 Release session — fix manually, re-run /prd-loop-pro to continue",
+		release: RELEASE_LABEL,
 		retry: "🔄 Retry task — discard changes, try again from scratch",
 		"retry-commit": "🔁 Retry commit — run the committer again",
 		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
@@ -1990,7 +1905,7 @@ async function showPauseMenu(
 	return index === -1 ? actions[0]! : actions[index]!;
 }
 
-type RoundLimitAction = "one-more-round" | "commit-as-is" | "skip" | "abort";
+type RoundLimitAction = "one-more-round" | "commit-as-is" | "release" | "skip" | "abort";
 
 /** Maximum number of open findings listed in the round-limit menu title. */
 const ROUND_LIMIT_MAX_LISTED_FINDINGS = 12;
@@ -2023,10 +1938,11 @@ async function showRoundLimitMenu(
 	];
 	if (count > listed.length) titleLines.push(`  … and ${count - listed.length} more`);
 
-	const actions: RoundLimitAction[] = ["one-more-round", "commit-as-is", "skip", "abort"];
+	const actions: RoundLimitAction[] = ["one-more-round", "commit-as-is", "release", "skip", "abort"];
 	const labels: Record<RoundLimitAction, string> = {
 		"one-more-round": "🔁 One more round — fix the open findings and review again",
 		"commit-as-is": "✅ Commit as-is & close task — open findings go into the report",
+		release: RELEASE_LABEL,
 		skip: "⏭️  Skip task — discard changes, mark done, continue with next",
 		abort: "❌ Abort loop — stop and keep changes on disk",
 	};
@@ -2109,7 +2025,12 @@ async function listExcludedFilesCommittedSince(pi: ExtensionAPI, cwd: string, be
  * - Output viewer overlay for the currently selected task
  * - Ctrl+C pauses the current subagent and opens the pause menu
  * - Commits via prd-committer subagent (commit model/thinking from settings)
- * - Final summary widget on completion/failure/abort
+ * - "Release (fix manually)": task todo → `needs-human` + open findings, loop stops
+ * - Resolving a `needs-human` task (`options.resume`): the task runs first,
+ *   starting at the commit phase ("Commit changes & close") or the review-fix
+ *   cycle ("Review again") with the current uncommitted changes
+ * - `needs-human` tasks (not being resolved) and their dependents are never started
+ * - Final summary widget on completion/failure/abort/release
  */
 async function runOrchestratorLoop(
 	ctx: ExtensionCommandContext,
@@ -2118,6 +2039,7 @@ async function runOrchestratorLoop(
 	prdTag: string,
 	settings: PrdLoopProSettings,
 	commitRules: string,
+	options: { resume?: NeedsHumanResume } = {},
 ): Promise<void> {
 	const agent = await loadPrdWorkerAgent(EXTENSION_DIR);
 	const reviewerAgent = await loadAgent(EXTENSION_DIR, "prd-reviewer");
@@ -2125,15 +2047,14 @@ async function runOrchestratorLoop(
 	const committerAgent = await loadAgent(EXTENSION_DIR, "prd-committer");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
-	const resolution = resolveTaskOrder(tasks);
+	const resume = options.resume && tasks.some((t) => t.id === options.resume!.taskId && isNeedsHuman(t.status))
+		? options.resume
+		: undefined;
+	const resolution = resolveTaskOrder(tasks, { resolvingTaskId: resume?.taskId });
 
 	// Sync PRD Task Index with actual todo statuses (picks up tasks closed outside the loop)
 	try {
-		const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-		const syncedBody = syncPrdTaskIndex(currentPrdBody, tasks);
-		if (syncedBody !== currentPrdBody) {
-			await updateTodoFileBody(ctx.cwd, prdId, syncedBody);
-		}
+		await syncPrdTaskIndexFile(ctx.cwd, prdId, tasks);
 	} catch (err) {
 		ctx.ui.notify(
 			`⚠️ Failed to sync PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
@@ -2147,6 +2068,10 @@ async function runOrchestratorLoop(
 	}
 
 	if (resolution.actionable.length === 0) {
+		if (resolution.held.length > 0) {
+			ctx.ui.notify(`No actionable tasks. ${formatHeldTasks(resolution.held)}`, "warning");
+			return;
+		}
 		ctx.ui.notify("All tasks already completed.", "info");
 		if (!isTaskClosed(prd.status)) {
 			await updateTodoFileStatus(ctx.cwd, prdId, "closed");
@@ -2167,7 +2092,7 @@ async function runOrchestratorLoop(
 			id: task.id,
 			title: task.title,
 			sequenceLabel: task.sequenceLabel,
-			status: isTaskClosed(task.status) ? "completed" as TaskStatus : "pending" as TaskStatus,
+			status: (isTaskClosed(task.status) ? "completed" : isNeedsHuman(task.status) ? "needs-human" : "pending") as TaskStatus,
 			cost: 0,
 			retries: 0,
 			errors: [],
@@ -2289,7 +2214,7 @@ async function runOrchestratorLoop(
 	);
 
 	type LoopRunResult = {
-		outcome: "completed" | "failed" | "aborted";
+		outcome: LoopOutcome;
 		notification?: { message: string; level: "info" | "warning" | "error" };
 		unexpectedError?: unknown;
 	};
@@ -2372,9 +2297,7 @@ async function runOrchestratorLoop(
 		await updateTodoFileStatus(ctx.cwd, task.id, "closed");
 		task.status = "closed";
 		try {
-			const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-			const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-			await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
+			await syncPrdTaskIndexFile(ctx.cwd, prdId, tasks);
 		} catch (err) {
 			if (options.notifyIndexError) {
 				ctx.ui.notify(
@@ -2397,21 +2320,79 @@ async function runOrchestratorLoop(
 		await closeTaskAndUpdateIndex(task, { notifyIndexError: false });
 	};
 
-	const releasedResult = (): LoopRunResult => ({
-		outcome: "aborted",
-		notification: {
-			message:
-				"⏸️ Session released. Uncommitted changes left on disk.\n" +
-				"Fix issues and re-run /prd-loop-pro to continue from where you left off.",
-			level: "info",
-		},
-	});
+	/** Why and with which open findings a task is released to a human. */
+	type ReleaseRequest = {
+		reason: string;
+		errors?: string[];
+		/** Review-fix cycle state at the release point (undefined during implementation). */
+		cycle?: ReviewCycleState;
+		/** Status text for findings of the last round that no fixer processed yet. */
+		openReason?: string;
+	};
+
+	/**
+	 * "Release (fix manually)": append the open findings section (incl. the
+	 * reason and errors) to the task todo, set its status to `needs-human`,
+	 * update the PRD Task Index and stop the loop. Uncommitted changes stay on
+	 * disk; the task is offered first at the next start.
+	 */
+	const releaseTask = async (task: TaskInfo, taskState: LoopTaskState, request: ReleaseRequest): Promise<LoopRunResult> => {
+		const cycle = request.cycle;
+		const lastRound = cycle?.rounds.at(-1)?.round;
+		const open: UnresolvedFinding[] = cycle
+			? [
+				...unresolvedFindings(cycle),
+				...openFindings(cycle).map((finding) => ({
+					finding,
+					reason: request.openReason ?? "Not processed before the release",
+					round: lastRound,
+				})),
+			]
+			: [];
+		const rejected = cycle ? rejectedForNextReview(cycle) : [];
+
+		const body = await readTodoBody(ctx.cwd, task.id);
+		const section = buildOpenFindingsSection(open, rejected, { reason: request.reason, errors: request.errors });
+		await updateTodoFileBody(ctx.cwd, task.id, appendSection(body, section));
+		await updateTodoFileStatus(ctx.cwd, task.id, NEEDS_HUMAN_STATUS);
+		task.status = NEEDS_HUMAN_STATUS;
+		try {
+			await syncPrdTaskIndexFile(ctx.cwd, prdId, tasks);
+		} catch (err) {
+			ctx.ui.notify(
+				`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
+		}
+
+		currentAbortController = new AbortController();
+		taskState.status = "needs-human";
+		taskState.endTime = Date.now();
+		taskState.currentActivity = undefined;
+		taskState.summary = `Released to a human: ${request.reason}`;
+		requestOverlayRender();
+
+		const findingsText = open.length > 0
+			? `${open.length} open finding${open.length === 1 ? "" : "s"} appended to ${task.id}.`
+			: `Release details appended to ${task.id}.`;
+		return {
+			outcome: "released",
+			notification: {
+				message:
+					`🔧 Task ${task.sequenceLabel} released to a human (needs-human): ${request.reason}.\n` +
+					`${findingsText} Uncommitted changes left on disk; dependent tasks stay blocked.\n` +
+					"Fix it manually (or with the main agent), then re-run /prd-loop-pro to commit & close it " +
+					"(or just close it if already committed, or review again) and continue with the next task.",
+				level: "warning",
+			},
+		};
+	};
 
 	type ReviewPhaseOutcome =
 		| { kind: "reviewed"; review: ReviewerResult }
 		| { kind: "no-changes" }
 		| { kind: "skipped" }
-		| { kind: "released" }
+		| { kind: "released"; reason: string }
 		| { kind: "aborted" }
 		| { kind: "failed"; error: string };
 
@@ -2473,7 +2454,7 @@ async function runOrchestratorLoop(
 						requestOverlayRender();
 						continue;
 					case "release":
-						return { kind: "released" };
+						return { kind: "released", reason: "manual pause during review" };
 					case "skip":
 						await skipTask(task, taskState);
 						requestOverlayRender();
@@ -2494,7 +2475,7 @@ async function runOrchestratorLoop(
 	type FixPhaseOutcome =
 		| { kind: "result"; outcome: FixOutcome }
 		| { kind: "skipped" }
-		| { kind: "released" }
+		| { kind: "released"; reason: string }
 		| { kind: "aborted" };
 
 	/**
@@ -2544,7 +2525,7 @@ async function runOrchestratorLoop(
 
 				switch (pauseAction) {
 					case "release":
-						return { kind: "released" };
+						return { kind: "released", reason: "manual pause during fix" };
 					case "skip":
 						await skipTask(task, taskState);
 						requestOverlayRender();
@@ -2584,7 +2565,7 @@ async function runOrchestratorLoop(
 	type CommitPhaseOutcome =
 		| { kind: "committed"; commits: CommitRef[] }
 		| { kind: "skipped" }
-		| { kind: "released" }
+		| { kind: "released"; reason: string; errors?: string[] }
 		| { kind: "aborted" };
 
 	/**
@@ -2643,7 +2624,7 @@ async function runOrchestratorLoop(
 
 						switch (pauseAction) {
 							case "release":
-								return { kind: "released" };
+								return { kind: "released", reason: "manual pause during commit" };
 							case "skip":
 								await skipTask(task, taskState);
 								requestOverlayRender();
@@ -2709,11 +2690,13 @@ async function runOrchestratorLoop(
 			const pauseAction = await showPauseMenu(ctx, task, {
 				phase: "Commit",
 				reason,
-				actions: ["retry-commit", "skip", "abort"],
+				actions: ["retry-commit", "release", "skip", "abort"],
 			});
 			widgetTimer = setInterval(requestOverlayRender, 1000);
 
 			switch (pauseAction) {
+				case "release":
+					return { kind: "released", reason, errors };
 				case "skip":
 					await skipTask(task, taskState, `Skipped after commit failure (${reason}).`);
 					requestOverlayRender();
@@ -2756,7 +2739,14 @@ async function runOrchestratorLoop(
 				taskState.currentTurn = 0;
 				taskState.outputEvents = [];
 				taskState.reviewInfo = undefined;
-				setPhase(taskState, "Implement");
+
+				/**
+				 * Resolving a `needs-human` task: the human's uncommitted changes
+				 * replace the implementation phase. "commit" goes straight to the
+				 * commit phase, "review" re-enters the review-fix cycle first.
+				 */
+				const resumeMode = resume && resume.taskId === task.id ? resume.mode : undefined;
+				setPhase(taskState, resumeMode === "commit" ? "Commit" : resumeMode === "review" ? "Review" : "Implement");
 
 				/** Cost per phase for the execution report. */
 				const phaseCosts: Partial<Record<CostPhase, number>> = {};
@@ -2765,10 +2755,11 @@ async function runOrchestratorLoop(
 				let attempt = 1;
 				let result: SubagentResult | undefined;
 				let currentPrompt = initialPrompt;
-				let taskSucceeded = false;
+				let taskSucceeded = resumeMode !== undefined;
 				let taskSkipped = false;
 
-				while (true) {
+				// Implementation phase (skipped when resolving a needs-human task).
+				while (!resumeMode) {
 					if (aborted) break;
 
 					const run = await spawnSubagent({
@@ -2806,7 +2797,7 @@ async function runOrchestratorLoop(
 								continue;
 
 							case "release":
-								return releasedResult();
+								return releaseTask(task, taskState, { reason: "manual pause during implementation" });
 
 							case "retry":
 								await discardChanges();
@@ -2897,7 +2888,9 @@ Errors: ${result.errors.join("; ")}`,
 
 				if (!taskSucceeded) continue;
 
-				const implementerSummary = result?.summary ?? "";
+				const implementerSummary = resumeMode
+					? "Resolved manually after the task was released to a human (needs-human)."
+					: result?.summary ?? "";
 				taskState.summary = implementerSummary;
 
 				// --- Review-fix cycle (see ./review-cycle.ts) ---
@@ -2905,15 +2898,19 @@ Errors: ${result.errors.join("; ")}`,
 					fixThreshold: settings.fixThreshold as FindingPriority,
 					maxReviewRounds: settings.maxReviewRounds,
 				});
-				let reviewNote: string | undefined;
+				let reviewNote: string | undefined = resumeMode === "commit"
+					? "Resolved by a human (needs-human) — changes committed without another automated review."
+					: undefined;
 				let cycleExit: "commit" | "skipped" | "released" | "aborted" | "failed" = "commit";
 				let cycleError = "";
+				let releaseRequest: ReleaseRequest | undefined;
 				const updateCycleInfo = () => {
 					taskState.reviewInfo = formatCycleInfo(cycle);
 					requestOverlayRender();
 				};
 
-				cycleLoop: while (true) {
+				// "Commit changes & close" skips the review-fix cycle.
+				cycleLoop: while (resumeMode !== "commit") {
 					if (aborted) {
 						cycleExit = "aborted";
 						break;
@@ -2937,11 +2934,16 @@ Errors: ${result.errors.join("; ")}`,
 								reviewNote = step.round === 1
 									? "No changes outside .pi/ — review skipped."
 									: `No changes outside .pi/ left for review round ${step.round} — review skipped.`;
+								if (resumeMode === "review") reviewNote = `Re-reviewed after release to a human (needs-human). ${reviewNote}`;
 								if (step.round === 1) taskState.reviewInfo = "skipped (no changes outside .pi/)";
 								break cycleLoop;
 							case "failed":
 								cycleExit = "failed";
 								cycleError = reviewOutcome.error;
+								break cycleLoop;
+							case "released":
+								cycleExit = "released";
+								releaseRequest = { reason: reviewOutcome.reason, cycle };
 								break cycleLoop;
 							default:
 								cycleExit = reviewOutcome.kind;
@@ -2959,6 +2961,9 @@ Errors: ${result.errors.join("; ")}`,
 							continue;
 						}
 						cycleExit = fixOutcome.kind;
+						if (fixOutcome.kind === "released") {
+							releaseRequest = { reason: fixOutcome.reason, cycle, openReason: "Not fixed before the release" };
+						}
 						break;
 					}
 
@@ -2981,6 +2986,14 @@ Errors: ${result.errors.join("; ")}`,
 							taskState.currentActivity = undefined;
 							updateCycleInfo();
 							continue;
+						case "release":
+							cycleExit = "released";
+							releaseRequest = {
+								reason: `review round limit reached (${step.round}/${step.roundLimit}) with ${step.openFindings.length} open finding${step.openFindings.length === 1 ? "" : "s"}`,
+								cycle,
+								openReason: `Open at the review round limit (${step.round}/${step.roundLimit})`,
+							};
+							break cycleLoop;
 						case "skip":
 							await skipTask(task, taskState, "Skipped at the review round limit.");
 							requestOverlayRender();
@@ -2993,7 +3006,9 @@ Errors: ${result.errors.join("; ")}`,
 					}
 				}
 
-				if (cycleExit === "released") return releasedResult();
+				if (cycleExit === "released") {
+					return releaseTask(task, taskState, releaseRequest ?? { reason: "released during the review-fix cycle", cycle });
+				}
 				if (cycleExit === "skipped") continue;
 				if (cycleExit === "aborted" || aborted) {
 					aborted = true;
@@ -3022,7 +3037,9 @@ Errors: ${result.errors.join("; ")}`,
 				setPhase(taskState, "Commit");
 				const commitOutcome = await runCommitPhase(task, taskState, phaseCosts);
 
-				if (commitOutcome.kind === "released") return releasedResult();
+				if (commitOutcome.kind === "released") {
+					return releaseTask(task, taskState, { reason: commitOutcome.reason, errors: commitOutcome.errors, cycle });
+				}
 				if (commitOutcome.kind === "skipped") continue;
 				if (commitOutcome.kind === "aborted" || aborted) {
 					aborted = true;
@@ -3037,6 +3054,9 @@ Errors: ${result.errors.join("; ")}`,
 				loopState.totalCommits += commits.length;
 
 				// --- Report: append execution report, close todo, update PRD Task Index ---
+				if (resumeMode === "review" && reviewNote === undefined) {
+					reviewNote = "Re-reviewed after release to a human (needs-human).";
+				}
 				const record: ExecutionRecord = {
 					implementerSummary,
 					...reportFields(cycle),
@@ -3065,7 +3085,22 @@ Errors: ${result.errors.join("; ")}`,
 				};
 			}
 
-			await updateTodoFileStatus(ctx.cwd, prdId, "closed");
+			// needs-human tasks (and their dependents) keep the PRD open.
+			const stillHeld = resolveTaskOrder(tasks).held;
+			if (stillHeld.length > 0) {
+				return {
+					outcome: "completed",
+					notification: {
+						message:
+							`✅ All ${resolution.actionable.length} actionable task(s) executed. ${formatHeldTasks(stillHeld)}`,
+						level: "warning",
+					},
+				};
+			}
+
+			if (tasks.every((t) => isTaskClosed(t.status))) {
+				await updateTodoFileStatus(ctx.cwd, prdId, "closed");
+			}
 			return {
 				outcome: "completed",
 				notification: {
@@ -3102,14 +3137,21 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		return;
 	}
 
-	// Step 1: Git clean check
+	// Step 1: Git status. Uncommitted changes are only allowed while resolving
+	// a needs-human task (checked after the needs-human dialog, see step 2).
 	const gitResult = await pi.exec("git", ["status", "--porcelain"]);
-	if (gitResult.stdout.trim() !== "") {
-		ctx.ui.notify(
-			"Uncommitted changes detected. Please clean your working directory before starting the loop.",
-			"error",
-		);
+	if (gitResult.code !== 0) {
+		ctx.ui.notify(`git status failed: ${(gitResult.stderr || gitResult.stdout).trim()}`, "error");
 		return;
+	}
+	const gitStatus = gitResult.stdout;
+	const needsHumanTasks = await getNeedsHumanTasks(ctx.cwd, parsedArgs.prdTag);
+	if (needsHumanTasks.length === 0) {
+		const check = checkGitClean(gitStatus, false);
+		if (!check.ok) {
+			ctx.ui.notify(check.error, "error");
+			return;
+		}
 	}
 
 	// Step 1b: Commit rules from the package's `/commit` prompt template.
@@ -3123,21 +3165,43 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		return;
 	}
 
-	// Step 2: PRD selection
+	// Step 2: needs-human tasks first (before PRD selection):
+	// "Commit changes & close" / "Already committed – just close" / "Review again" / "Not now".
+	const needsHuman = await offerNeedsHumanTasks(ctx, needsHumanTasks, gitStatus.trim() !== "");
+	const resume = needsHuman.resume;
+
+	// Git clean check: uncommitted changes pass only while resolving a needs-human task.
+	const gitCheck = checkGitClean(gitStatus, resume !== undefined);
+	if (!gitCheck.ok) {
+		ctx.ui.notify(gitCheck.error, "error");
+		return;
+	}
+
+	// Step 3: PRD selection. Resolving a needs-human task selects its PRD; after
+	// "just close", the loop continues with the next task of the same PRD.
 	let selectedPrd: { prd: TodoItem; openTaskCount: number; totalTaskCount: number } | undefined;
 
 	const activePrds = await getActivePrds(ctx.cwd);
 
 	if (activePrds.length === 0) {
-		ctx.ui.notify("No PRDs with open tasks found.", "error");
+		ctx.ui.notify(
+			needsHuman.closedPrdTag ? "No PRDs with open tasks left." : "No PRDs with open tasks found.",
+			needsHuman.closedPrdTag ? "info" : "error",
+		);
 		return;
 	}
 
-	if (parsedArgs.prdTag) {
-		// Direct selection via argument
-		selectedPrd = activePrds.find((p) => p.prd.tags.includes(parsedArgs.prdTag!));
+	const preselectedTag = parsedArgs.prdTag
+		?? resume?.entry.prdTag
+		?? (needsHuman.closedPrdTag && activePrds.some((p) => p.prd.tags.includes(needsHuman.closedPrdTag!))
+			? needsHuman.closedPrdTag
+			: null);
+
+	if (preselectedTag) {
+		// Direct selection via argument / resolved needs-human task
+		selectedPrd = activePrds.find((p) => p.prd.tags.includes(preselectedTag));
 		if (!selectedPrd) {
-			ctx.ui.notify(`No active PRD found with tag "${parsedArgs.prdTag}".`, "error");
+			ctx.ui.notify(`No active PRD found with tag "${preselectedTag}".`, "error");
 			return;
 		}
 	} else {
@@ -3157,7 +3221,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		selectedPrd = activePrds[choiceIndex];
 	}
 
-	// Steps 3 + 4: Load/merge/validate settings (wizard on first start) and show the overview.
+	// Steps 4 + 5: Load/merge/validate settings (wizard on first start) and show the overview.
 	// The returned settings are the effective ones (global + project overrides).
 	const settings = await resolveStartSettings(ctx, pi, {
 		title: selectedPrd.prd.title,
@@ -3166,9 +3230,11 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 	});
 	if (!settings) return;
 
-	// Step 5: Run the orchestrator loop
+	// Step 6: Run the orchestrator loop (a resolved needs-human task runs first)
 	const selectedPrdTag = selectedPrd.prd.tags.find((t) => /^prd-\d+$/.test(t))!;
-	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, settings, commitRules);
+	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, settings, commitRules, {
+		resume: resume ? { taskId: resume.entry.taskId, mode: resume.mode } : undefined,
+	});
 }
 
 // --- Extension entry point ---
