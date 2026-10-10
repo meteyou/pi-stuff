@@ -20,8 +20,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { parseFrontmatter, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
+import { keyText, parseFrontmatter, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
+import {
+	buildOutcomeLabel,
+	buildSummaryEntryLines,
+	buildSummaryTotalsLine,
+	formatElapsed,
+	statusIcon,
+} from "./summary.ts";
+import type { SummaryEntryLine, SummaryInput, SummaryOutcome, TaskStatus } from "./summary.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1294,8 +1302,6 @@ function deriveCommitScopeFromTitle(shortTitle: string, fallbackScope: string): 
 
 // --- Loop state and UI ---
 
-type TaskStatus = "pending" | "running" | "completed" | "failed" | "retrying" | "aborted";
-
 interface LoopTaskState {
 	id: string;
 	title: string;
@@ -1317,36 +1323,14 @@ interface LoopTaskState {
 
 interface LoopState {
 	startTime: number;
+	/** Set once the run is over; freezes the elapsed time in the finished overlay. */
+	endTime?: number;
 	tasks: LoopTaskState[];
 	totalCost: number;
 	totalCommits: number;
 	currentTaskIndex: number;
 	currentRetry: number;
 	maxRetries: number;
-}
-
-/**
- * Format elapsed milliseconds as "M:SS".
- */
-function formatElapsed(ms: number): string {
-	const totalSec = Math.floor(ms / 1000);
-	const min = Math.floor(totalSec / 60);
-	const sec = totalSec % 60;
-	return `${min}:${sec.toString().padStart(2, "0")}`;
-}
-
-/**
- * Get the status icon for a task state.
- */
-function statusIcon(status: TaskStatus): string {
-	switch (status) {
-		case "pending": return "⏳";
-		case "running": return "🔄";
-		case "completed": return "✅";
-		case "failed": return "❌";
-		case "retrying": return "🔁";
-		case "aborted": return "⚠️";
-	}
 }
 
 function taskStatusColor(status: TaskStatus): "accent" | "dim" | "error" | "success" | "warning" {
@@ -1381,12 +1365,20 @@ type TaskOverlayRow = {
 	text: string;
 };
 
+/** Shown by the overlay once the run is over (the overlay stays open until the user closes it). */
+interface FinishedOverlayInfo {
+	summary: SummaryInput;
+	notification?: { message: string; level: "info" | "warning" | "error" };
+	error?: string;
+}
+
 class PrdLoopOverlayComponent {
 	private selectedIndex = 0;
 	private expanded = new Set<number>();
 	private scrollOffset = 0;
 
 	private confirmingAbort = false;
+	private finished: FinishedOverlayInfo | undefined;
 
 	constructor(
 		private tui: TUI,
@@ -1397,8 +1389,16 @@ class PrdLoopOverlayComponent {
 		private onPause: () => void,
 		private onOpenViewer: () => void,
 		private requestRender: () => void,
+		private onClose: () => void,
 	) {
 		if (state.tasks.length > 0) this.expanded.add(0);
+	}
+
+	/** Switch to the finished view: no pause/abort anymore, Esc/q closes the overlay. */
+	markFinished(info: FinishedOverlayInfo): void {
+		this.finished = info;
+		this.confirmingAbort = false;
+		this.requestRender();
 	}
 
 	focusTask(index: number): void {
@@ -1412,25 +1412,34 @@ class PrdLoopOverlayComponent {
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape)) {
-			if (this.confirmingAbort) {
-				this.confirmingAbort = false;
-				this.onAbort();
+		if (this.finished) {
+			if (matchesKey(data, Key.escape) || data === "q" || data === "Q") {
+				this.onClose();
 				return;
 			}
-			this.confirmingAbort = true;
-			this.requestRender();
-			return;
-		}
-		if (this.confirmingAbort) {
-			// Any other key cancels the abort confirmation
-			this.confirmingAbort = false;
-			this.requestRender();
-			return;
-		}
-		if (matchesKey(data, Key.ctrl("c"))) {
-			this.onPause();
-			return;
+			// Nothing left to pause once the run is over.
+			if (matchesKey(data, Key.ctrl("c"))) return;
+		} else {
+			if (matchesKey(data, Key.escape)) {
+				if (this.confirmingAbort) {
+					this.confirmingAbort = false;
+					this.onAbort();
+					return;
+				}
+				this.confirmingAbort = true;
+				this.requestRender();
+				return;
+			}
+			if (this.confirmingAbort) {
+				// Any other key cancels the abort confirmation
+				this.confirmingAbort = false;
+				this.requestRender();
+				return;
+			}
+			if (matchesKey(data, Key.ctrl("c"))) {
+				this.onPause();
+				return;
+			}
 		}
 		if (data === "o" || data === "O") {
 			this.onOpenViewer();
@@ -1438,6 +1447,14 @@ class PrdLoopOverlayComponent {
 		}
 
 		if (this.state.tasks.length === 0) return;
+
+		if (data === "a" || data === "A") {
+			// Toggle all: expand everything unless everything is already expanded.
+			if (this.expanded.size === this.state.tasks.length) this.expanded.clear();
+			else for (let i = 0; i < this.state.tasks.length; i++) this.expanded.add(i);
+			this.requestRender();
+			return;
+		}
 
 		if (matchesKey(data, Key.up)) {
 			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
@@ -1508,6 +1525,7 @@ class PrdLoopOverlayComponent {
 	invalidate(): void {}
 
 	private buildHeader(width: number): string[] {
+		if (this.finished) return this.buildFinishedHeader(width, this.finished);
 		const now = Date.now();
 		const total = this.state.tasks.length;
 		const completed = this.state.tasks.filter((task) => task.status === "completed").length;
@@ -1535,11 +1553,40 @@ class PrdLoopOverlayComponent {
 		];
 	}
 
+	private buildFinishedHeader(width: number, info: FinishedOverlayInfo): string[] {
+		const { summary } = info;
+		const lines = [
+			truncateToWidth(
+				this.theme.fg("accent", this.theme.bold("PRD Loop")) + this.theme.fg("muted", ` • ${this.prdTitle}`),
+				width,
+			),
+			truncateToWidth(this.theme.fg(outcomeColor(summary.outcome), this.theme.bold(buildOutcomeLabel(summary.outcome))), width),
+		];
+		for (const line of wrapTextWithAnsi(this.theme.fg("muted", buildSummaryTotalsLine(summary)), width)) {
+			lines.push(truncateToWidth(line, width));
+		}
+		if (info.notification) {
+			const color = info.notification.level === "info" ? "dim" : info.notification.level;
+			for (const line of wrapTextWithAnsi(this.theme.fg(color, info.notification.message), width)) {
+				lines.push(truncateToWidth(line, width));
+			}
+		}
+		if (info.error) {
+			for (const line of wrapTextWithAnsi(this.theme.fg("error", `Unexpected error: ${info.error}`), width)) {
+				lines.push(truncateToWidth(line, width));
+			}
+		}
+		lines.push("");
+		return lines;
+	}
+
 	private buildFooter(width: number, totalRows: number, contentHeight: number): string[] {
 		const end = Math.min(totalRows, this.scrollOffset + contentHeight);
-		const hint = this.confirmingAbort
-			? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
-			: this.theme.fg("dim", "↑↓ select • enter expand • o output • ← collapse • ctrl+c pause • esc abort");
+		const hint = this.finished
+			? this.theme.fg("dim", "↑↓ select • enter expand • a expand all • o output • esc/q close & post summary to chat")
+			: this.confirmingAbort
+				? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
+				: this.theme.fg("dim", "↑↓ select • enter expand • a expand all • o output • ← collapse • ctrl+c pause • esc abort");
 		const scroll = totalRows > contentHeight
 			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
 			: "";
@@ -1625,63 +1672,56 @@ class PrdLoopOverlayComponent {
 	}
 }
 
-/**
- * Build the final summary widget lines.
- */
-function buildSummaryWidget(
-	state: LoopState,
-	prdTitle: string,
-	outcome: "completed" | "failed" | "aborted",
-): string[] {
-	const width = process.stdout.columns || 80;
-	const lines: string[] = [];
+/** Custom session entry type of the final summary (rendered in the chat, never sent to the LLM). */
+const SUMMARY_ENTRY_TYPE = "prd-loop-summary";
 
-	const outcomeIcon = outcome === "completed" ? "✅" : outcome === "failed" ? "❌" : "⚠️";
-	const outcomeText = outcome === "completed" ? "Loop completed" : outcome === "failed" ? "Loop failed" : "Loop aborted";
-	lines.push(`${outcomeIcon} ${prdTitle} — ${outcomeText}`);
-	lines.push("");
-
-	for (const task of state.tasks) {
-		const icon = statusIcon(task.status);
-		const label = `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`;
-
-		let timePart = "     ";
-		if (task.endTime && task.startTime) {
-			timePart = formatElapsed(task.endTime - task.startTime).padStart(5);
-		}
-
-		const costPart = task.cost > 0 ? `  $${task.cost.toFixed(2)}` : "";
-		const retryPart = task.retries > 0 ? `  (${task.retries} retry${task.retries > 1 ? "s" : ""})` : "";
-
-		lines.push(`${label}  ${icon}  ${timePart}${costPart}${retryPart}`);
-	}
-
-	lines.push("");
-
-	const totalElapsed = formatElapsed((state.tasks.at(-1)?.endTime ?? Date.now()) - state.startTime);
-	const totalRetries = state.tasks.reduce((sum, t) => sum + t.retries, 0);
-	const parts = [
-		`Total: ${totalElapsed}`,
-		`$${state.totalCost.toFixed(2)}`,
-		`${totalRetries} retry${totalRetries !== 1 ? "s" : ""}`,
-		`${state.totalCommits} commit${state.totalCommits !== 1 ? "s" : ""}`,
-	];
-	lines.push(parts.join(" | "));
-
-	return lines.map((line) => truncateToWidth(line, width));
+function outcomeColor(outcome: SummaryOutcome): "error" | "success" | "warning" {
+	return outcome === "completed" ? "success" : outcome === "failed" ? "error" : "warning";
 }
 
 /**
- * Print the final summary as static text to the session output.
+ * Build the (serializable) final summary of a run. Used for the finished
+ * overlay header and stored as custom session entry after the overlay closes.
  */
-function printSummary(
-	ctx: ExtensionCommandContext,
-	state: LoopState,
-	prdTitle: string,
-	outcome: "completed" | "failed" | "aborted",
-): void {
-	const lines = buildSummaryWidget(state, prdTitle, outcome);
-	ctx.ui.setWidget("prd-loop-summary", lines);
+function buildSummaryInput(state: LoopState, prdTitle: string, outcome: SummaryOutcome): SummaryInput {
+	return {
+		prdTitle,
+		outcome,
+		tasks: state.tasks.map((task) => ({
+			label: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
+			status: task.status,
+			elapsedMs: task.endTime && task.startTime ? task.endTime - task.startTime : undefined,
+			cost: task.cost,
+			retries: task.retries,
+		})),
+		totalElapsedMs: (state.endTime ?? Date.now()) - state.startTime,
+		totalCost: state.totalCost,
+		totalCommits: state.totalCommits,
+	};
+}
+
+function summaryLineColor(line: SummaryEntryLine): "accent" | "dim" | "error" | "muted" | "success" | "text" | "warning" {
+	switch (line.kind) {
+		case "totals": return "muted";
+		case "hint": return "dim";
+		case "task": return line.status ? taskStatusColor(line.status) : "text";
+		default: return "text";
+	}
+}
+
+/** Chat renderer for the summary entry: collapsed shows failed/aborted tasks, expanded shows all. */
+function renderSummaryEntry(summary: SummaryInput, expanded: boolean, theme: Theme): Box {
+	const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+	for (const line of buildSummaryEntryLines(summary, expanded, keyText("app.tools.expand") || "ctrl+o")) {
+		if (line.kind === "blank") {
+			box.addChild(new Spacer(1));
+		} else if (line.kind === "headline") {
+			box.addChild(new Text(theme.fg(outcomeColor(summary.outcome), theme.bold(line.text)), 0, 0));
+		} else {
+			box.addChild(new Text(theme.fg(summaryLineColor(line), line.text), 0, 0));
+		}
+	}
+	return box;
 }
 
 // --- Subagent Output Viewer Overlay ---
@@ -2196,6 +2236,7 @@ async function runOrchestratorLoop(
 				() => {
 					if (!overlayClosed && !viewerOpen) tui.requestRender();
 				},
+				() => closeOverlay("finished"),
 			);
 			return overlayComponent;
 		},
@@ -2551,16 +2592,34 @@ Errors: ${result.errors.join("; ")}`,
 			return { outcome: "failed", unexpectedError: err };
 		} finally {
 			if (widgetTimer) clearInterval(widgetTimer);
-			closeOverlay("finished");
 		}
 	})();
 
-	const [result] = await Promise.all([runPromise, overlayPromise]);
-
+	const result = await runPromise;
+	loopState.endTime = Date.now();
 	ctx.ui.setStatus("prd-loop", undefined);
 
-	// Print summary as static text widget
-	printSummary(ctx, loopState, prdTitle, result.outcome);
+	const summary = buildSummaryInput(loopState, prdTitle, result.outcome);
+
+	// Keep the overlay open in a finished view so tasks can still be inspected
+	// (expand/collapse, output viewer). Closing it posts the summary to the chat.
+	// If the user aborted via Esc, the overlay is already closed.
+	if (!overlayClosed && overlayComponent) {
+		overlayComponent.markFinished({
+			summary,
+			notification: result.notification,
+			error: result.unexpectedError
+				? (result.unexpectedError instanceof Error ? result.unexpectedError.message : String(result.unexpectedError))
+				: undefined,
+		});
+		requestOverlayRender();
+	} else {
+		closeOverlay("finished");
+	}
+	await overlayPromise;
+
+	// Summary as custom session entry: rendered in the chat (collapsible), never sent to the LLM.
+	pi.appendEntry<SummaryInput>(SUMMARY_ENTRY_TYPE, summary);
 
 	if (result.notification) ctx.ui.notify(result.notification.message, result.notification.level);
 	if (result.unexpectedError) throw result.unexpectedError;
@@ -2838,6 +2897,10 @@ export default function prdLoopExtension(pi: ExtensionAPI): void {
 		description: "Execute all tasks of a PRD autonomously with subagents",
 		handler: (args: string, ctx: ExtensionCommandContext) => prdLoopHandler(args, ctx, pi),
 	};
+
+	pi.registerEntryRenderer<SummaryInput>(SUMMARY_ENTRY_TYPE, (entry, { expanded }, theme) =>
+		entry.data ? renderSummaryEntry(entry.data, expanded, theme) : undefined,
+	);
 
 	pi.registerCommand("prd-loop", commandConfig);
 	pi.registerCommand("ralph", {
