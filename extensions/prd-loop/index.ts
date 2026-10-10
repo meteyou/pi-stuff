@@ -1961,10 +1961,10 @@ type PauseAction = "resume" | "release" | "retry" | "skip" | "abort";
  */
 async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Promise<PauseAction> {
 	const options = [
-		"▶️  Resume — keep changes, continue where it left off",
+		"🟢 Resume — keep changes, continue where it left off",
 		"🔧 Release session — fix manually, re-run /prd-loop to continue",
 		"🔄 Retry task — discard changes, try again from scratch",
-		"⏭️  Skip task — discard changes, mark done, continue with next",
+		"🚮 Skip task — discard changes, mark done, continue with next",
 		"❌ Abort loop — stop and keep changes on disk",
 	];
 
