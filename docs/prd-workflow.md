@@ -10,7 +10,7 @@ Adapted for local todo management using the
 ## Overview
 
 ```
-grill-me → write-a-prd → prd-to-todos → /prd-loop
+grill-me → write-a-prd → prd-to-todos → /prd-loop (or /prd-loop-pro)
 ```
 
 | Step | Trigger | What it does |
@@ -19,6 +19,7 @@ grill-me → write-a-prd → prd-to-todos → /prd-loop
 | 2 | `skill:write-a-prd` | Turn decisions into a structured PRD (saved as a numbered todo) |
 | 3 | `skill:prd-to-todos` | Break PRD into sequenced, dependency-aware tasks |
 | 4 | `/prd-loop` (or `/ralph`) | Execute tasks autonomously with isolated subagents |
+| 4 (alt.) | `/prd-loop-pro` (or `/ralph-pro`) | Same, with a review-fix pipeline per task, saved per-step settings and human hand-off |
 
 ## Step-by-Step
 
@@ -152,6 +153,65 @@ The extension uses two specialized agent definitions:
 | `prd-worker` | `agents/prd-worker.md` | Implements a task, validates acceptance criteria, returns JSON result |
 | `prd-committer` | `agents/prd-committer.md` | Analyzes `git diff`, creates granular conventional commits (smart-commits mode) |
 
+### 4 (alt.). PRD Loop Pro — Execute with review-fix pipeline
+
+`/prd-loop-pro` (alias `/ralph-pro`) is the pipeline variant of `/prd-loop`. Both can be used in parallel; pick
+`/prd-loop-pro` when every task should be reviewed and fixed before it is committed.
+
+```
+/prd-loop-pro prd-1
+```
+
+`prd-N` is the only argument — there are no flags. Full reference:
+[extensions/prd-loop-pro/README.md](../extensions/prd-loop-pro/README.md).
+
+#### Pipeline per task
+
+```
+Implement → Review ⇄ Fix → Commit → Report
+```
+
+1. **Implement** — `prd-worker` implements the task in an isolated subagent (with optional automatic retries).
+2. **Review** — a fresh `prd-reviewer` reviews the uncommitted changes (excluding `.pi/`) with the same rubric as
+   `/review`, and also checks completeness against the task's acceptance criteria and out-of-scope changes.
+3. **Fix** — one fresh `prd-fixer` per finding at/above the fix threshold, sequentially (P0 first). Each fixer fixes
+   the finding and runs the relevant checks, or rejects it with a reason.
+4. **Re-review** — only if at least one finding was fixed; rejected findings and their reasons are passed to the next
+   reviewer so they aren't raised again. Ends when no findings at/above the threshold remain, all were rejected, or
+   the round limit is reached (→ pause).
+5. **Commit** — `prd-committer` creates small Conventional Commits following the `/commit` prompt template (no
+   `Refs:`/`Task:` footers, never bypasses hooks).
+6. **Report** — an `## Execution Report` (rounds, fixed/rejected/deferred findings, callouts, commits, cost) is appended
+   to the task todo, the todo is closed and the PRD Task Index is updated.
+
+Findings below the threshold are not fixed; they are recorded as deferred findings in the execution report.
+
+#### Settings
+
+Instead of flags, `/prd-loop-pro` uses saved settings: model + thinking level for each step (implement, review, fix,
+commit, orchestrator for JSON repair), fix threshold (`P0`–`P3`, default `P1`), max review rounds (default `3`) and
+implementation retries (default `0`).
+
+- **First start:** a setup wizard walks through all settings and saves them globally
+  (`~/.pi/agent/prd-loop-pro.json`).
+- **Per project:** individual fields can be overridden in `.pi/prd-loop-pro.json` (only the differing fields are
+  stored).
+- **Every start:** an overview shows the PRD, task counts and all settings with their source (`[global]`/`[project]`)
+  → *Confirm & start*, *Change* (one row per setting; save globally, for this project only, or remove project
+  overrides) or *Cancel*. Unavailable models or invalid thinking levels are marked ⚠️ and block the start.
+
+#### Pauses and `needs-human`
+
+The loop never fails hard. When the round limit is reached, the implementation still fails after all retries, a
+subagent result can't be repaired into valid JSON, the committer or a git hook fails, or you press `Ctrl+C`, it opens
+a pause menu (e.g. *Resume*, *Retry phase*, *Retry task*, *One more round*, *Commit as-is*, *Skip task*, *Abort*).
+Discarding changes never touches `.pi/`.
+
+**Release (fix manually)** sets the task todo to `needs-human`, appends the open findings to it and stops the loop. The
+task and its dependents stay blocked. Fix it manually (or with the main agent), then run `/prd-loop-pro` again: the
+`needs-human` task is offered first with *Commit changes (committer) & close*, *Already committed – just close* or
+*Review again* — uncommitted changes are allowed for this — and the loop then continues with the next task.
+
 ## Alternative Entry Points
 
 You don't have to follow the full chain every time:
@@ -198,8 +258,8 @@ Status is synchronized in **two places** for resilience:
 
 | Source of Truth | What | Updated by |
 |----------------|------|-----------|
-| **Individual task todos** (status field) | Whether a task is open/closed | `/prd-loop` after each task |
-| **PRD Task Index** (in PRD body) | Dashboard view with dependencies + status | `/prd-loop` at start + after each task |
+| **Individual task todos** (status field) | Whether a task is open/closed (or `needs-human` with `/prd-loop-pro`) | `/prd-loop` / `/prd-loop-pro` after each task |
+| **PRD Task Index** (in PRD body) | Dashboard view with dependencies + status | `/prd-loop` / `/prd-loop-pro` at start + after each task |
 
 The Task Index gets updated from the actual task statuses after each completed task. This means it works correctly even
 if:
