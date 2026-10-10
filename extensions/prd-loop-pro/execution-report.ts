@@ -260,19 +260,42 @@ export function buildExecutionReport(record: ExecutionRecord): string {
 	return out.join("\n");
 }
 
+/** Context of a release to a human (shown at the top of the open findings section). */
+export interface ReleaseInfo {
+	/** Why the task was released (e.g. "review round limit reached (3/3)", "git hook failed"). */
+	reason?: string;
+	/** Errors of the failed phase (e.g. committer / hook output). */
+	errors?: string[];
+}
+
 /**
  * Build the "open findings" section appended to a task todo when it is
  * released to a human (`needs-human`). Lists every open finding with its
  * explanation; rejected findings are listed separately with their reasons.
+ * Optionally states why the task was released and the errors of the failed
+ * phase.
  */
-export function buildOpenFindingsSection(open: UnresolvedFinding[], rejected: RejectedFinding[] = []): string {
+export function buildOpenFindingsSection(
+	open: UnresolvedFinding[],
+	rejected: RejectedFinding[] = [],
+	release: ReleaseInfo = {},
+): string {
 	const out: string[] = [OPEN_FINDINGS_HEADING, ""];
+	if (release.reason?.trim()) {
+		out.push(`- **Released to a human:** ${oneLine(release.reason)}`);
+		out.push("- **Next step:** fix manually (or with the main agent), then re-run `/prd-loop-pro` to commit & close the task, close it if already committed, or review again.");
+		out.push("");
+	}
 	out.push(
 		open.length > 0
 			? "The automated review-fix cycle stopped with the following findings still open. Resolve them manually, then re-run the loop to close the task."
 			: "The automated review-fix cycle stopped without open findings.",
 		"",
 	);
+	const errors = (release.errors ?? []).filter((error) => error.trim());
+	if (errors.length > 0) {
+		out.push(section("Errors", errors.map((error) => formatFindingErrorItem(error))), "");
+	}
 	out.push(
 		section(
 			"Open",
@@ -291,6 +314,14 @@ export function buildOpenFindingsSection(open: UnresolvedFinding[], rejected: Re
 		);
 	}
 	return out.join("\n");
+}
+
+/** Error as a list item; multi-line errors keep their continuation lines inside the item. */
+function formatFindingErrorItem(error: string): string {
+	const [first, ...rest] = error.trim().split("\n");
+	const lines = [`- ${first!.trimEnd()}`];
+	for (const line of rest) lines.push(line.trim() ? `  ${line.trimEnd()}` : "");
+	return lines.join("\n");
 }
 
 /**
