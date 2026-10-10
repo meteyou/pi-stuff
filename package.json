@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "My pi extensions, skills and more",
   "keywords": ["pi-package"],
+  "scripts": {
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test"
+  },
   "pi": {
     "extensions": [
       "./extensions",
