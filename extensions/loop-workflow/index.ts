@@ -251,7 +251,7 @@ export default function loopWorkflowExtension(pi: ExtensionAPI): void {
 					await writePlan(cwd, plan);
 					await initializeFiles(cwd);
 
-					ctx.ui.notify("Loop initialized! Let's plan your project.", "success");
+					ctx.ui.notify("Loop initialized! Let's plan your project.", "info");
 
 					pi.sendUserMessage(`# Loop Workflow - Planning Phase
 
@@ -329,7 +329,7 @@ The user must explicitly trigger execution with \`/loop run\`.`);
 					const pendingTasks = plan.tasks.filter((t) => !t.completed);
 
 					if (pendingTasks.length === 0) {
-						ctx.ui.notify("All tasks completed! 🎉", "success");
+						ctx.ui.notify("All tasks completed! 🎉", "info");
 						return;
 					}
 
@@ -463,7 +463,7 @@ Stop if a task fails and report the issue.`);
 					await rm(loopDir, { recursive: true, force: true });
 					ctx.ui.setStatus("loop", "");
 
-					ctx.ui.notify("Cleared .pi/loop/ directory.", "success");
+					ctx.ui.notify("Cleared .pi/loop/ directory.", "info");
 					break;
 				}
 

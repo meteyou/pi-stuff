@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "description": "My pi extensions, skills and more",
   "keywords": ["pi-package"],
+  "scripts": {
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test"
+  },
   "pi": {
     "extensions": [
       "./extensions",
-      "./node_modules/agent-stuff/pi-extensions/session-breakdown.ts",
+      "./node_modules/agent-stuff/extensions/session-breakdown.ts",
       "./node_modules/pi-ghostty/extensions/ghostty.ts"
     ],
     "skills": [
@@ -29,6 +32,6 @@
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "typebox": "*"
   }
 }

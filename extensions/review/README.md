@@ -1,6 +1,6 @@
 # Review Extension
 
-Code review extension that prompts the agent to review code changes. Fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/pi-extensions/review.ts) with compatibility fixes for the current `@earendil-works/pi-tui` API.
+Code review extension that prompts the agent to review code changes. Fork of [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff/blob/main/extensions/review.ts) with compatibility fixes for the current `@earendil-works/pi-tui` API.
 
 ## Why this fork?
 
@@ -36,6 +36,22 @@ TypeError: (0 , _piTui.getEditorKeybindings) is not a function
 ## Review Guidelines
 
 If a `REVIEW_GUIDELINES.md` file exists in the same directory as `.pi`, its contents are automatically appended to the review prompt.
+
+## Shared review prompts
+
+The review rubric lives in [`review-prompts.ts`](./review-prompts.ts) (not an `index.ts`, so pi does not load it as an extension) and is shared with `prd-loop-pro`:
+
+| Export | Purpose |
+|---|---|
+| `REVIEW_RUBRIC_CORE` | Format-agnostic rubric: what to flag, untrusted input, comment guidelines, review priorities, fail-fast rules, priority levels P0–P3 |
+| `REVIEW_HUMAN_CALLOUTS_SECTION`, `REVIEW_MARKDOWN_OUTPUT_FORMAT` | Markdown output + required Human Reviewer Callouts section |
+| `REVIEW_RUBRIC_MARKDOWN` | Full rubric used by `/review` |
+| `REVIEW_JSON_OUTPUT_FORMAT`, `REVIEW_RUBRIC_JSON` | JSON output contract `{ verdict, summary, findings[], callouts[] }` (final message = raw JSON) used by `prd-loop-pro` |
+| `UNCOMMITTED_PROMPT` | Focus prompt for uncommitted changes |
+| `composeReviewPrompt`, `appendProjectReviewGuidelines` | Prompt composition helpers |
+| `loadProjectReviewGuidelines` | `REVIEW_GUIDELINES.md` loader |
+
+Run `npm test` to verify the markdown rubric stays byte-identical to the original.
 
 ## GitLab Support
 

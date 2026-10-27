@@ -47,7 +47,7 @@ For each approved slice, create a todo using the todo tool. Create them in depen
 
 #### Todo title format
 
-Use the PRD number from step 1. Prefix every title with `PRD #N - Task M/T:` where N is the PRD number, M is the sequence position, and T is the total task count.
+Use the PRD number from step 1. Prefix every title with `PRD #N - Task M/T:` where N is the PRD number, M is the task's unique position in the execution order (1…T), and T is the total task count.
 
 Example for `PRD #2: User Authentication`:
 
@@ -56,7 +56,7 @@ Example for `PRD #2: User Authentication`:
 - `PRD #2 - Task 3/4: Login UI & Session Handling`
 - `PRD #2 - Task 4/4: E2E Tests & Error Handling`
 
-Tasks at the same dependency level share the same sequence number (e.g., two independent tasks could both be `Task 1/4`).
+**Every task gets a unique sequence number** — never reuse a number, even for independent tasks at the same dependency level. Number the tasks consecutively from `1` to `T` in a valid dependency order (every task's blockers have lower numbers). With 16 tasks, the titles must read `Task 1/16` … `Task 16/16`, each number exactly once.
 
 #### Todo body structure
 
