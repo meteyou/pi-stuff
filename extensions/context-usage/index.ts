@@ -452,6 +452,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Track actual skill content from messages
 	pi.on("before_agent_start", async (event, ctx) => {
+		// Runs triggered by pi.sendMessage(..., { triggerTurn: true }) have no prompt
+		if (event.messageType !== "user" || typeof event.prompt !== "string") return;
 		const text = event.prompt;
 		// Check for expanded skill format: <skill name="..." location="...">content</skill>
 		const skillMatch = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>/);
