@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-export const CLAUDE_CODE_VERSION = "2.1.280";
+export const CLAUDE_CODE_VERSION = "2.1.322";
 
 // Replace standalone "pi" / "Pi" but preserve file paths and partial words
 // Match "pi" only when it's a whole word (not inside paths, URLs, or other words).
