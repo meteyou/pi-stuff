@@ -63,13 +63,14 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { keyText, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, keyText, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Box, matchesKey, Key, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
 import type { ThinkingLevel as AiThinkingLevel } from "@earendil-works/pi-ai";
 import type { PrdLoopProSettings, StepKey, StepSetting } from "./settings.ts";
@@ -82,6 +83,7 @@ import {
 	parseSubagentResult,
 	rawSnippet,
 	REVIEWER_RESULT_SCHEMA,
+	SPLITTER_RESULT_SCHEMA,
 	WORKER_RESULT_SCHEMA,
 } from "./subagent-result.ts";
 import type {
@@ -90,6 +92,8 @@ import type {
 	ResultSchema,
 	ReviewerResult,
 	ReviewFinding,
+	SplitProposal,
+	WorkerBlocked,
 	WorkerResult,
 } from "./subagent-result.ts";
 import { appendSection, buildExecutionReport, buildOpenFindingsSection, formatLocation } from "./execution-report.ts";
@@ -104,7 +108,7 @@ import {
 	syncPrdTaskIndex,
 } from "./task-index.ts";
 import type { TaskInfo } from "./task-index.ts";
-import { extractShortTitle, parseSequenceLabel, sequenceDepth, sortBySequence, subtaskProgress } from "./task-sequence.ts";
+import { extractShortTitle, nextSubtaskLabels, parseSequenceLabel, sequenceDepth, sortBySequence, subtaskProgress } from "./task-sequence.ts";
 import {
 	applyFixOutcomes,
 	applyReview,
@@ -126,7 +130,13 @@ import { buildCommitterPrompt, loadCommitRules } from "./committer-prompt.ts";
 import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
 import { buildPauseMenu, defaultReasonText, releaseReasonFor, skipSummaryFor } from "./pause.ts";
 import type { PauseAction, PauseReasonKind, PauseRequest } from "./pause.ts";
-import { discardChanges } from "./discard.ts";
+import { discardChanges, snapshotChanges } from "./discard.ts";
+import type { ChangeSnapshot } from "./discard.ts";
+import { appendAttempt, attemptActionText, shouldRecordAttempt } from "./attempt-log.ts";
+import { appendLogRecord, projectLogDir, pruneRunDirs, runDirName, runLogFileName, toLogRecord } from "./run-log.ts";
+import { addSplitToPrdIndex, describeSplitProposal, planSplit, validateSplitProposal } from "./task-split.ts";
+import { buildSplitterPrompt } from "./splitter-prompt.ts";
+import { buildHandoverPrompt } from "./handover.ts";
 import { arrowNavigation, clampScroll, findTaskBlock, revealBlock } from "./overlay-scroll.ts";
 import type { RowBlock } from "./overlay-scroll.ts";
 import {
@@ -143,6 +153,7 @@ import {
 	formatFixOutcomes,
 	formatReviewOutcome,
 	phaseGroupMeta,
+	phaseHeader,
 	startPhaseGroup,
 	statusIcon,
 } from "./progress-view.ts";
@@ -318,6 +329,8 @@ export interface SubagentResult {
 	errors: string[];
 	summary: string;
 	usage: SubagentUsage;
+	/** Set when the implementer reported that the task cannot be completed as written. */
+	blocked?: WorkerBlocked;
 }
 
 /**
@@ -461,6 +474,7 @@ const AGENT_END_EXIT_TIMEOUT_MS = 10000;
  * @param options.cwd - Working directory for the subagent process
  * @param options.agent - The agent definition (e.g. loaded from prd-worker.md)
  * @param options.signal - AbortSignal for cancellation
+ * @param options.logPath - JSONL log file of the run (see ./run-log.ts)
  * @returns SubagentRunResult with status, raw final text, usage stats and events
  */
 export async function spawnSubagent(options: {
@@ -471,8 +485,12 @@ export async function spawnSubagent(options: {
 	agent: AgentDefinition;
 	signal?: AbortSignal;
 	onActivity?: (activity: SubagentActivity) => void;
+	logPath?: string;
 }): Promise<SubagentRunResult> {
-	const { taskPrompt, model, thinkingLevel, cwd, agent, signal, onActivity } = options;
+	const { taskPrompt, model, thinkingLevel, cwd, agent, signal, onActivity, logPath } = options;
+	const log = (record: Record<string, unknown>) => {
+		if (logPath) appendLogRecord(logPath, record);
+	};
 
 	const events: OutputEvent[] = [];
 	const emitActivity = (activity: SubagentActivity) => {
@@ -534,6 +552,29 @@ export async function spawnSubagent(options: {
 	let settled = false;
 	let stderr = "";
 	let wasAborted = false;
+	/** Stop reason + error of the latest assistant message (a provider error ends the run without a result). */
+	let lastAssistant: { stopReason?: string; errorMessage?: string } | undefined;
+
+	log({
+		type: "run_start",
+		time: new Date().toISOString(),
+		agent: agent.name,
+		model: model ?? agent.model,
+		thinking: thinkingLevel,
+		cwd,
+		prompt: taskPrompt,
+	});
+	const finish = (result: SubagentRunResult): SubagentRunResult => {
+		log({
+			type: "run_end",
+			time: new Date().toISOString(),
+			status: result.status,
+			error: result.error,
+			usage: result.usage,
+			stderr: stderr.trim() || undefined,
+		});
+		return result;
+	};
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
@@ -562,6 +603,9 @@ export async function spawnSubagent(options: {
 				} catch {
 					return;
 				}
+
+				const logRecord = toLogRecord(event);
+				if (logRecord) log(logRecord);
 
 				// agent_end closes one low-level run. Automatic retries, overflow
 				// recovery or compaction can still continue afterwards, so keep only
@@ -595,6 +639,7 @@ export async function spawnSubagent(options: {
 					messages.push(msg);
 
 					if (msg.role === "assistant") {
+						lastAssistant = { stopReason: msg.stopReason, errorMessage: msg.errorMessage };
 						usage.turns++;
 						const msgUsage = msg.usage;
 						if (msgUsage) {
@@ -714,22 +759,35 @@ export async function spawnSubagent(options: {
 
 		// Handle abort
 		if (wasAborted) {
-			return { status: "aborted", finalText, usage, events, error: "Subagent was aborted" };
+			return finish({ status: "aborted", finalText, usage, events, error: "Subagent was aborted" });
+		}
+
+		// The run ended with a model/provider error (e.g. overloaded, rate limit,
+		// quota) after pi's own retries: there is no result, and an earlier
+		// assistant text must not be mistaken for one.
+		if (lastAssistant?.stopReason === "error") {
+			return finish({
+				status: "failed",
+				finalText,
+				usage,
+				events,
+				error: `Model/provider error: ${lastAssistant.errorMessage?.trim() || "unknown error"}`,
+			});
 		}
 
 		// Handle non-zero exit code — but if we received agent_settled, the agent
 		// DID complete; the non-zero code is likely from post-agent cleanup.
 		if (exitCode !== 0 && !settled) {
-			return {
+			return finish({
 				status: "failed",
 				finalText,
 				usage,
 				events,
 				error: `Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`,
-			};
+			});
 		}
 
-		return { status: "completed", finalText, usage, events };
+		return finish({ status: "completed", finalText, usage, events });
 	} finally {
 		// Clean up temp files
 		try {
@@ -824,7 +882,15 @@ export async function parseRunResult<T>(
 /** Map a parsed prd-worker run to the worker-level result used by the orchestrator. */
 function toWorkerResult(parsed: ParsedRunResult<WorkerResult>): SubagentResult {
 	if (parsed.ok) {
-		return { success: parsed.value.success, errors: parsed.value.errors, summary: parsed.value.summary, usage: parsed.usage };
+		const blocked = parsed.value.blocked?.reason.trim() ? parsed.value.blocked : undefined;
+		return {
+			// A blocked task is never a success, whatever the flag says.
+			success: parsed.value.success && !blocked,
+			errors: parsed.value.errors,
+			summary: parsed.value.summary,
+			usage: parsed.usage,
+			blocked,
+		};
 	}
 	const summary =
 		parsed.status === "aborted"
@@ -941,6 +1007,40 @@ async function updateTodoFileBody(cwd: string, todoId: string, newBody: string):
 	writeFileSync(filePath, split.jsonStr + "\n\n" + newBody + "\n", "utf-8");
 }
 
+/**
+ * Create a new todo file (JSON frontmatter + body), in the format of the
+ * todo tool. Fails if the file already exists.
+ */
+function createTodoFile(
+	cwd: string,
+	todo: { id: string; title: string; tags: string[]; status: string; body: string },
+): void {
+	const hex = todoIdToHex(todo.id);
+	const meta = { id: hex, title: todo.title, tags: todo.tags, status: todo.status, created_at: new Date().toISOString() };
+	writeFileSync(join(cwd, ".pi", "todos", `${hex}.md`), `${JSON.stringify(meta, null, 2)}\n\n${todo.body.trim()}\n`, {
+		encoding: "utf-8",
+		flag: "wx",
+	});
+}
+
+/** `count` unused todo ids (`TODO-<8 hex>`). */
+function generateTodoIds(cwd: string, count: number): string[] {
+	const ids: string[] = [];
+	while (ids.length < count) {
+		const hex = randomBytes(4).toString("hex");
+		const id = `TODO-${hex}`;
+		if (ids.includes(id) || existsSync(join(cwd, ".pi", "todos", `${hex}.md`))) continue;
+		ids.push(id);
+	}
+	return ids;
+}
+
+/** Local timestamp `YYYY-MM-DD HH:MM` (attempt log, stash messages). */
+function localTimestamp(date = new Date()): string {
+	const pad = (value: number) => String(value).padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 // --- PRD Task Index ---
 
 /** Re-sync the PRD Task Index (status column + "Next up" pointer) with the given task statuses. */
@@ -967,7 +1067,7 @@ function formatHeldTasks(held: TaskInfo[]): string {
 // --- Needs-human resolution ---
 
 /** How a `needs-human` task is resolved at start. */
-type NeedsHumanAction = "commit" | "close" | "review" | "not-now";
+type NeedsHumanAction = "commit" | "close" | "review" | "reopen" | "not-now";
 
 /** A `needs-human` task to resolve inside the orchestrator loop (runs first). */
 interface NeedsHumanResume {
@@ -1019,11 +1119,12 @@ async function showNeedsHumanMenu(
 			? "The working tree has uncommitted changes (assumed to be your work on this task)."
 			: "The working tree is clean.",
 	];
-	const actions: NeedsHumanAction[] = ["commit", "close", "review", "not-now"];
+	const actions: NeedsHumanAction[] = ["commit", "close", "review", "reopen", "not-now"];
 	const labels: Record<NeedsHumanAction, string> = {
 		commit: "Commit changes (committer) & close — then continue with the next task",
 		close: "Already committed – just close — then continue with the next task",
 		review: "Review again — run the review-fix cycle on the current changes, then commit & close",
+		reopen: "Re-open — the task was split or rewritten; set it back to open and let the loop run it (needs a clean working tree)",
 		"not-now": "Not now — leave the task as needs-human",
 	};
 	const menu = actions.map((action) => labels[action]);
@@ -1062,11 +1163,23 @@ async function closeNeedsHumanTask(cwd: string, entry: NeedsHumanTask): Promise<
 	}
 }
 
+/**
+ * "Re-open": the task was split into subtasks or rewritten while it was
+ * `needs-human`. Set it back to open and update the PRD Task Index; the loop
+ * runs it again when its blockers are closed.
+ */
+async function reopenNeedsHumanTask(cwd: string, entry: NeedsHumanTask): Promise<void> {
+	await updateTodoFileStatus(cwd, entry.taskId, "open");
+	if (!entry.prd) return;
+	const prdId = entry.prd.id.startsWith("TODO-") ? entry.prd.id : `TODO-${entry.prd.id}`;
+	await syncPrdTaskIndexFile(cwd, prdId, await fetchPrdTasks(cwd, entry.prdTag));
+}
+
 /** Outcome of offering the `needs-human` tasks at start. */
 interface NeedsHumanStartResult {
 	/** Task to resolve inside the loop ("Commit changes" / "Review again"). */
 	resume?: { entry: NeedsHumanTask; mode: NeedsHumanResume["mode"] };
-	/** PRD tag of the last task closed via "Already committed – just close". */
+	/** PRD tag of the last task closed via "Already committed – just close" or re-opened via "Re-open". */
 	closedPrdTag?: string;
 }
 
@@ -1111,6 +1224,11 @@ async function offerNeedsHumanTasks(
 				await closeNeedsHumanTask(ctx.cwd, entry);
 				result.closedPrdTag = entry.prdTag;
 				ctx.ui.notify(`✅ Closed ${entry.taskId} (${extractShortTitle(entry.task.title)}).`, "info");
+				continue;
+			case "reopen":
+				await reopenNeedsHumanTask(ctx.cwd, entry);
+				result.closedPrdTag = entry.prdTag;
+				ctx.ui.notify(`🔓 Re-opened ${entry.taskId} (${extractShortTitle(entry.task.title)}).`, "info");
 				continue;
 			case "commit":
 			case "review":
@@ -1211,6 +1329,10 @@ interface LoopTaskState {
 	reviewNote?: string;
 	/** Cost per pipeline phase (kept across "Retry task"). */
 	phaseCosts: Partial<Record<CostPhase, number>>;
+	/** Log files of the subagent runs of the current attempt (see ./run-log.ts). */
+	logFiles: string[];
+	/** Set when the implementer reported the task as blocked (kept for split / hand-over). */
+	blocked?: WorkerBlocked;
 	startTime?: number;
 	endTime?: number;
 	cost: number;
@@ -1333,6 +1455,16 @@ class PrdLoopOverlayComponent {
 
 	getSelectedTaskIndex(): number {
 		return this.selectedIndex;
+	}
+
+	/** The task list was rebuilt (split): row indices changed, so drop the index-based view state. */
+	tasksChanged(): void {
+		this.expanded.clear();
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, this.state.tasks.length - 1));
+		this.scrollOffset = 0;
+		this.lastView = undefined;
+		this.revealSelected = true;
+		this.requestRender();
 	}
 
 	handleInput(data: string): void {
@@ -2077,7 +2209,7 @@ async function listExcludedFilesCommittedSince(pi: ExtensionAPI, cwd: string, be
  * - `needs-human` tasks (not being resolved) and their dependents are never started
  * - Final summary widget on completion/failure/abort/release
  */
-async function runOrchestratorLoop(
+export async function runOrchestratorLoop(
 	ctx: ExtensionCommandContext,
 	pi: ExtensionAPI,
 	prd: TodoItem,
@@ -2090,6 +2222,7 @@ async function runOrchestratorLoop(
 	const reviewerAgent = await loadAgent(EXTENSION_DIR, "prd-reviewer");
 	const fixerAgent = await loadAgent(EXTENSION_DIR, "prd-fixer");
 	const committerAgent = await loadAgent(EXTENSION_DIR, "prd-committer");
+	const splitterAgent = await loadAgent(EXTENSION_DIR, "prd-splitter");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resume = options.resume && tasks.some((t) => t.id === options.resume!.taskId && isNeedsHuman(t.status))
@@ -2127,22 +2260,25 @@ async function runOrchestratorLoop(
 	// Hierarchical order: split subtasks (17a, 17a1, …) follow their parent task.
 	const allTasksSorted = sortBySequence(resolution.allTasks);
 
+	const newTaskState = (task: TaskInfo): LoopTaskState => ({
+		id: task.id,
+		title: task.title,
+		sequenceLabel: task.sequenceLabel,
+		status: (isTaskClosed(task.status) ? "completed" : isNeedsHuman(task.status) ? "needs-human" : "pending") as TaskStatus,
+		cost: 0,
+		retries: 0,
+		errors: [],
+		summary: undefined,
+		currentActivity: undefined,
+		currentTurn: 0,
+		outputGroups: [],
+		phaseCosts: {},
+		logFiles: [],
+	});
+
 	const loopState: LoopState = {
 		startTime: Date.now(),
-		tasks: allTasksSorted.map((task) => ({
-			id: task.id,
-			title: task.title,
-			sequenceLabel: task.sequenceLabel,
-			status: (isTaskClosed(task.status) ? "completed" : isNeedsHuman(task.status) ? "needs-human" : "pending") as TaskStatus,
-			cost: 0,
-			retries: 0,
-			errors: [],
-			summary: undefined,
-			currentActivity: undefined,
-			currentTurn: 0,
-			outputGroups: [],
-			phaseCosts: {},
-		})),
+		tasks: allTasksSorted.map(newTaskState),
 		totalCost: 0,
 		totalCommits: 0,
 		currentTaskIndex: 0,
@@ -2151,6 +2287,13 @@ async function runOrchestratorLoop(
 	};
 
 	const prdTitle = prd.title;
+
+	// Subagent run logs (outside the project, see ./run-log.ts).
+	const logProjectDir = projectLogDir(join(getAgentDir(), "prd-loop-pro", "logs"), ctx.cwd);
+	pruneRunDirs(logProjectDir);
+	const logRunDir = join(logProjectDir, runDirName(new Date()));
+	let logSequence = 0;
+
 	let currentAbortController = new AbortController();
 	let aborted = false;
 	let pauseRequested = false;
@@ -2347,6 +2490,8 @@ async function runOrchestratorLoop(
 		outcome: LoopOutcome;
 		notification?: { message: string; level: "info" | "warning" | "error" };
 		unexpectedError?: unknown;
+		/** Prompt for the main session after "Release / hand over" (see ./handover.ts). */
+		handoverPrompt?: string;
 	};
 
 	// --- Pipeline helpers ---
@@ -2433,7 +2578,7 @@ async function runOrchestratorLoop(
 	 * running subagent keeps the model it was started with.
 	 */
 	const runStepSubagent = async (
-		step: Exclude<StepKey, "orchestrator">,
+		step: StepKey,
 		taskState: LoopTaskState,
 		output: { ref: PhaseRef; note?: string },
 		run: { taskPrompt: string; agent: AgentDefinition },
@@ -2441,6 +2586,8 @@ async function runOrchestratorLoop(
 		const { model, thinking } = settings.steps[step];
 		const modelText = formatStepModel({ model, thinking });
 		beginPhaseOutput(taskState, output.ref, output.note, modelText);
+		const logPath = join(logRunDir, runLogFileName(++logSequence, taskState.sequenceLabel, phaseHeader(output.ref, output.note)));
+		taskState.logFiles.push(logPath);
 		activeRun = { step, model, thinking };
 		taskState.currentModel = modelText;
 		try {
@@ -2452,6 +2599,7 @@ async function runOrchestratorLoop(
 				agent: run.agent,
 				signal: currentAbortController.signal,
 				onActivity: createActivityHandler(taskState),
+				logPath,
 			});
 		} finally {
 			activeRun = undefined;
@@ -2467,10 +2615,67 @@ async function runOrchestratorLoop(
 	};
 
 	/**
-	 * Discard all uncommitted changes outside `.pi/` (see ./discard.ts). Todo
-	 * bookkeeping under `.pi/` is never touched, even when `.pi/` is tracked.
+	 * The pause that led to the action being carried out, to be recorded in the
+	 * task todo (see ./attempt-log.ts). Set by `pause`, written by `recordAttempt`.
 	 */
-	const discardTaskChanges = () => discardChanges((args) => pi.exec("git", args, { cwd: ctx.cwd }));
+	let pendingAttempt: { timestamp: string; phase: string; reason: string; action: string; errors?: string[]; summary?: string } | undefined;
+
+	/**
+	 * Write the pending attempt into the `## Failed Attempts` section of the
+	 * task todo (incl. the snapshot of discarded changes and the log files).
+	 * A failure to write is reported, never fatal.
+	 */
+	const recordAttempt = async (task: TaskInfo, taskState: LoopTaskState, snapshot?: ChangeSnapshot) => {
+		const attempt = pendingAttempt;
+		pendingAttempt = undefined;
+		if (!attempt) return;
+		try {
+			const body = await readTodoBody(ctx.cwd, task.id);
+			await updateTodoFileBody(
+				ctx.cwd,
+				task.id,
+				appendAttempt(body, { ...attempt, snapshot, logFiles: [...taskState.logFiles] }),
+			);
+		} catch (err) {
+			ctx.ui.notify(
+				`⚠️ Failed to record the attempt in ${task.id}: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
+		}
+	};
+
+	/**
+	 * Discard all uncommitted changes outside `.pi/` (see ./discard.ts). The
+	 * changes are saved as a git stash first, so the discard can be undone; if
+	 * that fails, nothing is discarded and the error is thrown. Todo bookkeeping
+	 * under `.pi/` is never touched, even when `.pi/` is tracked. The pending
+	 * attempt is recorded in the task todo together with the snapshot.
+	 */
+	const discardTaskChanges = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		what: string,
+	): Promise<ChangeSnapshot | undefined> => {
+		const git = (args: string[]) => pi.exec("git", args, { cwd: ctx.cwd });
+		let snapshot: ChangeSnapshot | undefined;
+		try {
+			snapshot = await snapshotChanges(git, `prd-loop-pro: Task ${task.sequenceLabel} — ${what} (${localTimestamp()})`);
+		} catch (err) {
+			throw new Error(
+				`Could not save the uncommitted changes as a git stash, so nothing was discarded: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		await discardChanges(git);
+		await recordAttempt(task, taskState, snapshot);
+		taskState.logFiles = [];
+		if (snapshot) {
+			ctx.ui.notify(
+				`💾 Changes of Task ${task.sequenceLabel} were saved before the discard — restore with: git stash apply ${snapshot.ref}`,
+				"info",
+			);
+		}
+		return snapshot;
+	};
 
 	/** Close a task todo and update the PRD Task Index (index errors are reported, not fatal). */
 	const closeTaskAndUpdateIndex = async (task: TaskInfo, options: { notifyIndexError: boolean }) => {
@@ -2490,7 +2695,7 @@ async function runOrchestratorLoop(
 
 	/** "Skip task": discard changes (except `.pi/`), close the todo, continue with the next task. */
 	const skipTask = async (task: TaskInfo, taskState: LoopTaskState, summary: string) => {
-		await discardTaskChanges();
+		await discardTaskChanges(task, taskState, "skip task");
 		currentAbortController = new AbortController();
 		taskState.status = "completed";
 		taskState.endTime = Date.now();
@@ -2546,6 +2751,21 @@ async function runOrchestratorLoop(
 			);
 		}
 
+		// Prepared prompt for the main session (put into the editor when the overlay closes).
+		const handoverPrompt = buildHandoverPrompt({
+			taskId: task.id,
+			taskTitle: task.title,
+			prdId,
+			prdTitle,
+			phase: taskState.phaseLabel ?? taskState.phase ?? "Implement",
+			reason: request.reason,
+			errors: request.errors,
+			summary: taskState.summary,
+			proposedSplit: taskState.blocked?.proposedSplit,
+			openFindings: open.length,
+			logFiles: taskState.logFiles,
+		});
+
 		currentAbortController = new AbortController();
 		taskState.status = "needs-human";
 		taskState.endTime = Date.now();
@@ -2562,10 +2782,12 @@ async function runOrchestratorLoop(
 				message:
 					`🔧 Task ${task.sequenceLabel} released to a human (needs-human): ${request.reason}.\n` +
 					`${findingsText} Uncommitted changes left on disk; dependent tasks stay blocked.\n` +
-					"Fix it manually (or with the main agent), then re-run /prd-loop-pro to commit & close it " +
-					"(or just close it if already committed, or review again) and continue with the next task.",
+					"A prompt for the main session is in the editor: send it to look into the task with the agent. " +
+					"Then re-run /prd-loop-pro to commit & close it (or just close it if already committed, review again, " +
+					"or re-open it if it was split or rewritten) and continue with the next task.",
 				level: "warning",
 			},
+			handoverPrompt,
 		};
 	};
 
@@ -2577,6 +2799,7 @@ async function runOrchestratorLoop(
 	/** Exits shared by all phases, chosen in a pause menu. */
 	type PhaseExit =
 		| { kind: "retry-task" }
+		| { kind: "split" }
 		| { kind: "skipped" }
 		| { kind: "released"; reason: string; errors?: string[] }
 		| { kind: "aborted" };
@@ -2602,8 +2825,9 @@ async function runOrchestratorLoop(
 		}
 		requestOverlayRender();
 		if (widgetTimer) clearInterval(widgetTimer);
+		let action: PauseAction;
 		try {
-			return await withOverlayHidden(() =>
+			action = await withOverlayHidden(() =>
 				showPauseMenu(ctx, {
 					taskLabel: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
 					phase,
@@ -2621,6 +2845,23 @@ async function runOrchestratorLoop(
 			taskState.currentActivity = undefined;
 			requestOverlayRender();
 		}
+
+		// Record the failed attempt in the task todo. Actions that discard the
+		// changes record it together with the snapshot (see `discardTaskChanges`).
+		pendingAttempt = shouldRecordAttempt(options.reason, action)
+			? {
+				timestamp: localTimestamp(),
+				phase: taskState.phaseLabel ?? phase,
+				reason: reasonText,
+				action: attemptActionText(action),
+				errors: options.errors,
+				summary: taskState.summary,
+			}
+			: undefined;
+		if (action !== "retry-task" && action !== "skip-task" && action !== "split-task") {
+			await recordAttempt(task, taskState);
+		}
+		return action;
 	};
 
 	/**
@@ -2655,6 +2896,173 @@ async function runOrchestratorLoop(
 	const repairedSuffix = (parsed: { ok: boolean; repaired?: boolean }) =>
 		parsed.ok && parsed.repaired ? " • JSON repaired" : "";
 
+	// --- Split task (see ./task-split.ts) ---
+
+	/** Todo ids of the subtasks created by the latest split (they run next). */
+	let lastSplitIds: string[] = [];
+
+	/** Detail lines of a "task-blocked" pause: the parts proposed by the implementer. */
+	const blockedDetails = (blocked: WorkerBlocked): string[] => {
+		const parts = blocked.proposedSplit.filter((part) => part.title.trim());
+		if (parts.length === 0) return [];
+		return [
+			"Split proposed by the implementer:",
+			...parts.map((part, i) => `  ${i + 1}. ${part.title.replace(/\s+/g, " ").trim()}`),
+		];
+	};
+
+	/**
+	 * "Split task": the prd-splitter subagent (orchestrator model/thinking)
+	 * proposes subtasks; after the human confirms, the changes of the attempt
+	 * are saved as a git stash and discarded, the subtask todos are created, the
+	 * task becomes the close-out task (blocked by the subtasks) and the PRD Task
+	 * Index gets the new rows. Returns false if nothing was split (splitter
+	 * failed, unusable proposal, not confirmed, cancelled).
+	 */
+	const runSplitFlow = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phaseCosts: Partial<Record<CostPhase, number>>,
+		pauseOptions: PauseOptions,
+	): Promise<boolean> => {
+		const existingLabels = tasks.map((t) => t.sequenceLabel);
+		const labelsFor = (count: number) => nextSubtaskLabels(task.sequenceLabel, existingLabels, count);
+		if (labelsFor(1).length === 0) {
+			ctx.ui.notify(`❌ Cannot split "${task.title}": the title has no sequence label ("Task M/T:").`, "error");
+			return false;
+		}
+
+		const reasonText = (pauseOptions.reasonText ?? defaultReasonText(pauseOptions.reason, "Implement")).replace(/\s+/g, " ").trim();
+		const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
+		const hasChanges = status.code === 0 && status.stdout.trim() !== "";
+		const blocked = taskState.blocked;
+		const attemptSummary = taskState.summary;
+
+		// --- Proposal: one retry if the proposal is not usable ---
+		let proposal: SplitProposal | undefined;
+		let issues: string[] = [];
+		const previousLabel = taskState.phaseLabel;
+		taskState.status = "running";
+		try {
+			for (let attempt = 1; attempt <= 2 && !proposal; attempt++) {
+				taskState.phaseLabel = "Split";
+				taskState.currentActivity = "✂️ planning the split…";
+				requestOverlayRender();
+				const run = await runStepSubagent(
+					"orchestrator",
+					taskState,
+					{ ref: { phase: "split", attempt } },
+					{
+						taskPrompt: buildSplitterPrompt({
+							taskTitle: task.title,
+							taskBody: task.body,
+							prdId,
+							reason: reasonText,
+							errors: pauseOptions.errors,
+							summary: attemptSummary,
+							blockedReason: blocked?.reason,
+							proposedSplit: blocked?.proposedSplit,
+							hasChanges,
+							previousIssues: issues,
+						}),
+						agent: splitterAgent,
+					},
+				);
+				const parsed = await parseRunResult(run, SPLITTER_RESULT_SCHEMA, createRepairFactory(taskState));
+				addCost(taskState, phaseCosts, "split", parsed.usage.cost);
+
+				// Ctrl+C / Esc while the splitter runs: back to the pause menu (or abort).
+				if (pauseRequested || aborted) {
+					endPhaseOutput(taskState, "cancelled", true);
+					return false;
+				}
+				if (!parsed.ok) {
+					endPhaseOutput(taskState, `failed — ${parsed.error}`, true);
+					ctx.ui.notify(`❌ Split failed: ${parsed.error}`, "error");
+					return false;
+				}
+				issues = validateSplitProposal(parsed.value);
+				if (issues.length === 0) {
+					proposal = parsed.value;
+					endPhaseOutput(taskState, `${proposal.subtasks.length} subtasks proposed${repairedSuffix(parsed)}`);
+				} else {
+					endPhaseOutput(taskState, `unusable proposal — ${issues[0]}`, true);
+				}
+			}
+		} finally {
+			taskState.phaseLabel = previousLabel;
+			taskState.currentActivity = undefined;
+			requestOverlayRender();
+		}
+		if (!proposal) {
+			ctx.ui.notify(`❌ Split failed: the splitter returned no usable proposal (${issues.join("; ")}).`, "error");
+			return false;
+		}
+
+		// --- Confirmation ---
+		const count = proposal.subtasks.length;
+		const labels = labelsFor(count);
+		const title = [
+			`✂️  Split Task ${task.sequenceLabel}: ${extractShortTitle(task.title)} into ${count} subtasks?`,
+			"",
+			...describeSplitProposal(proposal, labels),
+			"",
+			hasChanges
+				? "Applying saves the uncommitted changes as a git stash, removes them from the working tree and references the stash in the subtasks."
+				: "There are no uncommitted changes to save.",
+		].join("\n");
+		const applyLabel = `Apply split — create ${count} subtask todos and continue with ${labels[0]!.split("/")[0]}`;
+		const backLabel = "Back to the pause menu — change nothing";
+		const choice = await withOverlayHidden(() => ctx.ui.select(title, [applyLabel, backLabel]));
+		if (choice !== applyLabel) return false;
+
+		// --- Apply ---
+		try {
+			const snapshot = await discardTaskChanges(task, taskState, "split");
+			const plan = planSplit({
+				parent: {
+					id: task.id,
+					title: task.title,
+					// Current body incl. the attempt record written by the discard above.
+					body: await readTodoBody(ctx.cwd, task.id),
+					sequenceLabel: task.sequenceLabel,
+				},
+				existingLabels,
+				proposal,
+				newIds: generateTodoIds(ctx.cwd, count),
+				date: localTimestamp().slice(0, 10),
+				reason: reasonText.length > 200 ? `${reasonText.slice(0, 199)}…` : reasonText,
+				snapshot,
+			});
+			for (const subtask of plan.subtasks) {
+				createTodoFile(ctx.cwd, { id: subtask.id, title: subtask.title, tags: ["task", prdTag], status: "open", body: subtask.body });
+			}
+			await updateTodoFileBody(ctx.cwd, task.id, plan.parentBody);
+
+			let indexUpdated = false;
+			try {
+				const index = addSplitToPrdIndex(await readTodoBody(ctx.cwd, prdId), task.id, plan);
+				if (index.updated) await updateTodoFileBody(ctx.cwd, prdId, index.body);
+				indexUpdated = index.updated;
+			} catch {
+				// reported below
+			}
+
+			lastSplitIds = plan.subtasks.map((subtask) => subtask.id);
+			const range = `${labels[0]!.split("/")[0]}–${labels.at(-1)!.split("/")[0]}`;
+			taskState.summary = `Split into ${range}; runs again as close-out after the subtasks.`;
+			ctx.ui.notify(
+				`✂️ Task ${task.sequenceLabel} split into ${range} (${plan.subtasks.map((subtask) => subtask.id).join(", ")}).` +
+					(indexUpdated ? "" : " ⚠️ The PRD Task Index has no row for the task; add the subtask rows manually."),
+				indexUpdated ? "info" : "warning",
+			);
+			return true;
+		} catch (err) {
+			ctx.ui.notify(`❌ Split failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+			return false;
+		}
+	};
+
 	type ImplementPhaseOutcome =
 		| { kind: "implemented"; summary: string }
 		| PhaseExit;
@@ -2662,9 +3070,12 @@ async function runOrchestratorLoop(
 	/**
 	 * Implement phase: prd-worker subagent (implement model/thinking) with up
 	 * to `implementationRetries` automatic retries. Pauses instead of failing:
-	 * - still failing after all retries → Retry task / Release / Skip task / Abort
+	 * - the implementer reports the task as blocked (no automatic retry) →
+	 *   Split task / Release / Retry phase / Retry task / Skip task / Abort
+	 * - still failing after all retries → Retry phase (keep changes) / Retry task /
+	 *   Split task / Release / Skip task / Abort
 	 * - unrepairable JSON result → Retry phase / Release / Skip task / Abort
-	 * - Ctrl+C → Resume / Skip phase / Retry task / Release / Skip task / Abort
+	 * - Ctrl+C → Resume / Skip phase / Retry task / Split task / Release / Skip task / Abort
 	 */
 	const runImplementPhase = async (
 		task: TaskInfo,
@@ -2676,6 +3087,33 @@ async function runOrchestratorLoop(
 		let attempt = 1;
 		/** Qualifier of the next output group header (`resumed`, `retry`). */
 		let runNote: string | undefined;
+
+		/**
+		 * Pause menu of the implement phase. "Split task" runs the split flow;
+		 * if no split was applied, the menu is shown again.
+		 */
+		const pauseImplement = async (options: PauseOptions): Promise<PauseAction | "split-applied"> => {
+			while (true) {
+				const action = await pause(task, taskState, "Implement", options);
+				if (action !== "split-task") return action;
+				if (await runSplitFlow(task, taskState, phaseCosts, options)) return "split-applied";
+				if (aborted) return "abort";
+			}
+		};
+
+		/** Run the implementer again on the changes on disk, with the errors of the failed attempt. */
+		const retryKeepingChanges = (errors: string[]) => {
+			prompt = buildRetryPrompt(task, prdId, errors);
+			runNote = "retry, changes kept";
+			attempt++;
+			taskState.retries++;
+			taskState.status = "retrying";
+			taskState.errors = [];
+			taskState.blocked = undefined;
+			taskState.currentActivity = "▶ retrying implementation…";
+			loopState.currentRetry = attempt - 1;
+			requestOverlayRender();
+		};
 
 		while (true) {
 			if (aborted) return { kind: "aborted" };
@@ -2694,12 +3132,14 @@ async function runOrchestratorLoop(
 			const result = toWorkerResult(parsedRun);
 			addCost(taskState, phaseCosts, "implement", result.usage.cost);
 			taskState.summary = result.summary;
+			taskState.blocked = result.blocked;
 			requestOverlayRender();
 
 			// --- Pause: Ctrl+C ---
 			if (pauseRequested) {
 				const options: PauseOptions = { reason: "manual" };
-				const action = await pause(task, taskState, "Implement", options);
+				const action = await pauseImplement(options);
+				if (action === "split-applied") return { kind: "split" };
 				if (action === "resume") {
 					prompt = buildContinuePrompt(task, prdId);
 					runNote = "resumed";
@@ -2743,6 +3183,27 @@ async function runOrchestratorLoop(
 			}
 
 			taskState.errors = result.errors;
+
+			// --- Pause: the implementer says the task cannot be completed as written.
+			// Retrying the same task automatically would fail the same way. ---
+			if (result.blocked) {
+				const blockedReason = result.blocked.reason.replace(/\s+/g, " ").trim();
+				endPhaseOutput(taskState, `blocked — ${blockedReason}`, true);
+				const options: PauseOptions = {
+					reason: "task-blocked",
+					reasonText: `the implementer reported that the task cannot be completed as written: ${blockedReason}`,
+					errors: result.errors,
+					details: blockedDetails(result.blocked),
+				};
+				const action = await pauseImplement(options);
+				if (action === "split-applied") return { kind: "split" };
+				if (action === "retry-phase") {
+					retryKeepingChanges([`The previous attempt reported the task as blocked: ${blockedReason}`, ...result.errors]);
+					continue;
+				}
+				return handleCommonPauseAction(task, taskState, "Implement", options, action);
+			}
+
 			endPhaseOutput(taskState, `failed — ${result.errors[0] ?? result.summary}`, true);
 
 			// --- Pause: still failing after all retries ---
@@ -2752,7 +3213,12 @@ async function runOrchestratorLoop(
 					reasonText: `implementation failed after ${attempt} attempt${attempt === 1 ? "" : "s"}`,
 					errors: result.errors,
 				};
-				const action = await pause(task, taskState, "Implement", options);
+				const action = await pauseImplement(options);
+				if (action === "split-applied") return { kind: "split" };
+				if (action === "retry-phase") {
+					retryKeepingChanges(result.errors);
+					continue;
+				}
 				return handleCommonPauseAction(task, taskState, "Implement", options, action);
 			}
 
@@ -3107,6 +3573,7 @@ async function runOrchestratorLoop(
 		| { kind: "completed" }
 		| { kind: "skipped" }
 		| { kind: "retry-task" }
+		| { kind: "split" }
 		| { kind: "released"; request: ReleaseRequest }
 		| { kind: "aborted"; summary: string };
 
@@ -3276,14 +3743,61 @@ async function runOrchestratorLoop(
 		return { kind: "completed" };
 	};
 
+	/** Open tasks still to run, in dependency order (rebuilt after a split). */
+	let queue: TaskInfo[] = [...resolution.actionable];
+	/** Tasks already run in this loop (never started twice, except the close-out of a split). */
+	const processed = new Set<string>();
+	let executedCount = 0;
+
+	/**
+	 * Re-read the tasks of the PRD after a split: new subtask todos join the
+	 * task list, the overlay and the queue. Returns an error message if the
+	 * new task graph cannot be resolved.
+	 */
+	const refreshTasks = async (): Promise<string | undefined> => {
+		const fresh = await fetchPrdTasks(ctx.cwd, prdTag);
+		tasks.splice(0, tasks.length, ...fresh);
+		const next = resolveTaskOrder(tasks);
+		if (next.error) return next.error;
+		try {
+			await syncPrdTaskIndexFile(ctx.cwd, prdId, tasks);
+		} catch (err) {
+			ctx.ui.notify(
+				`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
+		}
+
+		const previous = new Map(loopState.tasks.map((state) => [state.id, state]));
+		loopState.tasks = sortBySequence(tasks).map((task) => {
+			const state = previous.get(task.id);
+			if (!state) return newTaskState(task);
+			state.title = task.title;
+			state.sequenceLabel = task.sequenceLabel;
+			return state;
+		});
+		loopState.currentTaskIndex = Math.min(loopState.currentTaskIndex, Math.max(0, loopState.tasks.length - 1));
+		overlayComponent?.tasksChanged();
+		// The subtasks of the split run next (they only depend on each other and
+		// on the blockers of the task that was just running), then everything else.
+		const open = next.actionable.filter((task) => !processed.has(task.id));
+		const split = new Set(lastSplitIds);
+		queue = [...open.filter((task) => split.has(task.id)), ...open.filter((task) => !split.has(task.id))];
+		lastSplitIds = [];
+		return undefined;
+	};
+
 	const runPromise = (async (): Promise<LoopRunResult> => {
 		widgetTimer = setInterval(requestOverlayRender, 1000);
 
 		try {
-			for (let i = 0; i < resolution.actionable.length; i++) {
+			while (queue.length > 0) {
 				if (aborted) break;
 
-				const task = resolution.actionable[i]!;
+				const task = queue.shift()!;
+				if (processed.has(task.id)) continue;
+				processed.add(task.id);
+				executedCount++;
 				const taskStateIndex = loopState.tasks.findIndex((ts) => ts.id === task.id);
 				if (taskStateIndex === -1) continue;
 				const taskState = loopState.tasks[taskStateIndex]!;
@@ -3292,9 +3806,11 @@ async function runOrchestratorLoop(
 
 				/** Resolving a `needs-human` task ("Retry task" restarts it at implement). */
 				let resumeMode = resume && resume.taskId === task.id ? resume.mode : undefined;
-				/** Cost per phase for the execution report (kept across "Retry task"). */
-				const phaseCosts: Partial<Record<CostPhase, number>> = {};
-				taskState.phaseCosts = phaseCosts;
+				/**
+				 * Cost per phase for the execution report (kept across "Retry task",
+				 * and across a split when the task runs again as close-out).
+				 */
+				const phaseCosts = taskState.phaseCosts;
 				taskState.startTime = Date.now();
 
 				let outcome: TaskOutcome;
@@ -3308,6 +3824,8 @@ async function runOrchestratorLoop(
 					taskState.currentActivity = undefined;
 					taskState.currentTurn = 0;
 					taskState.outputGroups = [];
+					taskState.logFiles = [];
+					taskState.blocked = undefined;
 					taskState.review = undefined;
 					taskState.reviewNote = undefined;
 					taskState.phase = undefined;
@@ -3318,13 +3836,30 @@ async function runOrchestratorLoop(
 					outcome = await runTaskPipeline(task, taskState, phaseCosts, resumeMode);
 					if (outcome.kind !== "retry-task") break;
 
-					// "Retry task": discard changes (except .pi/) and restart at implement.
-					await discardTaskChanges();
+					// "Retry task": discard changes (saved as git stash, except .pi/) and restart at implement.
+					await discardTaskChanges(task, taskState, "retry task");
 					resumeMode = undefined;
 				}
 
 				if (outcome.kind === "released") {
 					return releaseTask(task, taskState, outcome.request);
+				}
+				if (outcome.kind === "split") {
+					// The task is now the close-out of its subtasks: it runs again after them.
+					processed.delete(task.id);
+					executedCount--;
+					taskState.status = "pending";
+					taskState.endTime = undefined;
+					taskState.errors = [];
+					taskState.blocked = undefined;
+					taskState.phase = undefined;
+					taskState.phaseLabel = undefined;
+					taskState.currentActivity = undefined;
+					const refreshError = await refreshTasks();
+					if (refreshError) {
+						return { outcome: "failed", notification: { message: `❌ ${refreshError}`, level: "error" } };
+					}
+					continue;
 				}
 				if (outcome.kind === "aborted") {
 					aborted = true;
@@ -3353,7 +3888,7 @@ async function runOrchestratorLoop(
 					outcome: "completed",
 					notification: {
 						message:
-							`✅ All ${resolution.actionable.length} actionable task(s) executed. ${formatHeldTasks(stillHeld)}`,
+							`✅ All ${executedCount} actionable task(s) executed. ${formatHeldTasks(stillHeld)}`,
 						level: "warning",
 					},
 				};
@@ -3365,7 +3900,7 @@ async function runOrchestratorLoop(
 			return {
 				outcome: "completed",
 				notification: {
-					message: `🎉 PRD Loop Pro complete! All ${resolution.actionable.length} task(s) executed successfully.`,
+					message: `🎉 PRD Loop Pro complete! All ${executedCount} task(s) executed successfully.`,
 					level: "info",
 				},
 			};
@@ -3404,6 +3939,17 @@ async function runOrchestratorLoop(
 	pi.appendEntry<SummaryInput>(SUMMARY_ENTRY_TYPE, summary);
 
 	if (result.notification) ctx.ui.notify(result.notification.message, result.notification.level);
+
+	// "Release / hand over": prepared prompt for the main session. It is not
+	// sent automatically, and text already in the editor is never overwritten.
+	if (result.handoverPrompt) {
+		if (ctx.ui.getEditorText().trim() === "") {
+			ctx.ui.setEditorText(result.handoverPrompt);
+		} else {
+			ctx.ui.notify("ℹ️ The editor is not empty, so the hand-over prompt was not inserted.", "info");
+		}
+	}
+
 	if (result.unexpectedError) throw result.unexpectedError;
 }
 

@@ -15,15 +15,16 @@
 import type { ReviewFinding } from "./subagent-result.ts";
 
 /** Pipeline phases that can incur cost. */
-export type CostPhase = "implement" | "review" | "fix" | "commit" | "repair";
+export type CostPhase = "implement" | "review" | "fix" | "commit" | "split" | "repair";
 
-export const COST_PHASES: readonly CostPhase[] = ["implement", "review", "fix", "commit", "repair"];
+export const COST_PHASES: readonly CostPhase[] = ["implement", "review", "fix", "commit", "split", "repair"];
 
 export const COST_PHASE_LABELS: Record<CostPhase, string> = {
 	implement: "implement",
 	review: "review",
 	fix: "fix",
 	commit: "commit",
+	split: "split",
 	repair: "JSON repair",
 };
 
@@ -283,7 +284,7 @@ export function buildOpenFindingsSection(
 	const out: string[] = [OPEN_FINDINGS_HEADING, ""];
 	if (release.reason?.trim()) {
 		out.push(`- **Released to a human:** ${oneLine(release.reason)}`);
-		out.push("- **Next step:** fix manually (or with the main agent), then re-run `/prd-loop-pro` to commit & close the task, close it if already committed, or review again.");
+		out.push("- **Next step:** fix manually (or with the main agent), then re-run `/prd-loop-pro` to commit & close the task, close it if already committed, review again, or re-open it if it was split or rewritten.");
 		out.push("");
 	}
 	out.push(

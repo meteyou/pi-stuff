@@ -89,7 +89,8 @@ export type PhaseRef =
 	| { phase: "implement"; attempt?: number }
 	| { phase: "review"; round: number }
 	| { phase: "fix"; round: number; count: number }
-	| { phase: "commit" };
+	| { phase: "commit" }
+	| { phase: "split"; attempt?: number };
 
 /** Output of one subagent run, shown under its own header in the output viewer. */
 export interface PhaseOutputGroup {
@@ -136,6 +137,10 @@ export function phaseHeader(ref: PhaseRef, note?: string): string {
 			break;
 		case "commit":
 			header = "Commit";
+			break;
+		case "split":
+			header = "Split";
+			if (ref.attempt !== undefined && ref.attempt > 1) qualifiers.push(`attempt ${ref.attempt}`);
 			break;
 	}
 	const trimmedNote = note ? oneLine(note) : "";
