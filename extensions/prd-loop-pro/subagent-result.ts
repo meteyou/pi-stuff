@@ -180,13 +180,30 @@ export function describeSchema(schema: ResultSchema<unknown>): string {
 
 // --- Agent result schemas ---
 
+/** One proposed part of a task the implementer could not complete as written. */
+export interface ProposedPart {
+	title: string;
+	description: string;
+}
+
+/**
+ * Set by the implementer when the task cannot be completed as written (too
+ * large for one run, missing prerequisite, contradictory criteria). The loop
+ * does not retry such a task automatically; it pauses and offers a split.
+ */
+export interface WorkerBlocked {
+	reason: string;
+	proposedSplit: ProposedPart[];
+}
+
 export interface WorkerResult {
 	success: boolean;
 	errors: string[];
 	summary: string;
+	blocked?: WorkerBlocked;
 }
 
-/** prd-worker: `{ success, errors[], summary }` (unchanged contract). */
+/** prd-worker: `{ success, errors[], summary, blocked? }`. */
 export const WORKER_RESULT_SCHEMA: ResultSchema<WorkerResult> = {
 	name: "prd-worker",
 	schema: {
@@ -195,6 +212,82 @@ export const WORKER_RESULT_SCHEMA: ResultSchema<WorkerResult> = {
 			success: { type: "boolean", description: "true only if all acceptance criteria are met and checks pass" },
 			errors: { type: "array", items: { type: "string" }, optional: true, default: [] },
 			summary: { type: "string", optional: true, default: "" },
+			blocked: {
+				type: "object",
+				optional: true,
+				description: "only if the task cannot be completed as written (too large, missing prerequisite); success must be false",
+				properties: {
+					reason: { type: "string" },
+					proposedSplit: {
+						type: "array",
+						optional: true,
+						default: [],
+						items: {
+							type: "object",
+							properties: {
+								title: { type: "string" },
+								description: { type: "string", optional: true, default: "" },
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+};
+
+/** One subtask of a split proposal. */
+export interface SplitSubtask {
+	/** Short title without the "PRD #N - Task M/T:" prefix. */
+	title: string;
+	whatToBuild: string;
+	acceptanceCriteria: string[];
+	/** 1-based numbers of earlier subtasks of the proposal that must be done first. */
+	dependsOn: number[];
+}
+
+/** prd-splitter: how to split a task that was too large / blocked. */
+export interface SplitProposal {
+	rationale: string;
+	subtasks: SplitSubtask[];
+	/** What remains for the original task after all subtasks are done (integration, close-out). */
+	parent: { whatToBuild: string; acceptanceCriteria: string[] };
+}
+
+/** prd-splitter: `{ rationale, subtasks[], parent }`. */
+export const SPLITTER_RESULT_SCHEMA: ResultSchema<SplitProposal> = {
+	name: "prd-splitter",
+	schema: {
+		type: "object",
+		properties: {
+			rationale: { type: "string", optional: true, default: "", description: "one or two sentences: why this cut" },
+			subtasks: {
+				type: "array",
+				description: "in execution order",
+				items: {
+					type: "object",
+					properties: {
+						title: { type: "string", description: "short, without the 'PRD #N - Task M/T:' prefix" },
+						whatToBuild: { type: "string" },
+						acceptanceCriteria: { type: "array", items: { type: "string" } },
+						dependsOn: {
+							type: "array",
+							items: { type: "number", integer: true, min: 1 },
+							optional: true,
+							default: [],
+							description: "1-based numbers of earlier subtasks",
+						},
+					},
+				},
+			},
+			parent: {
+				type: "object",
+				description: "what remains for the original task after all subtasks",
+				properties: {
+					whatToBuild: { type: "string" },
+					acceptanceCriteria: { type: "array", items: { type: "string" } },
+				},
+			},
 		},
 	},
 };
