@@ -1,7 +1,7 @@
 # PRD Loop Pro Extension
 
 Autonomous PRD task orchestrator with a **review-fix pipeline per task** and **saved per-step settings**. Started as a
-copy of [`prd-loop`](../prd-loop/index.ts); the original stays unchanged and can be used in parallel. Part of the
+copy of [`prd-loop`](../prd-loop/index.ts); the original is still available and can be used in parallel. Part of the
 [PRD Workflow](../../docs/prd-workflow.md).
 
 Compared to `/prd-loop`:
@@ -38,8 +38,9 @@ in the saved [settings](#settings).
    [interrupted task](#interrupted-tasks) again.
 2. **Commit rules** — loaded from the package's [`/commit` prompt template](../../prompts/commit.md) (frontmatter
    stripped). A missing or empty template is a hard error.
-3. **`needs-human` tasks first** — see [Needs-Human Resume Flow](#needs-human-resume-flow).
-4. **PRD selection** — argument, dialog, or the PRD of the resolved `needs-human` task.
+3. **`needs-human` tasks first** — see [Needs-Human Resume Flow](#needs-human-resume-flow). Then, if the working tree
+   is dirty, an **interrupted task** — see [Interrupted tasks](#interrupted-tasks).
+4. **PRD selection** — argument, dialog, or the PRD of the task picked up in step 3.
 5. **Settings** — first start: setup wizard; afterwards global settings merged with project overrides and validated.
 6. **Overview** — PRD, task counts and all settings; select an entry to change it, then `Confirm & start`.
 7. **Orchestrator loop** — runs the [pipeline](#pipeline) for each task in dependency order (topological sort over the
@@ -47,7 +48,8 @@ in the saved [settings](#settings).
 
 ## Pipeline
 
-Every task runs through the following phases, each in a **fresh, isolated `pi` subprocess**:
+Every task runs through the following phases, each in a **fresh, isolated `pi` subprocess** (only a continued
+implementation reuses the implementer's session, see [Interrupted tasks](#interrupted-tasks)):
 
 ```
 Implement → Review ⇄ Fix → Commit → Report
@@ -89,8 +91,9 @@ review → findings ≥ threshold? ──no────────────�
 
 Appended to the task todo after the task is committed (or closed via a pause/resume option). Contains the implementer
 summary, review rounds, fixed findings, rejected findings with reasons, deferred findings, unresolved findings, human
-reviewer callouts, the created commit SHAs (HEAD before vs. after the commit phase, determined by the orchestrator) and
-the cost per phase (implement, review, fix, commit, JSON repair).
+reviewer callouts, the created commit SHAs (HEAD before vs. after the commit phase, determined by the orchestrator),
+the cost per phase (implement, review, fix, commit, split, JSON repair), the active time, the tokens and the sessions
+of all subagent runs of the task.
 
 ## Settings
 
@@ -102,7 +105,7 @@ the cost per phase (implement, review, fix, commit, JSON repair).
 | `steps.review` | model + thinking level | session model + thinking level |
 | `steps.fix` | model + thinking level | session model + thinking level |
 | `steps.commit` | model + thinking level | session model + thinking level |
-| `steps.orchestrator` | model + thinking level (used for JSON repair) | session model + thinking level |
+| `steps.orchestrator` | model + thinking level (used for JSON repair and for the splitter of *Split task*) | session model + thinking level |
 | `fixThreshold` | `P0` (only P0), `P1` (≤ P1), `P2` (≤ P2), `P3` (≤ P3) | `P1` |
 | `maxReviewRounds` | integer ≥ 1 | `3` |
 | `implementationRetries` | integer ≥ 0 | `0` |
@@ -167,7 +170,7 @@ background and the overlay comes back when you confirm or leave the dialog.
 
 - Every subagent reads its step's model + thinking level **when it starts**. A running subagent is never interrupted
   and keeps the model it was started with; the change applies from the next start of that step (e.g. the next fixer
-  of the current task, or a *Retry phase*). The orchestrator model applies to the next JSON repair.
+  of the current task, or a *Retry phase*). The orchestrator model applies to the next JSON repair or split.
 - The dialog shows which subagent is running right now (and with which model). Edited rows are marked `• changed`.
 - Actions with unsaved changes: **Apply to this run** (not saved), **Apply & save globally**, **Apply & save for this
   project only** (only the steps edited in this dialog are written; earlier run-only edits stay unsaved) and
@@ -206,7 +209,7 @@ progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any erro
 
 | Option | Effect |
 |--------|--------|
-| Resume current phase | Keep changes and continue/restart the paused phase |
+| Resume current phase | Keep changes and continue/restart the paused phase. During implement the implementer continues in its own session |
 | Skip phase | Keep changes and move on (implement → review, review → commit, fix → open findings unresolved, commit) |
 | Retry phase | Keep changes and run the phase's agent again. After a failed implementation the implementer gets the errors of the failed attempt and continues on the changes on disk |
 | Retry task | Discard changes (saved as git stash, `.pi/` is kept) and restart at implement |
@@ -218,8 +221,9 @@ progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any erro
 | Abort | Stop the loop, keep changes on disk |
 
 Discard operations never touch `.pi/` — todos, execution reports and settings are never lost, even if `.pi/` is
-tracked by git. Everything else is saved as a git stash before it is discarded (see [Safety net](#safety-net)). The committer never uses `--no-verify` and never tries to fix hook failures; it reports
-`hookFailed: true` and the loop pauses so you can resolve the hook problem.
+tracked by git. Everything else is saved as a git stash before it is discarded (see [Safety net](#safety-net)). The
+committer never uses `--no-verify` and never tries to fix hook failures; it reports `hookFailed: true` and the loop
+pauses so you can resolve the hook problem.
 
 ## Blocked tasks and Split task
 
@@ -291,17 +295,17 @@ not touched):
 
 It is written after every subagent run, so an abort or a crash loses nothing. At the next start the overlay shows
 time, cost, tokens, review rounds and the implementer summary (read from the Execution Report) of the tasks from
-earlier runs again, and the header shows the **PRD total**
-(cost and active time of all tasks over all runs) next to the numbers of the current run. The summary entry in the
-chat keeps counting the current run only. The Execution Report of a task additionally lists time, tokens and all
-sessions.
+earlier runs again, and the header shows the **PRD total** (cost and active time of all tasks over all runs) next to
+the numbers of the current run. The summary entry in the chat keeps counting the current run only. The Execution
+Report of a task additionally lists time, tokens and all sessions. Tasks that were completed before the statistics
+existed only show their summary.
 
 **The clock stops while a dialog waits for you.** The task time and the elapsed time of the loop do not run while a
 pause menu or the split confirmation is open; they continue when you choose an option. The run settings dialog (`s`)
 does not stop them, because the subagent keeps working.
 
-**Sessions.** Subagents no longer run with `--no-session`. Every run is a normal pi session of the project with an
-id chosen by the loop and a name like `PRD #1 - Task 17a1/20 · Implement (attempt 2)`:
+**Sessions.** Every subagent run is a normal pi session of the project (stored where pi stores the project's sessions)
+with an id chosen by the loop and a name like `PRD #1 - Task 17a1/20 · Implement (attempt 2)`:
 
 - pi's session statistics count their tokens and cost,
 - `/resume` lists them (recognisable by the name),
@@ -323,11 +327,10 @@ statistics go with them. Set `"gc": false` in `.pi/todos/settings.json` to keep 
 4. When you close the overlay, a **prepared prompt** for the main session is put into the editor (it is not sent, and
    an editor that already contains text is left alone). It names the task, the PRD, the phase, the reason, the errors,
    the last subagent summary, the implementer's split proposal and the session files of the subagent runs, and asks
-   the agent to find the cause
-   and propose a way out (fix, split or rewrite the task) before changing anything.
+   the agent to find the cause and propose a way out (fix, split or rewrite the task) before changing anything.
 
 `needs-human` is **not** closed: the task and all tasks depending on it are held back until it is resolved. Fix the
-open findings manually (or with the main agent), then run `/prd-loop-pro` again. Before PRD selection, every
+problem manually (or with the main agent, using the prepared prompt), then run `/prd-loop-pro` again. Before PRD selection, every
 `needs-human` task is offered first (with several tasks, you pick one):
 
 | Option | Effect |
@@ -339,8 +342,9 @@ open findings manually (or with the main agent), then run `/prd-loop-pro` again.
 | Re-open | The task was split or rewritten in the meantime: sets it back to open; the loop runs it when its blockers are closed (needs a clean working tree) |
 | Not now | Leaves the task as `needs-human` |
 
-The git clean check allows uncommitted changes while a `needs-human` task is being resolved. Afterwards the loop
-continues with the next task of the PRD.
+The git clean check allows uncommitted changes while a `needs-human` task is being resolved (*Continue
+implementation*, *Commit changes & close*, *Review again*). Afterwards the loop continues with the next task of the
+PRD.
 
 ## UI
 
@@ -359,8 +363,9 @@ continues with the next task of the PRD.
   `prd-to-todos` skill) are sorted below their parent (`17` < `17a` < `17a1` < `17a2` < `17b` < `18`), indented per
   level, and the parent row shows `subtasks x/y done`.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
-  `Fix #1 • 3 findings`, `Commit`) with the model + thinking level of the run, outcome, cost and duration.
-- **Finished view** — when the run is over (completed, failed, aborted by a pause action or released), the overlay
+  `Fix #1 • 3 findings`, `Commit`, `Split`) with the model + thinking level of the run, outcome, cost and duration.
+  It shows the runs of the current loop run; earlier runs are opened as sessions (`/todos` → task → **sessions**).
+- **Finished view** — when the run is over (completed, stopped after a task, failed, aborted or released), the overlay
   stays open: the header shows the outcome, totals and the final notification; tasks can still be expanded and their
   output inspected. `Esc`/`q` closes it.
 - **Summary entry** — closing the overlay posts the summary to the chat as a custom session entry (persisted in the
@@ -381,8 +386,9 @@ message**.
 | [`prd-committer`](./agents/prd-committer.md) | Commit | read, bash | `{ success, errors[], summary, hookFailed }` |
 
 Rules shared by all agents: never touch `.pi/`, never use the todo tool (also not when a task body asks for follow-up
-todos: the worker reports such work as blocked with a proposed split, and the orchestrator creates the todos). Worker, reviewer and fixer never run git write
-operations; only the committer commits (explicit paths, no `git add -A`, no `--no-verify`, no footers).
+todos: the worker reports such work as blocked with a proposed split, and the orchestrator creates the todos).
+Worker, splitter, reviewer and fixer never run git write operations; only the committer commits (explicit paths, no
+`git add -A`, no `--no-verify`, no footers).
 
 ### JSON repair
 

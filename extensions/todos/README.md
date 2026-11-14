@@ -6,6 +6,8 @@ File-based todo manager with claiming, locking, and garbage collection. Fork of 
 
 - Removed dependency on `getEditorKeybindings()` from `@earendil-works/pi-tui` (caused `TypeError: is not a function` due to ESM/CJS interop when the extension resolves an older peer dependency version)
 - Replaced with a local `matchesAction()` helper that uses `matchesKey()` and `Key.*` constants directly
+- Front matter fields the extension does not know are kept when a todo is rewritten (upstream drops them)
+- **sessions** action for tasks that `/prd-loop-pro` worked on
 
 ## Concept
 

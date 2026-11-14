@@ -84,6 +84,14 @@ After creating all tasks, the skill **updates the PRD todo** with a Task Index:
 | 4/4 | Monitoring & E2E Tests     | TODO-jkl012  | TODO-ghi789  | ⏳ blocked  |
 ```
 
+The loops keep the status column up to date. `/prd-loop` writes `🔄 open`, `⏳ blocked` and `✅ closed`;
+`/prd-loop-pro` writes `🔓 ready`, `⏳ blocked`, `✅ done` and `🔧 needs-human`, and turns the `Start with:` line into
+`Next up:`.
+
+A task that turns out to be too large can be split later into subtasks with hierarchical labels (`Task 3/4` →
+`3a/4`, `3b/4`; `3a/4` → `3a1/4`, …), either by the skill ("Splitting an existing task into subtasks") or by
+`/prd-loop-pro` (*Split task*). Both loops sort and indent such subtasks below their parent.
+
 ### 4. PRD Loop — Execute tasks autonomously
 
 When you're ready to implement, run `/prd-loop` (or its alias `/ralph`):
@@ -96,7 +104,8 @@ The extension:
 
 1. **Checks git status** — aborts if the working directory is dirty
 2. **Selects the PRD** — via argument or interactive dialog
-3. **Configures the run** — retry count, smart commits, model selection (via dialogs or flags)
+3. **Configures the run** — retry count, smart commits, model and thinking level, optional commit model (via dialogs
+   or flags)
 4. **Shows a confirmation dialog** — PRD name, task count, configuration summary
 5. **Runs the orchestrator loop:**
    - Resolves task dependencies (topological sort)
@@ -112,7 +121,8 @@ The extension:
 8. **Posts a final summary to the chat** — a collapsible entry (not sent to the LLM): collapsed it shows failed/aborted
    tasks and the totals, `Ctrl+O` expands it to all tasks
 
-While the loop is running, `Esc` (twice) closes the overlay and aborts the loop.
+While the loop is running, `Ctrl+C` pauses the current subagent and opens a pause menu (*Resume*, *Release session*,
+*Retry task*, *Skip task*, *Abort loop*); `Esc` (twice) closes the overlay and aborts the loop.
 
 #### Commands
 
@@ -123,17 +133,21 @@ While the loop is running, `Esc` (twice) closes the overlay and aborts the loop.
 
 #### Flags
 
-Skip interactive dialogs with command-line flags:
+Skip the configuration dialogs with command-line flags (a flag replaces its dialog; the confirmation dialog is always
+shown):
 
 ```
-/prd-loop prd-1 --retry-fixes=3 --smart-commits --model=anthropic/claude-sonnet-4-5
+/prd-loop prd-1 --retry-fixes=3 --smart-commits --model=anthropic/claude-sonnet-4-5 --thinking=medium
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--retry-fixes=N` | Number of retry attempts per failed task | `0` (no retries) |
-| `--smart-commits` | Use a committer subagent for granular conventional commits | off (single auto-commit) |
-| `--model=<id>` | Model for subagents (`provider/model-id` or just `model-id`) | active model |
+| Flag | Description | Without the flag |
+|------|-------------|------------------|
+| `--retry-fixes=N` | Number of retry attempts per failed task | dialog |
+| `--smart-commits` | Use a committer subagent for granular conventional commits | dialog (otherwise a single auto-commit) |
+| `--model=<id>` | Model for subagents (`provider/model-id` or just `model-id`) | dialog |
+| `--thinking=<level>` | Thinking level for subagents (`minimal`, `low`, `medium`, `high`, `xhigh`) | dialog (reasoning models only) |
+| `--commit-model=<id>` | Dedicated model for the committer (smart commits) | dialog / task model |
+| `--commit-thinking=<level>` | Thinking level for the committer | task thinking level |
 
 #### How it works under the hood
 
@@ -146,7 +160,8 @@ The orchestrator manages:
 - **Todo status** — closes tasks and updates the PRD Task Index automatically
 - **Git commits** — simple auto-commit per task, or granular conventional commits via `--smart-commits`
 - **Retries** — failed tasks get retried with error context from the previous attempt
-- **Abort handling** — Ctrl+C kills the current subagent, stops the loop, leaves code on disk
+- **Pause and abort** — `Ctrl+C` stops the current subagent and opens the pause menu; `Esc` (twice) aborts the loop
+  and leaves the code on disk
 
 #### Subagents
 
@@ -193,7 +208,7 @@ Findings below the threshold are not fixed; they are recorded as deferred findin
 #### Settings
 
 Instead of flags, `/prd-loop-pro` uses saved settings: model + thinking level for each step (implement, review, fix,
-commit, orchestrator for JSON repair), fix threshold (`P0`–`P3`, default `P1`), max review rounds (default `3`) and
+commit, orchestrator for JSON repair and *Split task*), fix threshold (`P0`–`P3`, default `P1`), max review rounds (default `3`) and
 implementation retries (default `0`).
 
 - **First start:** a setup wizard walks through all settings and saves them globally
@@ -228,9 +243,10 @@ todos are created, the original task becomes the close-out task and the loop con
 
 **Release / hand over** sets the task todo to `needs-human`, appends the open findings to it, stops the loop and puts
 a prepared prompt for the main session into the editor. The task and its dependents stay blocked. Fix it manually (or
-with the main agent), then run `/prd-loop-pro` again: the `needs-human` task is offered first with *Commit changes
-(committer) & close*, *Already committed – just close*, *Review again* or *Re-open* (if it was split or rewritten) —
-uncommitted changes are allowed for committing and reviewing — and the loop then continues with the next task.
+with the main agent), then run `/prd-loop-pro` again: the `needs-human` task is offered first with *Continue
+implementation*, *Commit changes (committer) & close*, *Already committed – just close*, *Review again* or *Re-open*
+(if it was split or rewritten) — uncommitted changes are allowed for continuing, committing and reviewing — and the
+loop then continues with the next task.
 
 ## Alternative Entry Points
 
@@ -246,13 +262,15 @@ through individual tasks — though for full autonomous execution, use `/prd-loo
 Open `/todos`, select a specific **task** (e.g., `PRD #1 - Task 3/4: ...`), and say "work". The agent checks its
 blockers, and either starts working or tells you which tasks need to be done first.
 
-### Skip dialogs for CI/automation
+### Skip the configuration dialogs
 
-Use flags to run non-interactively:
+Pass flags to `/prd-loop` to go straight to the confirmation dialog:
 
 ```
-/prd-loop prd-1 --retry-fixes=2 --smart-commits --model=anthropic/claude-sonnet-4-5
+/prd-loop prd-1 --retry-fixes=2 --smart-commits --model=anthropic/claude-sonnet-4-5 --thinking=medium
 ```
+
+Both loops need the interactive TUI (overlay, pause menus); they are not meant for CI.
 
 ### Create multiple PRDs first, implement later
 
@@ -281,10 +299,13 @@ Status is synchronized in **two places** for resilience:
 | **Individual task todos** (status field) | Whether a task is open/closed (or `needs-human` with `/prd-loop-pro`) | `/prd-loop` / `/prd-loop-pro` after each task |
 | **PRD Task Index** (in PRD body) | Dashboard view with dependencies + status | `/prd-loop` / `/prd-loop-pro` at start + after each task |
 
+`/prd-loop-pro` additionally stores time, tokens, cost and the sessions of its subagent runs in each task todo (front
+matter field `prd_loop`).
+
 The Task Index gets updated from the actual task statuses after each completed task. This means it works correctly even
 if:
 
-- A previous run was aborted mid-task
+- A previous run was aborted mid-task (`/prd-loop-pro` then offers to continue the interrupted task)
 - Someone closes a task manually
 - Tasks are worked on across multiple sessions
 - You resume after an interruption (closed tasks are skipped automatically)
