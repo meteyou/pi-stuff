@@ -241,6 +241,9 @@ continues with the next task of the PRD.
   Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
   `a` expand/collapse all, `o` output viewer, `s` change models/thinking while running (see
   [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `Ctrl+C` pause, `Esc` (twice) abort.
+- **Split tasks** — tasks split into subtasks with hierarchical labels (`Task 17a/20`, `Task 17a1/20`, … — see the
+  `prd-to-todos` skill) are sorted below their parent (`17` < `17a` < `17a1` < `17a2` < `17b` < `18`), indented per
+  level, and the parent row shows `subtasks x/y done`.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
   `Fix #1 • 3 findings`, `Commit`) with the model + thinking level of the run, outcome, cost and duration.
 - **Finished view** — when the run is over (completed, failed, aborted by a pause action or released), the overlay
@@ -289,6 +292,7 @@ If both fail, the loop pauses (*JSON repair failed*).
 | `reviewer-prompt.ts`, `fixer-prompt.ts`, `committer-prompt.ts` | Prompt builders (reviewer uses the shared [review rubric](../review/review-prompts.ts)) |
 | `execution-report.ts` | Execution report and open-findings sections (pure) |
 | `pause.ts` | Pause reasons, menu options and labels (pure) |
+| `task-sequence.ts` | Sequence labels incl. split subtasks (`17a1/20`): parsing, hierarchical sort, depth, subtask progress (pure) |
 | `task-index.ts` | Task graph, `needs-human` handling, PRD Task Index sync, git clean check (pure) |
 | `discard.ts` | Discard uncommitted changes except `.pi/` |
 | `progress-view.ts` | View model for overlay, output viewer and summary entry (pure) |
