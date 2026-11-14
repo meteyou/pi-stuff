@@ -1974,37 +1974,33 @@ async function spawnCommitterSubagent(
 	model: string,
 	thinkingLevel?: string,
 	signal?: AbortSignal,
-): Promise<{ success: boolean; commitCount: number; cost: number }> {
-	try {
-		const agent = await loadPrdCommitterAgent(EXTENSION_DIR);
-		const prompt = [
-			`Analyze all uncommitted changes and create granular conventional commits.`,
-			``,
-			`PRD reference: ${prdTag}`,
-			`Use meaningful scopes based on the changed module or area (e.g., chat-ui, auth, api, docs).`,
-			`Do NOT use "${prdTag}" as the scope unless there is truly no better module scope.`,
-			`Add "Refs: ${prdTag}" as a footer line in each commit message body.`,
-		].join("\n");
+): Promise<{ success: boolean; commitCount: number; cost: number; errors: string[] }> {
+	const agent = await loadPrdCommitterAgent(EXTENSION_DIR);
+	const prompt = [
+		`Analyze all uncommitted changes and create granular conventional commits.`,
+		``,
+		`PRD reference: ${prdTag}`,
+		`Use meaningful scopes based on the changed module or area (e.g., chat-ui, auth, api, docs).`,
+		`Do NOT use "${prdTag}" as the scope unless there is truly no better module scope.`,
+		`Add "Refs: ${prdTag}" as a footer line in each commit message body.`,
+	].join("\n");
 
-		const result = await spawnSubagent({
-			taskPrompt: prompt,
-			model,
-			thinkingLevel,
-			cwd,
-			agent,
-			signal,
-		});
+	const result = await spawnSubagent({
+		taskPrompt: prompt,
+		model,
+		thinkingLevel,
+		cwd,
+		agent,
+		signal,
+	});
 
-		if (result.success) {
-			const commitCountMatch = result.summary.match(/(\d+)\s*commit/i);
-			const commitCount = commitCountMatch ? parseInt(commitCountMatch[1], 10) : 1;
-			return { success: true, commitCount, cost: result.usage.cost };
-		}
-
-		return { success: false, commitCount: 0, cost: result.usage.cost };
-	} catch {
-		return { success: false, commitCount: 0, cost: 0 };
+	if (result.success) {
+		const commitCountMatch = result.summary.match(/(\d+)\s*commit/i);
+		const commitCount = commitCountMatch ? parseInt(commitCountMatch[1], 10) : 1;
+		return { success: true, commitCount, cost: result.usage.cost, errors: [] };
 	}
+
+	return { success: false, commitCount: 0, cost: result.usage.cost, errors: result.errors };
 }
 
 /**
@@ -2560,9 +2556,30 @@ Errors: ${result.errors.join("; ")}`,
 						break;
 					}
 
+					// Ctrl+C during the commit phase killed the committer: stop here
+					// instead of committing everything in one fallback commit.
+					if (pauseRequested) {
+						pauseRequested = false;
+						taskState.status = "aborted";
+						taskState.summary = "Paused during commit.";
+						return {
+							outcome: "aborted",
+							notification: {
+								message:
+									`⏸️ Paused while committing Task ${task.sequenceLabel}. The task stays open and its changes may be only partly committed.\n` +
+									"Commit the remaining changes and close the task todo, then re-run /prd-loop.",
+								level: "warning",
+							},
+						};
+					}
+
 					if (committerResult.success) {
 						loopState.totalCommits += committerResult.commitCount;
 					} else {
+						ctx.ui.notify(
+							`⚠️ Smart commit failed for Task ${task.sequenceLabel}, using a single commit instead: ${committerResult.errors.join("; ")}`,
+							"warning",
+						);
 						const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
 						if (fallback.error) return commitFailed(task, taskState, fallback.error);
 						if (fallback.committed) loopState.totalCommits++;
