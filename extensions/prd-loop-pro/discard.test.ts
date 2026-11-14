@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DISCARD_PATHSPEC, discardChanges } from "./discard.ts";
+import { DISCARD_PATHSPEC, discardChanges, snapshotChanges } from "./discard.ts";
 import type { GitExec } from "./discard.ts";
 
 let repo: string;
@@ -152,5 +152,57 @@ describe("discardChanges", () => {
 		const failing: GitExec = async (args) =>
 			args[0] === "rev-parse" ? { code: 0, stdout: "abc\n", stderr: "" } : { code: 128, stdout: "", stderr: "fatal: boom" };
 		await assert.rejects(discardChanges(failing), /fatal: boom/);
+	});
+});
+
+describe("snapshotChanges", () => {
+	const commitBase = () => {
+		write("src/a.txt", "a\n");
+		write(".pi/todos/x.md", "todo\n");
+		git("add", "-A");
+		git("commit", "-q", "-m", "init");
+	};
+
+	it("saves staged, unstaged and untracked changes as a stash and keeps .pi/", async () => {
+		commitBase();
+		write("src/a.txt", "changed\n");
+		write("src/new.txt", "new\n");
+		write("src/staged.txt", "staged\n");
+		git("add", "src/staged.txt");
+		write(".pi/todos/x.md", "todo changed\n");
+		write(".pi/todos/y.md", "new todo\n");
+
+		const snapshot = await snapshotChanges(exec, "prd-loop-pro:  Task 1/2\nretry");
+		assert.ok(snapshot);
+		assert.equal(snapshot.message, "prd-loop-pro: Task 1/2 retry");
+		assert.equal(snapshot.ref, git("rev-parse", "refs/stash").trim());
+		assert.match(git("stash", "list"), /prd-loop-pro: Task 1\/2 retry/);
+
+		await discardChanges(exec);
+		assert.equal(read("src/a.txt"), "a\n");
+		assert.equal(existsSync(join(repo, "src/new.txt")), false);
+		assert.equal(existsSync(join(repo, "src/staged.txt")), false);
+		assert.equal(read(".pi/todos/x.md"), "todo changed\n");
+		assert.equal(read(".pi/todos/y.md"), "new todo\n");
+
+		// The snapshot restores everything outside .pi/.
+		git("stash", "apply", snapshot.ref);
+		assert.equal(read("src/a.txt"), "changed\n");
+		assert.equal(read("src/new.txt"), "new\n");
+		assert.equal(read("src/staged.txt"), "staged\n");
+	});
+
+	it("returns undefined when only .pi/ changed or nothing changed", async () => {
+		commitBase();
+		assert.equal(await snapshotChanges(exec, "x"), undefined);
+		write(".pi/todos/x.md", "todo changed\n");
+		assert.equal(await snapshotChanges(exec, "x"), undefined);
+		assert.equal(git("stash", "list").trim(), "");
+	});
+
+	it("returns undefined in a repository without commits", async () => {
+		write("src/a.txt", "a\n");
+		assert.equal(await snapshotChanges(exec, "x"), undefined);
+		assert.equal(read("src/a.txt"), "a\n");
 	});
 });
