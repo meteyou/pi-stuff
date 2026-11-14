@@ -270,7 +270,8 @@ not touched):
 - the review progress (rounds and finding counts).
 
 It is written after every subagent run, so an abort or a crash loses nothing. At the next start the overlay shows
-time, cost, tokens and review rounds of the tasks from earlier runs again, and the header shows the **PRD total**
+time, cost, tokens, review rounds and the implementer summary (read from the Execution Report) of the tasks from
+earlier runs again, and the header shows the **PRD total**
 (cost and active time of all tasks over all runs) next to the numbers of the current run. The summary entry in the
 chat keeps counting the current run only. The Execution Report of a task additionally lists time, tokens and all
 sessions.
@@ -327,7 +328,12 @@ continues with the next task of the PRD.
   tokens. Time and cost include earlier loop runs (see [Statistics and sessions](#statistics-and-sessions)).
   Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
   `a` expand/collapse all, `o` output viewer, `s` change models/thinking while running (see
-  [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `Ctrl+C` pause, `Esc` (twice) abort.
+  [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `x` stop after the current task,
+  `Ctrl+C` pause, `Esc` (twice) abort.
+- **Stop after the current task** (`x`, press again to cancel) — the loop finishes the running task completely
+  (implement, review, fix, commit, report) and then stops instead of starting the next one. The working tree is clean
+  and nothing is half-done, so this is the safe way to end a day: re-run `/prd-loop-pro` later and it continues with
+  the next task. The footer shows `⏹ Stopping after the current task` while it is armed.
 - **Split tasks** — tasks split into subtasks with hierarchical labels (`Task 17a/20`, `Task 17a1/20`, … — see the
   `prd-to-todos` skill) are sorted below their parent (`17` < `17a` < `17a1` < `17a2` < `17b` < `18`), indented per
   level, and the parent row shows `subtasks x/y done`.

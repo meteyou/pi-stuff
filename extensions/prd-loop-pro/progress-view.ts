@@ -350,7 +350,7 @@ export interface SummaryTask {
 	reviewNote?: string;
 }
 
-export type SummaryOutcome = "completed" | "failed" | "aborted" | "released";
+export type SummaryOutcome = "completed" | "failed" | "aborted" | "released" | "stopped";
 
 export interface SummaryInput {
 	prdTitle: string;
@@ -361,12 +361,13 @@ export interface SummaryInput {
 	totalCommits: number;
 }
 
-const OUTCOME_ICONS: Record<SummaryOutcome, string> = { completed: "✅", failed: "❌", aborted: "⚠️", released: "🔧" };
+const OUTCOME_ICONS: Record<SummaryOutcome, string> = { completed: "✅", failed: "❌", aborted: "⚠️", released: "🔧", stopped: "⏹" };
 const OUTCOME_TEXTS: Record<SummaryOutcome, string> = {
 	completed: "Loop completed",
 	failed: "Loop failed",
 	aborted: "Loop aborted",
 	released: "Loop stopped — task released to a human (needs-human)",
+	stopped: "Loop stopped after the current task — re-run /prd-loop-pro to continue",
 };
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {

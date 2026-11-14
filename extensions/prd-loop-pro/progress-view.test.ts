@@ -307,3 +307,9 @@ describe("summary entry", () => {
 		assert.equal(buildOutcomeLabel("failed"), "❌ Loop failed");
 	});
 });
+
+describe("stopped outcome", () => {
+	it("has a label that says how to continue", () => {
+		assert.equal(buildOutcomeLabel("stopped"), "⏹ Loop stopped after the current task — re-run /prd-loop-pro to continue");
+	});
+});

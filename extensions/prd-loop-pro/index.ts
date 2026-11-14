@@ -96,7 +96,13 @@ import type {
 	WorkerBlocked,
 	WorkerResult,
 } from "./subagent-result.ts";
-import { appendSection, buildExecutionReport, buildOpenFindingsSection, formatLocation } from "./execution-report.ts";
+import {
+	appendSection,
+	buildExecutionReport,
+	buildOpenFindingsSection,
+	extractImplementerSummary,
+	formatLocation,
+} from "./execution-report.ts";
 import type { CommitRef, CostPhase, ExecutionRecord, RejectedFinding, UnresolvedFinding } from "./execution-report.ts";
 import {
 	checkGitClean,
@@ -1409,6 +1415,8 @@ interface LoopState {
 	pausedMs: number;
 	/** Start of the dialog that is open right now. */
 	pauseStart?: number;
+	/** "Stop after the current task" (`x` in the overlay): the loop ends cleanly once the running task is done. */
+	stopAfterTask?: boolean;
 	tasks: LoopTaskState[];
 	totalCost: number;
 	totalCommits: number;
@@ -1550,6 +1558,12 @@ class PrdLoopOverlayComponent {
 			}
 			if (matchesKey(data, Key.ctrl("c"))) {
 				this.onPause();
+				return;
+			}
+			// Stop the loop after the current task (toggle): a clean point to resume from later.
+			if (data === "x" || data === "X") {
+				this.state.stopAfterTask = !this.state.stopAfterTask;
+				this.requestRender();
 				return;
 			}
 			// Change models/thinking while the loop keeps running (not after the run).
@@ -1734,7 +1748,10 @@ class PrdLoopOverlayComponent {
 			? this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • esc/q close & post summary to chat")
 			: this.confirmingAbort
 				? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
-				: this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • s models • ← collapse • ctrl+c pause • esc abort");
+				: this.state.stopAfterTask
+					? this.theme.fg("warning", "⏹ Stopping after the current task (x to cancel)") +
+						this.theme.fg("dim", " • o output • s models • ctrl+c pause • esc abort")
+					: this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • s models • x stop after task • ← collapse • ctrl+c pause • esc abort");
 		const scroll = totalRows > contentHeight
 			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
 			: "";
@@ -1855,7 +1872,8 @@ function formatStepModel(step: { model: string; thinking: string }): string {
 }
 
 /** Final outcome of a loop run (`released` = a task was released to a human). */
-type LoopOutcome = "completed" | "failed" | "aborted" | "released";
+/** Final outcome of a loop run (`stopped` = stopped after a task on request, tasks are left). */
+type LoopOutcome = "completed" | "failed" | "aborted" | "released" | "stopped";
 
 /** Custom session entry type of the final summary (rendered in the chat, never sent to the LLM). */
 const SUMMARY_ENTRY_TYPE = "prd-loop-pro-summary";
@@ -2340,7 +2358,8 @@ export async function runOrchestratorLoop(
 			cost: statsTotals(stats).cost,
 			retries: 0,
 			errors: [],
-			summary: undefined,
+			// Tasks completed in earlier loop runs show the summary of their execution report again.
+			summary: isTaskClosed(task.status) ? extractImplementerSummary(task.body) : undefined,
 			currentActivity: undefined,
 			currentTurn: 0,
 			outputGroups: [],
@@ -3915,6 +3934,8 @@ export async function runOrchestratorLoop(
 	/** Tasks already run in this loop (never started twice, except the close-out of a split). */
 	const processed = new Set<string>();
 	let executedCount = 0;
+	/** True once a task was started in this run ("stop after the current task" needs one). */
+	let startedAny = false;
 
 	/**
 	 * Re-read the tasks of the PRD after a split: new subtask todos join the
@@ -3961,10 +3982,26 @@ export async function runOrchestratorLoop(
 			while (queue.length > 0) {
 				if (aborted) break;
 
+				// "Stop after the current task" (`x`): the task that was running is
+				// done (or split), nothing is half-finished, the working tree is clean.
+				if (loopState.stopAfterTask && startedAny) {
+					const left = queue.filter((task) => !processed.has(task.id)).length;
+					return {
+						outcome: "stopped",
+						notification: {
+							message:
+								`⏹ Loop stopped after the current task, as requested. ${left} task${left === 1 ? " is" : "s are"} left. ` +
+								"Re-run /prd-loop-pro to continue with the next one.",
+							level: "info",
+						},
+					};
+				}
+
 				const task = queue.shift()!;
 				if (processed.has(task.id)) continue;
 				processed.add(task.id);
 				executedCount++;
+				startedAny = true;
 				const taskStateIndex = loopState.tasks.findIndex((ts) => ts.id === task.id);
 				if (taskStateIndex === -1) continue;
 				const taskState = loopState.tasks[taskStateIndex]!;

@@ -293,6 +293,20 @@ export function buildExecutionReport(record: ExecutionRecord): string {
 	return out.join("\n");
 }
 
+/**
+ * The implementer summary of the last `## Execution Report` in a todo body,
+ * or undefined if the todo has no report. Used to show the summary of tasks
+ * completed in earlier loop runs again.
+ */
+export function extractImplementerSummary(body: string): string | undefined {
+	const reportStart = body.lastIndexOf(`\n${EXECUTION_REPORT_HEADING}`);
+	const report = reportStart !== -1 ? body.slice(reportStart + 1) : body.startsWith(EXECUTION_REPORT_HEADING) ? body : undefined;
+	if (report === undefined) return undefined;
+	const match = report.match(/\n### Implementer summary[ \t]*\n([\s\S]*?)(?=\n#{2,3} |$)/);
+	const summary = match?.[1]?.trim();
+	return summary && summary !== NONE ? summary : undefined;
+}
+
 /** Context of a release to a human (shown at the top of the open findings section). */
 export interface ReleaseInfo {
 	/** Why the task was released (e.g. "review round limit reached (3/3)", "git hook failed"). */

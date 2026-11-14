@@ -14,6 +14,7 @@ import {
 	formatFindingHeadline,
 	formatLocation,
 	totalCost,
+	extractImplementerSummary,
 } from "./execution-report.ts";
 import type { ExecutionRecord } from "./execution-report.ts";
 import type { ReviewFinding } from "./subagent-result.ts";
@@ -280,5 +281,36 @@ describe("buildOpenFindingsSection", () => {
 		assert.equal(sectionContent(md, "### Open"), "_None._");
 		assert.doesNotMatch(md, /Rejected by fixer/);
 		assert.match(md, /without open findings/);
+	});
+});
+
+describe("extractImplementerSummary", () => {
+	const record = {
+		implementerSummary: "Ported 21 functions.\n\nAll vectors match.",
+		reviewRounds: 0,
+		fixed: [],
+		rejected: [],
+		deferred: [],
+		unresolved: [],
+		callouts: [],
+		commits: [],
+		cost: {},
+	};
+
+	it("reads the summary back from a todo body with a report", () => {
+		const body = appendSection("## What to build\n\nX", buildExecutionReport(record));
+		assert.equal(extractImplementerSummary(body), "Ported 21 functions.\n\nAll vectors match.");
+		assert.equal(extractImplementerSummary(buildExecutionReport(record)), "Ported 21 functions.\n\nAll vectors match.");
+	});
+
+	it("uses the last report and stops at the next section", () => {
+		const first = appendSection("body", buildExecutionReport({ ...record, implementerSummary: "old" }));
+		const second = appendSection(first, buildExecutionReport({ ...record, implementerSummary: "new", reviewSummary: "fine", reviewRounds: 1 }));
+		assert.equal(extractImplementerSummary(second), "new");
+	});
+
+	it("returns undefined without a report or with an empty summary", () => {
+		assert.equal(extractImplementerSummary("## What to build\n\nX"), undefined);
+		assert.equal(extractImplementerSummary(buildExecutionReport({ ...record, implementerSummary: " " })), undefined);
 	});
 });
