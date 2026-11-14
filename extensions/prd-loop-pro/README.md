@@ -10,7 +10,11 @@ Compared to `/prd-loop`:
   **fixed** by dedicated subagents before anything is committed
 - each agent step has its **own model + thinking level**, saved globally and optionally per project — no CLI flags
 - the loop never fails hard: whenever automation gets stuck it **pauses** and hands control to you, and a task can be
-  **released to a human** (`needs-human`) and resumed at the next start
+  **released to a human** (`needs-human`, with a prepared prompt for the main session) and resumed at the next start
+- a task that is **too large or blocked** is reported as such by the implementer and can be **split into subtasks**
+  from the pause menu; the loop then continues with the subtasks
+- nothing is lost on a failure: discarded changes are **saved as a git stash**, every failed attempt is **recorded in
+  the task todo** and every subagent run is **logged**
 - invalid subagent JSON is **repaired** (deterministically, then via the orchestrator model) instead of aborting the run
 - commits are always clean Conventional Commits made by a committer agent (no simple fallback commit, no
   `Refs:`/`Task:` footers)
@@ -48,7 +52,7 @@ Implement → Review ⇄ Fix → Commit → Report
 
 | Phase | Agent | What happens |
 |-------|-------|--------------|
-| **Implement** | `prd-worker` | Implements the task, validates acceptance criteria, runs tests/build/lint. Retried automatically up to *Implementation retries* times with the previous errors as context. |
+| **Implement** | `prd-worker` | Implements the task, validates acceptance criteria, runs tests/build/lint. Retried automatically up to *Implementation retries* times with the previous errors as context. If the task cannot be completed as written (too large for one run, missing prerequisite), the worker reports it as **blocked**; the loop then pauses without a retry (see [Blocked tasks and Split task](#blocked-tasks-and-split-task)). |
 | **Review** | `prd-reviewer` | Reviews the uncommitted changes (excluding `.pi/`) with the shared `/review` rubric, the project's `REVIEW_GUIDELINES.md` (if any) and the task title/body. Also reports missing/partial acceptance criteria and out-of-scope changes. Each round uses a fresh reviewer. |
 | **Fix** | `prd-fixer` | One fresh fixer **per review round** for all findings at/above the [fix threshold](#fix-threshold--round-limit) (listed P0 first). It fixes each valid finding, rejects the others with a reason and runs the relevant checks **once** after all fixes. It reports fixed/rejected per finding. |
 | **Commit** | `prd-committer` | Commits the changes (excluding `.pi/`) as small Conventional Commits following the `/commit` template. Never bypasses hooks. |
@@ -185,8 +189,9 @@ progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any erro
 
 | Reason | Options |
 |--------|---------|
-| Manual pause (`Ctrl+C`) | Resume current phase, Skip phase\*, Retry task, Release, Skip task, Abort |
-| Implementation failed after all retries | Retry task, Release, Skip task, Abort |
+| Manual pause (`Ctrl+C`) | Resume current phase, Skip phase\*, Retry task, Split task\*\*, Release, Skip task, Abort |
+| Implementation failed after all retries | Retry phase, Retry task, Split task, Release, Skip task, Abort |
+| Implementer reported the task as blocked (no automatic retry) | Split task, Release, Retry phase, Retry task, Skip task, Abort |
 | JSON repair failed (no valid subagent result) | Retry phase, Release, Skip task, Abort |
 | Phase failed (reviewer/fixer crashed, git error, …) | Retry phase, Release, Skip task, Abort |
 | Committer failed | Retry phase, Release, Skip task, Abort |
@@ -194,31 +199,74 @@ progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any erro
 | Review round limit reached (lists open findings: priority, `file:line`, title) | One more round, Commit as-is & close task, Release, Skip task, Abort |
 
 \* *Skip phase* is not offered during the commit phase — uncommitted changes would leak into the next task.
+\*\* *Split task* is only offered during the implement phase.
 
 | Option | Effect |
 |--------|--------|
 | Resume current phase | Keep changes and continue/restart the paused phase |
 | Skip phase | Keep changes and move on (implement → review, review → commit, fix → open findings unresolved, commit) |
-| Retry phase | Keep changes and run the phase's agent again |
-| Retry task | Discard changes (except `.pi/`) and restart at implement |
+| Retry phase | Keep changes and run the phase's agent again. After a failed implementation the implementer gets the errors of the failed attempt and continues on the changes on disk |
+| Retry task | Discard changes (saved as git stash, `.pi/` is kept) and restart at implement |
+| Split task | A splitter proposes smaller subtasks; after you confirm, the changes are stashed, the subtask todos are created and the loop continues with them (see [Blocked tasks and Split task](#blocked-tasks-and-split-task)) |
 | One more round | Fix the open findings and review again |
 | Commit as-is & close task | Commit; open findings go into the report as unresolved |
-| Release (fix manually) | Mark the task `needs-human`, append open findings, stop the loop |
-| Skip task | Discard changes (except `.pi/`), mark the task done, continue with the next one |
+| Release / hand over | Mark the task `needs-human`, append open findings, stop the loop, keep the changes and put a prepared prompt for the main session into the editor |
+| Skip task | Discard changes (saved as git stash, `.pi/` is kept), mark the task done, continue with the next one |
 | Abort | Stop the loop, keep changes on disk |
 
 Discard operations never touch `.pi/` — todos, execution reports and settings are never lost, even if `.pi/` is
-tracked by git. The committer never uses `--no-verify` and never tries to fix hook failures; it reports
+tracked by git. Everything else is saved as a git stash before it is discarded (see [Safety net](#safety-net)). The committer never uses `--no-verify` and never tries to fix hook failures; it reports
 `hookFailed: true` and the loop pauses so you can resolve the hook problem.
+
+## Blocked tasks and Split task
+
+A task can turn out to be too large for one run, or to need something that does not exist yet. The implementer then
+ends its run with a **blocked** result (`blocked: { reason, proposedSplit[] }`) instead of a plain failure. The loop
+does not retry such a task automatically, since the same task would fail the same way. It pauses with the reason and
+the parts the implementer proposed.
+
+**Split task** (offered for a blocked task, a failed implementation and a manual pause during implement):
+
+1. The [`prd-splitter`](./agents/prd-splitter.md) subagent (read-only, orchestrator model + thinking level) reads the
+   task, the reason, the implementer's proposal and the uncommitted changes of the attempt, and proposes 2–12 subtasks
+   plus what remains for the original task. An unusable proposal is requested once more.
+2. You see the proposal and confirm it (*Apply split*) or go back to the pause menu.
+3. The changes of the attempt are saved as a git stash and removed from the working tree.
+4. The subtask todos are created with hierarchical labels (`Task 17/20` → `17a/20`, `17b/20`; `Task 17a/20` →
+   `17a1/20`, `17a2/20`; the total stays, labels are never reused). Subtasks that depend on nothing inside the split
+   take over the blockers of the original task. Each subtask references the stash as reference material.
+5. The original task stays open as **close-out task**: it is blocked by the last subtasks and its description and
+   acceptance criteria are reduced to what remains. Tasks that were blocked by it keep pointing at it.
+6. The PRD Task Index gets one row per subtask below the row of the original task.
+7. The loop re-reads the tasks and continues with the subtasks, then with the other open tasks; the close-out task runs
+   when its subtasks are closed.
+
+The rules are the same as in the `prd-to-todos` skill ("Splitting an existing task into subtasks"), so a split made by
+the loop and one made by hand in the main session look alike.
+
+## Safety net
+
+| What | Where | Purpose |
+|------|-------|---------|
+| **Snapshot before every discard** | git stash, message `prd-loop-pro: Task <label> — <retry task \| skip task \| split> (<time>)` | *Retry task*, *Skip task* and *Split task* can be undone: `git stash apply <ref>` (the ref is shown in a notification and recorded in the todo). If the stash cannot be created, nothing is discarded. |
+| **Failed attempts in the todo** | `## Failed Attempts` section of the task todo | Phase, reason, errors, the last subagent summary, the chosen action, the stash ref and the log files. Written for every failure pause, and for a manual or round-limit pause that ends the attempt (retry task, skip task, split, release, abort). |
+| **Subagent run logs** | `~/.pi/agent/prd-loop-pro/logs/<project>/<run>/<nnn>-<task>-<phase>.jsonl` | One JSONL file per subagent run: prompt, all completed messages (incl. tool calls and results), compaction and auto-retry events, final status, error, usage and stderr. Outside the project, so never reviewed, committed or discarded. The newest 30 runs per project are kept. |
+
+A subagent run that ends with a model/provider error (overloaded, rate limit, quota, …) after pi's own retries is
+reported as failed with that error; an earlier assistant text is never mistaken for its result.
 
 ## Needs-Human Resume Flow
 
-**Release (fix manually)** is available in every pause menu:
+**Release / hand over** is available in every pause menu:
 
 1. The task todo status is set to `needs-human` and an `## Open Findings` section (open/unresolved findings, rejected
    findings with reasons, release reason and errors) is appended to the todo.
 2. The PRD Task Index shows the task as `🔧 needs-human`.
 3. The loop stops; uncommitted changes stay on disk.
+4. When you close the overlay, a **prepared prompt** for the main session is put into the editor (it is not sent, and
+   an editor that already contains text is left alone). It names the task, the PRD, the phase, the reason, the errors,
+   the last subagent summary, the implementer's split proposal and the log files, and asks the agent to find the cause
+   and propose a way out (fix, split or rewrite the task) before changing anything.
 
 `needs-human` is **not** closed: the task and all tasks depending on it are held back until it is resolved. Fix the
 open findings manually (or with the main agent), then run `/prd-loop-pro` again. Before PRD selection, every
@@ -229,6 +277,7 @@ open findings manually (or with the main agent), then run `/prd-loop-pro` again.
 | Commit changes (committer) & close | Runs only the commit phase on the current changes, then report + close |
 | Already committed – just close | Appends an execution report, closes the task and updates the PRD Task Index |
 | Review again | Runs the review-fix cycle on the current changes, then commit + close |
+| Re-open | The task was split or rewritten in the meantime: sets it back to open; the loop runs it when its blockers are closed (needs a clean working tree) |
 | Not now | Leaves the task as `needs-human` |
 
 The git clean check allows uncommitted changes while a `needs-human` task is being resolved. Afterwards the loop
@@ -260,12 +309,14 @@ message**.
 
 | Agent | Step | Tools | Result contract |
 |-------|------|-------|-----------------|
-| [`prd-worker`](./agents/prd-worker.md) | Implement | read, bash, write, edit | `{ success, errors[], summary }` |
+| [`prd-worker`](./agents/prd-worker.md) | Implement | read, bash, write, edit | `{ success, errors[], summary, blocked?: { reason, proposedSplit: [{ title, description }] } }` |
+| [`prd-splitter`](./agents/prd-splitter.md) | Split task (orchestrator model) | read, bash (read-only) | `{ rationale, subtasks: [{ title, whatToBuild, acceptanceCriteria[], dependsOn[] }], parent: { whatToBuild, acceptanceCriteria[] } }` |
 | [`prd-reviewer`](./agents/prd-reviewer.md) | Review | read, bash, grep, find, ls (read-only) | `{ verdict: "correct" \| "needs attention", summary, findings: [{ priority: "P0".."P3", title, file, line?, body }], callouts: [string] }` |
 | [`prd-fixer`](./agents/prd-fixer.md) | Fix | read, bash, edit, write | `{ results: [{ id, status: "fixed" \| "rejected", reason, summary }], verification }` (one entry per finding) |
 | [`prd-committer`](./agents/prd-committer.md) | Commit | read, bash | `{ success, errors[], summary, hookFailed }` |
 
-Rules shared by all agents: never touch `.pi/`, never use the todo tool. Worker, reviewer and fixer never run git write
+Rules shared by all agents: never touch `.pi/`, never use the todo tool (also not when a task body asks for follow-up
+todos: the worker reports such work as blocked with a proposed split, and the orchestrator creates the todos). Worker, reviewer and fixer never run git write
 operations; only the committer commits (explicit paths, no `git add -A`, no `--no-verify`, no footers).
 
 ### JSON repair
@@ -292,9 +343,14 @@ If both fail, the loop pauses (*JSON repair failed*).
 | `reviewer-prompt.ts`, `fixer-prompt.ts`, `committer-prompt.ts` | Prompt builders (reviewer uses the shared [review rubric](../review/review-prompts.ts)) |
 | `execution-report.ts` | Execution report and open-findings sections (pure) |
 | `pause.ts` | Pause reasons, menu options and labels (pure) |
+| `attempt-log.ts` | `## Failed Attempts` section of the task todo (pure) |
+| `run-log.ts` | Subagent run logs (JSONL files outside the project) |
+| `task-split.ts` | Split a task into subtasks: labels, todo bodies, close-out task, PRD Task Index rows (pure) |
+| `splitter-prompt.ts` | Prompt builder for the splitter (pure) |
+| `handover.ts` | Prepared prompt for the main session after *Release / hand over* (pure) |
 | `task-sequence.ts` | Sequence labels incl. split subtasks (`17a1/20`): parsing, hierarchical sort, depth, subtask progress (pure) |
 | `task-index.ts` | Task graph, `needs-human` handling, PRD Task Index sync, git clean check (pure) |
-| `discard.ts` | Discard uncommitted changes except `.pi/` |
+| `discard.ts` | Snapshot (git stash) and discard uncommitted changes except `.pi/` |
 | `progress-view.ts` | View model for overlay, output viewer and summary entry (pure) |
 
 ## Tests

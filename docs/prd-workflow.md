@@ -207,15 +207,22 @@ implementation retries (default `0`).
 
 #### Pauses and `needs-human`
 
-The loop never fails hard. When the round limit is reached, the implementation still fails after all retries, a
-subagent result can't be repaired into valid JSON, the committer or a git hook fails, or you press `Ctrl+C`, it opens
-a pause menu (e.g. *Resume*, *Retry phase*, *Retry task*, *One more round*, *Commit as-is*, *Skip task*, *Abort*).
-Discarding changes never touches `.pi/`.
+The loop never fails hard. When the round limit is reached, the implementation still fails after all retries, the
+implementer reports the task as blocked, a subagent result can't be repaired into valid JSON, the committer or a git
+hook fails, or you press `Ctrl+C`, it opens a pause menu (e.g. *Resume*, *Retry phase*, *Retry task*, *Split task*,
+*One more round*, *Commit as-is*, *Skip task*, *Abort*). Discarding changes never touches `.pi/`, and everything else
+is saved as a git stash first, so a discard can be undone. Every failed attempt is recorded in the task todo
+(`## Failed Attempts`) and every subagent run is logged.
 
-**Release (fix manually)** sets the task todo to `needs-human`, appends the open findings to it and stops the loop. The
-task and its dependents stay blocked. Fix it manually (or with the main agent), then run `/prd-loop-pro` again: the
-`needs-human` task is offered first with *Commit changes (committer) & close*, *Already committed – just close* or
-*Review again* — uncommitted changes are allowed for this — and the loop then continues with the next task.
+**Task too large?** The implementer reports a task it cannot finish in one run as *blocked* instead of grinding on it.
+**Split task** lets a splitter propose smaller subtasks (`Task 17/20` → `17a/20`, `17b/20`, …); after you confirm, the
+todos are created, the original task becomes the close-out task and the loop continues with the subtasks.
+
+**Release / hand over** sets the task todo to `needs-human`, appends the open findings to it, stops the loop and puts
+a prepared prompt for the main session into the editor. The task and its dependents stay blocked. Fix it manually (or
+with the main agent), then run `/prd-loop-pro` again: the `needs-human` task is offered first with *Commit changes
+(committer) & close*, *Already committed – just close*, *Review again* or *Re-open* (if it was split or rewritten) —
+uncommitted changes are allowed for committing and reviewing — and the loop then continues with the next task.
 
 ## Alternative Entry Points
 
