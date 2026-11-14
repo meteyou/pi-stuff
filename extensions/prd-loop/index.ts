@@ -2086,15 +2086,20 @@ async function simpleAutoCommit(
 	const commitHeader = `feat(${scope}): ${description}`;
 	const commitFooter = `Refs: ${prdTag}\nTask: ${sequenceLabel}`;
 
-	await pi.exec("git", ["add", "-A"], { cwd });
-	const commitResult = await pi.exec("git", ["commit", "-m", commitHeader, "-m", commitFooter], { cwd });
+	const git = (args: string[]) => pi.exec("git", args, { cwd });
+	const describe = (step: string, result: { code: number; stdout: string; stderr: string }) =>
+		`${step} failed (exit code ${result.code}): ${(result.stderr || result.stdout).trim()}`;
 
-	if (commitResult.code !== 0) {
-		if (commitResult.stdout.includes("nothing to commit")) {
-			return { committed: false };
-		}
-		return { committed: false, error: commitResult.stderr || commitResult.stdout };
-	}
+	const addResult = await git(["add", "-A"]);
+	if (addResult.code !== 0) return { committed: false, error: describe("git add -A", addResult) };
+
+	// Exit code 0 = nothing staged, 1 = staged changes, anything else = error.
+	const stagedResult = await git(["diff", "--cached", "--quiet"]);
+	if (stagedResult.code === 0) return { committed: false };
+	if (stagedResult.code !== 1) return { committed: false, error: describe("git diff --cached", stagedResult) };
+
+	const commitResult = await git(["commit", "-m", commitHeader, "-m", commitFooter]);
+	if (commitResult.code !== 0) return { committed: false, error: describe("git commit", commitResult) };
 	return { committed: true };
 }
 
@@ -2328,6 +2333,22 @@ async function runOrchestratorLoop(
 		outcome: "completed" | "failed" | "aborted";
 		notification?: { message: string; level: "info" | "warning" | "error" };
 		unexpectedError?: unknown;
+	};
+
+	/** A failed commit stops the loop: the task stays open, its changes stay on disk. */
+	const commitFailed = (task: TaskInfo, taskState: LoopTaskState, error: string): LoopRunResult => {
+		taskState.status = "failed";
+		taskState.errors = [error];
+		requestOverlayRender();
+		return {
+			outcome: "failed",
+			notification: {
+				message:
+					`❌ Commit failed for Task ${task.sequenceLabel}: ${error}\n` +
+					"The task stays open and its changes are uncommitted. Fix the cause, commit the changes and close the task todo, then re-run /prd-loop.",
+				level: "error",
+			},
+		};
 	};
 
 	const runPromise = (async (): Promise<LoopRunResult> => {
@@ -2602,19 +2623,13 @@ Errors: ${result.errors.join("; ")}`,
 						loopState.totalCommits += committerResult.commitCount;
 					} else {
 						const fallback = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-						if (fallback.committed) {
-							loopState.totalCommits++;
-						} else if (fallback.error) {
-							ctx.ui.notify(`⚠️ Git commit warning: ${fallback.error}`, "warning");
-						}
+						if (fallback.error) return commitFailed(task, taskState, fallback.error);
+						if (fallback.committed) loopState.totalCommits++;
 					}
 				} else {
 					const commitResult = await simpleAutoCommit(pi, ctx.cwd, prdTag, task.sequenceLabel, shortTitle);
-					if (commitResult.committed) {
-						loopState.totalCommits++;
-					} else if (commitResult.error) {
-						ctx.ui.notify(`⚠️ Git commit warning: ${commitResult.error}`, "warning");
-					}
+					if (commitResult.error) return commitFailed(task, taskState, commitResult.error);
+					if (commitResult.committed) loopState.totalCommits++;
 				}
 
 				if (aborted) {
@@ -2758,6 +2773,13 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 
 	// Step 1: Git clean check
 	const gitResult = await pi.exec("git", ["status", "--porcelain"]);
+	if (gitResult.code !== 0) {
+		ctx.ui.notify(
+			`git status failed (exit code ${gitResult.code}): ${(gitResult.stderr || gitResult.stdout).trim()}`,
+			"error",
+		);
+		return;
+	}
 	if (gitResult.stdout.trim() !== "") {
 		ctx.ui.notify(
 			"Uncommitted changes detected. Please clean your working directory before starting the loop.",
