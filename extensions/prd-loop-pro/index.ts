@@ -63,9 +63,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -108,7 +108,15 @@ import {
 	syncPrdTaskIndex,
 } from "./task-index.ts";
 import type { TaskInfo } from "./task-index.ts";
-import { extractShortTitle, nextSubtaskLabels, parseSequenceLabel, sequenceDepth, sortBySequence, subtaskProgress } from "./task-sequence.ts";
+import {
+	extractShortTitle,
+	nextSubtaskLabels,
+	parseSequenceLabel,
+	sequenceDepth,
+	sortBySequence,
+	subtaskProgress,
+	titlePrefix,
+} from "./task-sequence.ts";
 import {
 	applyFixOutcomes,
 	applyReview,
@@ -133,7 +141,20 @@ import type { PauseAction, PauseReasonKind, PauseRequest } from "./pause.ts";
 import { discardChanges, snapshotChanges } from "./discard.ts";
 import type { ChangeSnapshot } from "./discard.ts";
 import { appendAttempt, attemptActionText, shouldRecordAttempt } from "./attempt-log.ts";
-import { appendLogRecord, projectLogDir, pruneRunDirs, runDirName, runLogFileName, toLogRecord } from "./run-log.ts";
+import {
+	STATS_KEY,
+	emptyStats,
+	emptyTokens,
+	formatTokens,
+	parseStats,
+	phaseCostsOf,
+	serializeFrontMatter,
+	statsToJson,
+	statsTotals,
+	totalTokens,
+} from "./task-stats.ts";
+import type { RunRecord, TaskStats } from "./task-stats.ts";
+import { findSessionFile, sessionDirsFor } from "./session-files.ts";
 import { addSplitToPrdIndex, describeSplitProposal, planSplit, validateSplitProposal } from "./task-split.ts";
 import { buildSplitterPrompt } from "./splitter-prompt.ts";
 import { buildHandoverPrompt } from "./handover.ts";
@@ -182,6 +203,8 @@ interface TodoItem {
 	tags: string[];
 	status: string;
 	body: string;
+	/** Raw `prd_loop` front matter value (statistics, see ./task-stats.ts). */
+	stats?: unknown;
 }
 
 /**
@@ -222,6 +245,7 @@ function parseTodoFile(content: string): TodoItem | null {
 			tags: meta.tags || [],
 			status: meta.status || "open",
 			body,
+			stats: meta[STATS_KEY],
 		};
 	} catch {
 		return null;
@@ -474,7 +498,8 @@ const AGENT_END_EXIT_TIMEOUT_MS = 10000;
  * @param options.cwd - Working directory for the subagent process
  * @param options.agent - The agent definition (e.g. loaded from prd-worker.md)
  * @param options.signal - AbortSignal for cancellation
- * @param options.logPath - JSONL log file of the run (see ./run-log.ts)
+ * @param options.session - Store the run as a pi session with this id and name
+ *   (omitted = ephemeral run without a session)
  * @returns SubagentRunResult with status, raw final text, usage stats and events
  */
 export async function spawnSubagent(options: {
@@ -485,12 +510,9 @@ export async function spawnSubagent(options: {
 	agent: AgentDefinition;
 	signal?: AbortSignal;
 	onActivity?: (activity: SubagentActivity) => void;
-	logPath?: string;
+	session?: { id: string; name: string };
 }): Promise<SubagentRunResult> {
-	const { taskPrompt, model, thinkingLevel, cwd, agent, signal, onActivity, logPath } = options;
-	const log = (record: Record<string, unknown>) => {
-		if (logPath) appendLogRecord(logPath, record);
-	};
+	const { taskPrompt, model, thinkingLevel, cwd, agent, signal, onActivity, session } = options;
 
 	const events: OutputEvent[] = [];
 	const emitActivity = (activity: SubagentActivity) => {
@@ -507,8 +529,12 @@ export async function spawnSubagent(options: {
 	// isolated and avoid unrelated hooks interfering with clean shutdown. We still
 	// explicitly load cc-support so Anthropic subagents get the same Claude Code
 	// user-agent + system-prompt rewrite as the parent agent.
+	//
+	// The run is stored as a normal session of the project (chosen id + name),
+	// so it shows up in pi's session statistics and can be opened later.
 	const args: string[] = [
-		"--mode", "json", "-p", "--no-session",
+		"--mode", "json", "-p",
+		...(session ? ["--session-id", session.id, "--name", session.name] : ["--no-session"]),
 		"--no-extensions", "--no-themes",
 	];
 
@@ -555,27 +581,6 @@ export async function spawnSubagent(options: {
 	/** Stop reason + error of the latest assistant message (a provider error ends the run without a result). */
 	let lastAssistant: { stopReason?: string; errorMessage?: string } | undefined;
 
-	log({
-		type: "run_start",
-		time: new Date().toISOString(),
-		agent: agent.name,
-		model: model ?? agent.model,
-		thinking: thinkingLevel,
-		cwd,
-		prompt: taskPrompt,
-	});
-	const finish = (result: SubagentRunResult): SubagentRunResult => {
-		log({
-			type: "run_end",
-			time: new Date().toISOString(),
-			status: result.status,
-			error: result.error,
-			usage: result.usage,
-			stderr: stderr.trim() || undefined,
-		});
-		return result;
-	};
-
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
 			let resolved = false;
@@ -603,9 +608,6 @@ export async function spawnSubagent(options: {
 				} catch {
 					return;
 				}
-
-				const logRecord = toLogRecord(event);
-				if (logRecord) log(logRecord);
 
 				// agent_end closes one low-level run. Automatic retries, overflow
 				// recovery or compaction can still continue afterwards, so keep only
@@ -759,35 +761,35 @@ export async function spawnSubagent(options: {
 
 		// Handle abort
 		if (wasAborted) {
-			return finish({ status: "aborted", finalText, usage, events, error: "Subagent was aborted" });
+			return { status: "aborted", finalText, usage, events, error: "Subagent was aborted" };
 		}
 
 		// The run ended with a model/provider error (e.g. overloaded, rate limit,
 		// quota) after pi's own retries: there is no result, and an earlier
 		// assistant text must not be mistaken for one.
 		if (lastAssistant?.stopReason === "error") {
-			return finish({
+			return {
 				status: "failed",
 				finalText,
 				usage,
 				events,
 				error: `Model/provider error: ${lastAssistant.errorMessage?.trim() || "unknown error"}`,
-			});
+			};
 		}
 
 		// Handle non-zero exit code — but if we received agent_settled, the agent
 		// DID complete; the non-zero code is likely from post-agent cleanup.
 		if (exitCode !== 0 && !settled) {
-			return finish({
+			return {
 				status: "failed",
 				finalText,
 				usage,
 				events,
 				error: `Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`,
-			});
+			};
 		}
 
-		return finish({ status: "completed", finalText, usage, events });
+		return { status: "completed", finalText, usage, events };
 	} finally {
 		// Clean up temp files
 		try {
@@ -918,6 +920,7 @@ export async function fetchPrdTasks(cwd: string, prdTag: string): Promise<TaskIn
 			body: t.body,
 			blockedBy: parseBlockedBy(t.body),
 			sequenceLabel: parseSequenceLabel(t.title),
+			stats: parseStats(t.stats),
 		}));
 }
 
@@ -976,7 +979,23 @@ async function updateTodoFileStatus(cwd: string, todoId: string, newStatus: stri
 	const meta = JSON.parse(split.jsonStr);
 	meta.status = newStatus;
 
-	writeFileSync(filePath, JSON.stringify(meta, null, 2) + split.body, "utf-8");
+	// `split.body` starts after the line break that ends the front matter.
+	writeFileSync(filePath, `${serializeFrontMatter(meta)}\n${split.body}`, "utf-8");
+}
+
+/**
+ * Store the statistics of a task (time, runs with sessions, tokens and cost)
+ * in the `prd_loop` field of its todo front matter (see ./task-stats.ts).
+ */
+function updateTodoFileStats(cwd: string, todoId: string, stats: TaskStats): void {
+	const filePath = join(cwd, ".pi", "todos", `${todoIdToHex(todoId)}.md`);
+	const split = splitTodoFile(readFileSync(filePath, "utf-8"));
+	if (!split) throw new Error(`Invalid todo file format: ${filePath}`);
+
+	const meta = JSON.parse(split.jsonStr);
+	meta[STATS_KEY] = statsToJson(stats);
+	// `split.body` starts after the line break that ends the front matter.
+	writeFileSync(filePath, `${serializeFrontMatter(meta)}\n${split.body}`, "utf-8");
 }
 
 /**
@@ -1329,12 +1348,27 @@ interface LoopTaskState {
 	reviewNote?: string;
 	/** Cost per pipeline phase (kept across "Retry task"). */
 	phaseCosts: Partial<Record<CostPhase, number>>;
-	/** Log files of the subagent runs of the current attempt (see ./run-log.ts). */
-	logFiles: string[];
+	/**
+	 * Statistics stored in the task todo: active time and one record per
+	 * subagent run, incl. the runs of earlier loop runs (see ./task-stats.ts).
+	 */
+	stats: TaskStats;
+	/** Subagent runs of the current attempt (for the attempt log and the hand-over). */
+	attemptRuns: RunRecord[];
+	/** Latest subagent run (its cost and outcome are completed after the result is parsed). */
+	lastRun?: RunRecord;
 	/** Set when the implementer reported the task as blocked (kept for split / hand-over). */
 	blocked?: WorkerBlocked;
-	startTime?: number;
-	endTime?: number;
+	/**
+	 * Active time on the task so far, incl. earlier loop runs. The clock stops
+	 * while a dialog waits for the human (pause menu, split confirmation).
+	 */
+	activeMs: number;
+	/** Start of the running clock segment (undefined = clock stopped). */
+	clockStart?: number;
+	/** True once the task was started in this loop run. */
+	ran?: boolean;
+	/** Cost incl. earlier loop runs. */
 	cost: number;
 	retries: number;
 	errors: string[];
@@ -1349,10 +1383,32 @@ interface LoopTaskState {
 	outputGroups: PhaseOutputGroup[];
 }
 
+/** Token counts of all subagent runs of a task, or undefined if there are none. */
+function taskTokensText(task: Pick<LoopTaskState, "stats">): string | undefined {
+	const tokens = statsTotals(task.stats).tokens;
+	return totalTokens(tokens) > 0 ? formatTokens(tokens) : undefined;
+}
+
+/** Active time on a task: finished clock segments plus the running one. */
+function taskElapsedMs(task: Pick<LoopTaskState, "activeMs" | "clockStart">, now = Date.now()): number {
+	return task.activeMs + (task.clockStart !== undefined ? Math.max(0, now - task.clockStart) : 0);
+}
+
+/** Elapsed time of the loop run without the time spent in dialogs. */
+function loopElapsedMs(state: LoopState, now = Date.now()): number {
+	const end = state.endTime ?? now;
+	const paused = state.pausedMs + (state.pauseStart !== undefined ? Math.max(0, end - state.pauseStart) : 0);
+	return Math.max(0, end - state.startTime - paused);
+}
+
 interface LoopState {
 	startTime: number;
 	/** Set once the run is over; freezes the elapsed time in the finished overlay. */
 	endTime?: number;
+	/** Time spent in dialogs that wait for the human (not counted as elapsed time). */
+	pausedMs: number;
+	/** Start of the dialog that is open right now. */
+	pauseStart?: number;
 	tasks: LoopTaskState[];
 	totalCost: number;
 	totalCommits: number;
@@ -1626,11 +1682,22 @@ class PrdLoopOverlayComponent {
 				width,
 			),
 			truncateToWidth(
-				this.theme.fg("dim", `${currentLabel} • $${this.state.totalCost.toFixed(2)} • ${formatElapsed(now - this.state.startTime)}`),
+				this.theme.fg("dim", `${currentLabel} • $${this.state.totalCost.toFixed(2)} • ${formatElapsed(loopElapsedMs(this.state, now))}${this.prdTotalText(now)}`),
 				width,
 			),
 			"",
 		];
+	}
+
+	/**
+	 * ` • PRD total: $12.34 • 3:25:10` — cost and active time of all tasks incl.
+	 * earlier loop runs (empty while this run is the only one).
+	 */
+	private prdTotalText(now: number): string {
+		const cost = this.state.tasks.reduce((sum, task) => sum + task.cost, 0);
+		if (cost <= this.state.totalCost + 0.005) return "";
+		const time = this.state.tasks.reduce((sum, task) => sum + taskElapsedMs(task, now), 0);
+		return ` • PRD total: $${cost.toFixed(2)} • ${formatElapsed(time)}`;
 	}
 
 	private buildFinishedHeader(width: number, info: FinishedOverlayInfo): string[] {
@@ -1643,7 +1710,7 @@ class PrdLoopOverlayComponent {
 			),
 			truncateToWidth(this.theme.fg(outcomeColor, this.theme.bold(buildOutcomeLabel(summary.outcome))), width),
 		];
-		for (const line of wrapTextWithAnsi(this.theme.fg("muted", buildSummaryTotalsLine(summary)), width)) {
+		for (const line of wrapTextWithAnsi(this.theme.fg("muted", buildSummaryTotalsLine(summary) + this.prdTotalText(Date.now())), width)) {
 			lines.push(truncateToWidth(line, width));
 		}
 		if (info.notification) {
@@ -1697,10 +1764,8 @@ class PrdLoopOverlayComponent {
 				: this.theme.fg("text", titleText);
 
 			const meta: string[] = [];
-			if (task.startTime) {
-				const end = task.endTime ?? now;
-				meta.push(formatElapsed(end - task.startTime));
-			}
+			const elapsed = taskElapsedMs(task, now);
+			if (elapsed > 0 || task.clockStart !== undefined) meta.push(formatElapsed(elapsed));
 			if (task.cost > 0) meta.push(`$${task.cost.toFixed(2)}`);
 			if (task.retries > 0) meta.push(`${task.retries} retry${task.retries === 1 ? "" : "s"}`);
 			const subtasks = subtaskProgress(task, this.state.tasks, (t) => t.status === "completed");
@@ -1734,6 +1799,7 @@ class PrdLoopOverlayComponent {
 				review: task.review,
 				reviewNote: task.reviewNote,
 				phaseCosts: task.phaseCosts,
+				tokens: taskTokensText(task),
 			});
 			for (const detail of detailLines) {
 				const label = this.theme.fg("dim", `${indent}    ${detail.label}: `);
@@ -1805,13 +1871,15 @@ function buildSummaryInput(state: LoopState, prdTitle: string, outcome: LoopOutc
 		tasks: state.tasks.map((task) => ({
 			label: `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`,
 			status: task.status,
-			elapsedMs: task.endTime && task.startTime ? task.endTime - task.startTime : undefined,
-			cost: task.cost,
+			// Tasks that did not run in this loop keep their stored numbers out of
+			// the summary of this run (the overlay shows them).
+			elapsedMs: task.ran ? taskElapsedMs(task) : undefined,
+			cost: task.ran ? task.cost : 0,
 			retries: task.retries,
-			review: task.review ? { ...task.review } : undefined,
+			review: task.ran && task.review ? { ...task.review } : undefined,
 			reviewNote: task.review ? undefined : task.reviewNote,
 		})),
-		totalElapsedMs: (state.endTime ?? Date.now()) - state.startTime,
+		totalElapsedMs: loopElapsedMs(state),
 		totalCost: state.totalCost,
 		totalCommits: state.totalCommits,
 	};
@@ -2058,7 +2126,7 @@ class SubagentOutputViewer {
 		const now = Date.now();
 
 		const icon = task.status === "running" ? "🔄" : task.status === "retrying" ? "🔁" : statusIcon(task.status);
-		const elapsed = task.startTime ? formatElapsed((task.endTime ?? now) - task.startTime) : "0:00";
+		const elapsed = formatElapsed(taskElapsedMs(task, now));
 		const turnInfo = task.currentTurn > 0 ? `T${task.currentTurn}` : "";
 		const phaseCount = task.outputGroups.length;
 		const eventCount = `${phaseCount} phase${phaseCount === 1 ? "" : "s"} • ${countPhaseEvents(task.outputGroups)} events`;
@@ -2260,25 +2328,34 @@ export async function runOrchestratorLoop(
 	// Hierarchical order: split subtasks (17a, 17a1, …) follow their parent task.
 	const allTasksSorted = sortBySequence(resolution.allTasks);
 
-	const newTaskState = (task: TaskInfo): LoopTaskState => ({
-		id: task.id,
-		title: task.title,
-		sequenceLabel: task.sequenceLabel,
-		status: (isTaskClosed(task.status) ? "completed" : isNeedsHuman(task.status) ? "needs-human" : "pending") as TaskStatus,
-		cost: 0,
-		retries: 0,
-		errors: [],
-		summary: undefined,
-		currentActivity: undefined,
-		currentTurn: 0,
-		outputGroups: [],
-		phaseCosts: {},
-		logFiles: [],
-	});
+	// Time, cost, tokens and review progress of earlier loop runs come from the
+	// statistics stored in the task todos (see ./task-stats.ts).
+	const newTaskState = (task: TaskInfo): LoopTaskState => {
+		const stats = task.stats ?? emptyStats();
+		return {
+			id: task.id,
+			title: task.title,
+			sequenceLabel: task.sequenceLabel,
+			status: (isTaskClosed(task.status) ? "completed" : isNeedsHuman(task.status) ? "needs-human" : "pending") as TaskStatus,
+			cost: statsTotals(stats).cost,
+			retries: 0,
+			errors: [],
+			summary: undefined,
+			currentActivity: undefined,
+			currentTurn: 0,
+			outputGroups: [],
+			phaseCosts: phaseCostsOf(stats),
+			stats,
+			attemptRuns: [],
+			activeMs: stats.activeMs,
+			review: stats.review,
+		};
+	};
 
 	const loopState: LoopState = {
 		startTime: Date.now(),
 		tasks: allTasksSorted.map(newTaskState),
+		pausedMs: 0,
 		totalCost: 0,
 		totalCommits: 0,
 		currentTaskIndex: 0,
@@ -2288,11 +2365,54 @@ export async function runOrchestratorLoop(
 
 	const prdTitle = prd.title;
 
-	// Subagent run logs (outside the project, see ./run-log.ts).
-	const logProjectDir = projectLogDir(join(getAgentDir(), "prd-loop-pro", "logs"), ctx.cwd);
-	pruneRunDirs(logProjectDir);
-	const logRunDir = join(logProjectDir, runDirName(new Date()));
-	let logSequence = 0;
+	// Subagent runs are stored as pi sessions of the project (see ./session-files.ts).
+	const sessionDirs = sessionDirsFor(ctx.cwd, getAgentDir(), ctx.sessionManager.getSessionDir());
+	/** `<label>: <session file | pi --session id>` for the attempt log and the hand-over. */
+	const sessionRefs = (runs: RunRecord[], withFile: boolean): string[] =>
+		runs
+			.filter((run) => run.session)
+			.map((run) => {
+				const file = withFile ? findSessionFile(sessionDirs, run.session!) : null;
+				return `${run.label}: ${file ?? `\`pi --session ${run.session}\``}`;
+			});
+
+	// --- Task clock and persisted statistics (see ./task-stats.ts) ---
+
+	/** Write the statistics of a task into its todo. A failure is never fatal. */
+	const persistStats = (taskState: LoopTaskState) => {
+		taskState.stats.activeMs = taskElapsedMs(taskState);
+		taskState.stats.review = taskState.review ? { ...taskState.review } : undefined;
+		try {
+			updateTodoFileStats(ctx.cwd, taskState.id, taskState.stats);
+		} catch {
+			// The todo may have been removed or be unreadable; the loop goes on.
+		}
+	};
+	const startClock = (taskState: LoopTaskState) => {
+		if (taskState.clockStart === undefined) taskState.clockStart = Date.now();
+	};
+	const stopClock = (taskState: LoopTaskState) => {
+		if (taskState.clockStart !== undefined) {
+			taskState.activeMs = taskElapsedMs(taskState);
+			taskState.clockStart = undefined;
+		}
+		persistStats(taskState);
+	};
+	/**
+	 * Stop the task clock and the loop clock while a dialog waits for the
+	 * human. Returns the function that starts them again.
+	 */
+	const pauseClocks = (taskState: LoopTaskState): (() => void) => {
+		const wasRunning = taskState.clockStart !== undefined;
+		stopClock(taskState);
+		const pauseStart = Date.now();
+		loopState.pauseStart = pauseStart;
+		return () => {
+			loopState.pausedMs += Date.now() - pauseStart;
+			loopState.pauseStart = undefined;
+			if (wasRunning) startClock(taskState);
+		};
+	};
 
 	let currentAbortController = new AbortController();
 	let aborted = false;
@@ -2558,6 +2678,9 @@ export async function runOrchestratorLoop(
 		taskState.cost += cost;
 		loopState.totalCost += cost;
 		phaseCosts[phase] = (phaseCosts[phase] ?? 0) + cost;
+		// The stored run gets the final cost (incl. a JSON repair of its result).
+		if (taskState.lastRun) taskState.lastRun.cost = cost;
+		persistStats(taskState);
 		finishPhaseGroup(taskState.outputGroups, { cost });
 		requestOverlayRender();
 	};
@@ -2586,12 +2709,19 @@ export async function runOrchestratorLoop(
 		const { model, thinking } = settings.steps[step];
 		const modelText = formatStepModel({ model, thinking });
 		beginPhaseOutput(taskState, output.ref, output.note, modelText);
-		const logPath = join(logRunDir, runLogFileName(++logSequence, taskState.sequenceLabel, phaseHeader(output.ref, output.note)));
-		taskState.logFiles.push(logPath);
+		// Every run is stored as a named pi session of the project and recorded
+		// in the task todo (session id, model, duration, tokens, cost).
+		const header = phaseHeader(output.ref, output.note);
+		const session = {
+			id: randomUUID(),
+			name: `${titlePrefix(taskState.title)}Task ${taskState.sequenceLabel} · ${header}`,
+		};
+		const startedAt = Date.now();
+		let result: SubagentRunResult | undefined;
 		activeRun = { step, model, thinking };
 		taskState.currentModel = modelText;
 		try {
-			return await spawnSubagent({
+			result = await spawnSubagent({
 				taskPrompt: run.taskPrompt,
 				model,
 				thinkingLevel: thinking,
@@ -2599,9 +2729,28 @@ export async function runOrchestratorLoop(
 				agent: run.agent,
 				signal: currentAbortController.signal,
 				onActivity: createActivityHandler(taskState),
-				logPath,
+				session,
 			});
+			return result;
 		} finally {
+			const usage = result?.usage;
+			const record: RunRecord = {
+				phase: output.ref.phase,
+				label: header,
+				session: session.id,
+				model: modelText,
+				startedAt: new Date(startedAt).toISOString(),
+				durationMs: Date.now() - startedAt,
+				cost: usage?.cost ?? 0,
+				tokens: usage
+					? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite }
+					: emptyTokens(),
+				failed: result?.status === "completed" ? undefined : true,
+			};
+			taskState.stats.runs.push(record);
+			taskState.attemptRuns.push(record);
+			taskState.lastRun = record;
+			persistStats(taskState);
 			activeRun = undefined;
 			taskState.currentModel = undefined;
 			requestOverlayRender();
@@ -2611,6 +2760,10 @@ export async function runOrchestratorLoop(
 	/** Record the one-line outcome of the latest subagent run (output viewer header). */
 	const endPhaseOutput = (taskState: LoopTaskState, outcome: string, failed = false) => {
 		finishPhaseGroup(taskState.outputGroups, { outcome, failed });
+		if (taskState.lastRun) {
+			taskState.lastRun.failed = failed ? true : undefined;
+			persistStats(taskState);
+		}
 		requestOverlayRender();
 	};
 
@@ -2622,7 +2775,7 @@ export async function runOrchestratorLoop(
 
 	/**
 	 * Write the pending attempt into the `## Failed Attempts` section of the
-	 * task todo (incl. the snapshot of discarded changes and the log files).
+	 * task todo (incl. the snapshot of discarded changes and the subagent sessions).
 	 * A failure to write is reported, never fatal.
 	 */
 	const recordAttempt = async (task: TaskInfo, taskState: LoopTaskState, snapshot?: ChangeSnapshot) => {
@@ -2634,7 +2787,7 @@ export async function runOrchestratorLoop(
 			await updateTodoFileBody(
 				ctx.cwd,
 				task.id,
-				appendAttempt(body, { ...attempt, snapshot, logFiles: [...taskState.logFiles] }),
+				appendAttempt(body, { ...attempt, snapshot, sessions: sessionRefs(taskState.attemptRuns, false) }),
 			);
 		} catch (err) {
 			ctx.ui.notify(
@@ -2667,7 +2820,7 @@ export async function runOrchestratorLoop(
 		}
 		await discardChanges(git);
 		await recordAttempt(task, taskState, snapshot);
-		taskState.logFiles = [];
+		taskState.attemptRuns = [];
 		if (snapshot) {
 			ctx.ui.notify(
 				`💾 Changes of Task ${task.sequenceLabel} were saved before the discard — restore with: git stash apply ${snapshot.ref}`,
@@ -2698,7 +2851,7 @@ export async function runOrchestratorLoop(
 		await discardTaskChanges(task, taskState, "skip task");
 		currentAbortController = new AbortController();
 		taskState.status = "completed";
-		taskState.endTime = Date.now();
+		stopClock(taskState);
 		taskState.currentActivity = undefined;
 		taskState.summary = summary;
 		taskState.errors = [];
@@ -2763,12 +2916,12 @@ export async function runOrchestratorLoop(
 			summary: taskState.summary,
 			proposedSplit: taskState.blocked?.proposedSplit,
 			openFindings: open.length,
-			logFiles: taskState.logFiles,
+			sessions: sessionRefs(taskState.attemptRuns, true),
 		});
 
 		currentAbortController = new AbortController();
 		taskState.status = "needs-human";
-		taskState.endTime = Date.now();
+		stopClock(taskState);
 		taskState.currentActivity = undefined;
 		taskState.summary = `Released to a human: ${request.reason}`;
 		requestOverlayRender();
@@ -2825,6 +2978,8 @@ export async function runOrchestratorLoop(
 		}
 		requestOverlayRender();
 		if (widgetTimer) clearInterval(widgetTimer);
+		// The clocks stop while the menu waits for the human.
+		const resumeClocks = pauseClocks(taskState);
 		let action: PauseAction;
 		try {
 			action = await withOverlayHidden(() =>
@@ -2839,6 +2994,7 @@ export async function runOrchestratorLoop(
 				}),
 			);
 		} finally {
+			resumeClocks();
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = setInterval(requestOverlayRender, 1000);
 			currentAbortController = new AbortController();
@@ -3013,7 +3169,13 @@ export async function runOrchestratorLoop(
 		].join("\n");
 		const applyLabel = `Apply split — create ${count} subtask todos and continue with ${labels[0]!.split("/")[0]}`;
 		const backLabel = "Back to the pause menu — change nothing";
-		const choice = await withOverlayHidden(() => ctx.ui.select(title, [applyLabel, backLabel]));
+		const resumeClocks = pauseClocks(taskState);
+		let choice: string | undefined;
+		try {
+			choice = await withOverlayHidden(() => ctx.ui.select(title, [applyLabel, backLabel]));
+		} finally {
+			resumeClocks();
+		}
 		if (choice !== applyLabel) return false;
 
 		// --- Apply ---
@@ -3731,12 +3893,17 @@ export async function runOrchestratorLoop(
 			reviewNote,
 			commits,
 			cost: phaseCosts,
+			time: formatElapsed(taskElapsedMs(taskState)),
+			tokens: taskTokensText(taskState),
+			sessions: taskState.stats.runs
+				.filter((run) => run.session)
+				.map((run) => ({ id: run.session!, label: run.label, model: run.model })),
 		};
 		const taskBody = await readTodoBody(ctx.cwd, task.id);
 		await updateTodoFileBody(ctx.cwd, task.id, appendSection(taskBody, buildExecutionReport(record)));
 
 		taskState.status = "completed";
-		taskState.endTime = Date.now();
+		stopClock(taskState);
 		taskState.currentActivity = undefined;
 		await closeTaskAndUpdateIndex(task, { notifyIndexError: true });
 		requestOverlayRender();
@@ -3811,20 +3978,21 @@ export async function runOrchestratorLoop(
 				 * and across a split when the task runs again as close-out).
 				 */
 				const phaseCosts = taskState.phaseCosts;
-				taskState.startTime = Date.now();
+				taskState.ran = true;
+				startClock(taskState);
 
 				let outcome: TaskOutcome;
 				while (true) {
 					loopState.currentRetry = 0;
 					taskState.status = "running";
-					taskState.endTime = undefined;
+					startClock(taskState);
 					taskState.retries = 0;
 					taskState.errors = [];
 					taskState.summary = undefined;
 					taskState.currentActivity = undefined;
 					taskState.currentTurn = 0;
 					taskState.outputGroups = [];
-					taskState.logFiles = [];
+					taskState.attemptRuns = [];
 					taskState.blocked = undefined;
 					taskState.review = undefined;
 					taskState.reviewNote = undefined;
@@ -3849,7 +4017,7 @@ export async function runOrchestratorLoop(
 					processed.delete(task.id);
 					executedCount--;
 					taskState.status = "pending";
-					taskState.endTime = undefined;
+					stopClock(taskState);
 					taskState.errors = [];
 					taskState.blocked = undefined;
 					taskState.phase = undefined;
@@ -3865,7 +4033,7 @@ export async function runOrchestratorLoop(
 					aborted = true;
 					taskState.status = "aborted";
 					taskState.summary = outcome.summary;
-					if (!taskState.endTime) taskState.endTime = Date.now();
+					stopClock(taskState);
 					break;
 				}
 				// completed / skipped: continue with the next task (unless aborted meanwhile)
@@ -3908,6 +4076,10 @@ export async function runOrchestratorLoop(
 			return { outcome: "failed", unexpectedError: err };
 		} finally {
 			if (widgetTimer) clearInterval(widgetTimer);
+			// Whatever ended the run: no task clock keeps running, and the time is stored.
+			for (const taskState of loopState.tasks) {
+				if (taskState.clockStart !== undefined) stopClock(taskState);
+			}
 		}
 	})();
 

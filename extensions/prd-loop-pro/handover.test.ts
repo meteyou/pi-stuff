@@ -38,7 +38,7 @@ describe("buildHandoverPrompt", () => {
 		assert.match(prompt, /Do not change anything before I agree/);
 		assert.match(prompt, /Splitting an existing task into subtasks/);
 		assert.match(prompt, /re-open it if it was split or rewritten/);
-		assert.doesNotMatch(prompt, /Errors:|Subagent logs|Split proposed|open review finding/);
+		assert.doesNotMatch(prompt, /Errors:|Subagent sessions|Split proposed|open review finding/);
 	});
 
 	it("includes errors (capped), summary, proposed split, findings and logs", () => {
@@ -47,7 +47,7 @@ describe("buildHandoverPrompt", () => {
 			summary: "y".repeat(HANDOVER_MAX_TEXT_LENGTH + 100),
 			proposedSplit: [{ title: "Allocator", description: "6 functions" }, { title: "Surfaces", description: "" }],
 			openFindings: 2,
-			logFiles: ["/logs/001.jsonl"],
+			sessions: ["Implement: /sessions/2026_0193abc.jsonl"],
 		}));
 		assert.match(prompt, /^ {2}- error 0 line 2$/m);
 		assert.match(prompt, /^ {2}- … and 2 more \(see the todo\)$/m);
@@ -55,7 +55,8 @@ describe("buildHandoverPrompt", () => {
 		assert.match(prompt, /^ {2}1\. Allocator — 6 functions$/m);
 		assert.match(prompt, /^ {2}2\. Surfaces$/m);
 		assert.match(prompt, /^- 2 open review findings/m);
-		assert.match(prompt, /^ {2}- \/logs\/001\.jsonl$/m);
+		assert.match(prompt, /^- Subagent sessions \(JSONL transcripts/m);
+		assert.match(prompt, /^ {2}- Implement: \/sessions\/2026_0193abc\.jsonl$/m);
 	});
 });
 

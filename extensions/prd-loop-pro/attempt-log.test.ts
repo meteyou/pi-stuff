@@ -58,15 +58,15 @@ describe("buildAttemptEntry", () => {
 			errors: ["cargo test failed\n  left: 1\n  right: 2", " "],
 			summary: "Ported 40 of 160 functions.",
 			snapshot: { ref: "abc123", message: "prd-loop-pro: Task 17a/20 — retry task" },
-			logFiles: ["/logs/001-17a-20-implement.jsonl"],
+			sessions: ["Implement:   `pi --session 0193abc`"],
 		}));
 		assert.equal(text, [
 			"### 2026-11-13 23:30 — Implement: implementation failed after 2 attempts",
 			"",
 			"- **Action:** Retry task (changes discarded, restarted at implement)",
 			'- **Snapshot of the discarded changes:** git stash `abc123` ("prd-loop-pro: Task 17a/20 — retry task") — restore with `git stash apply abc123`',
-			"- **Subagent logs:**",
-			"  - `/logs/001-17a-20-implement.jsonl`",
+			"- **Subagent sessions:**",
+			"  - Implement: `pi --session 0193abc`",
 			"- **Summary:** Ported 40 of 160 functions.",
 			"- **Errors:**",
 			"  - cargo test failed",
@@ -78,7 +78,7 @@ describe("buildAttemptEntry", () => {
 
 	it("omits empty parts and truncates long texts", () => {
 		const text = buildAttemptEntry(entry({ errors: ["x".repeat(ATTEMPT_MAX_TEXT_LENGTH + 500)] }));
-		assert.doesNotMatch(text, /Snapshot|Subagent logs|Summary/);
+		assert.doesNotMatch(text, /Snapshot|Subagent sessions|Summary/);
 		assert.ok(text.length < ATTEMPT_MAX_TEXT_LENGTH + 300);
 		assert.match(text, /…$/);
 	});

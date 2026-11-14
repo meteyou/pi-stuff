@@ -4,7 +4,7 @@
  * Every pause that is a failure (or that ends with a destructive / final
  * action) is recorded in the task todo under `## Failed Attempts`: phase,
  * reason, errors, the implementer's summary, the chosen action, the snapshot
- * of discarded changes and the subagent log files. The record survives
+ * of discarded changes and the sessions of the subagent runs. The record survives
  * "Retry task", "Skip task" and "Abort", so a later session can see why a
  * task did not go through.
  *
@@ -33,8 +33,8 @@ export interface AttemptEntry {
 	summary?: string;
 	/** Snapshot of the discarded changes (git stash). */
 	snapshot?: { ref: string; message: string };
-	/** Subagent log files of the attempt. */
-	logFiles?: string[];
+	/** Sessions of the subagent runs of the attempt, e.g. "Implement (attempt 2): `pi --session <id>`". */
+	sessions?: string[];
 }
 
 /**
@@ -86,10 +86,10 @@ export function buildAttemptEntry(entry: AttemptEntry): string {
 				`restore with \`git stash apply ${entry.snapshot.ref}\``,
 		);
 	}
-	const logs = (entry.logFiles ?? []).filter((file) => file.trim());
-	if (logs.length > 0) {
-		out.push("- **Subagent logs:**");
-		for (const file of logs) out.push(`  - \`${file}\``);
+	const sessions = (entry.sessions ?? []).filter((session) => session.trim());
+	if (sessions.length > 0) {
+		out.push("- **Subagent sessions:**");
+		for (const session of sessions) out.push(`  - ${oneLine(session)}`);
 	}
 	if (entry.summary?.trim()) out.push(listItem(`**Summary:** ${entry.summary}`, ""));
 	const errors = (entry.errors ?? []).filter((error) => error.trim());

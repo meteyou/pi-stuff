@@ -5,7 +5,7 @@
  * `needs-human`. So that the main agent does not have to reconstruct what
  * happened, the loop puts a prepared prompt into the editor after the overlay
  * is closed: task, PRD, phase, reason, errors, the implementer's summary and
- * split proposal, and the subagent log files. The prompt is not sent
+ * split proposal, and the sessions of the subagent runs. The prompt is not sent
  * automatically; the human can edit or discard it.
  *
  * Only erasable TypeScript syntax is used (`node --test` type stripping).
@@ -34,7 +34,8 @@ export interface HandoverInfo {
 	proposedSplit?: ProposedPart[];
 	/** Number of open review findings appended to the todo. */
 	openFindings?: number;
-	logFiles?: string[];
+	/** Sessions of the subagent runs, e.g. "Implement (attempt 2): /path/to/session.jsonl". */
+	sessions?: string[];
 }
 
 function clip(text: string): string {
@@ -71,10 +72,10 @@ export function buildHandoverPrompt(info: HandoverInfo): string {
 	if (info.openFindings && info.openFindings > 0) {
 		lines.push(`- ${info.openFindings} open review finding${info.openFindings === 1 ? "" : "s"} (see "Open Findings" in the todo)`);
 	}
-	const logs = (info.logFiles ?? []).filter((file) => file.trim());
-	if (logs.length > 0) {
-		lines.push("- Subagent logs (JSONL: prompt, messages, tool calls, result):");
-		for (const file of logs) lines.push(`  - ${file}`);
+	const sessions = (info.sessions ?? []).filter((session) => session.trim());
+	if (sessions.length > 0) {
+		lines.push("- Subagent sessions (JSONL transcripts: prompt, messages, tool calls, result):");
+		for (const session of sessions) lines.push(`  - ${session}`);
 	}
 	lines.push("- The uncommitted changes of the attempt are still on disk (see `git status`).");
 
@@ -82,7 +83,7 @@ export function buildHandoverPrompt(info: HandoverInfo): string {
 		"",
 		"Please:",
 		"",
-		`1. Read the task todo ${info.taskId} (incl. its "Failed Attempts" / "Open Findings" sections) and the uncommitted changes; use the logs if the reason is unclear. Find out why the loop could not finish the task.`,
+		`1. Read the task todo ${info.taskId} (incl. its "Failed Attempts" / "Open Findings" sections) and the uncommitted changes; use the subagent sessions if the reason is unclear. Find out why the loop could not finish the task.`,
 		"2. Tell me what you found and propose how to proceed. Do not change anything before I agree. Typical ways out:",
 		"   - fix the problem here and leave the changes uncommitted,",
 		'   - split the task into smaller subtasks (prd-to-todos skill, "Splitting an existing task into subtasks"),',
