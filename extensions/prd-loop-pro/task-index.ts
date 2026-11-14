@@ -14,6 +14,8 @@
  * Only erasable TypeScript syntax is used (`node --test` type stripping).
  */
 
+import type { TaskStats } from "./task-stats.ts";
+
 /** Todo status of a task released to a human ("Release (fix manually)"). */
 export const NEEDS_HUMAN_STATUS = "needs-human";
 
@@ -32,6 +34,8 @@ export interface TaskInfo {
 	body: string;
 	blockedBy: string[];
 	sequenceLabel: string; // e.g. "1/8"
+	/** Statistics stored in the todo by earlier loop runs (see ./task-stats.ts). */
+	stats?: TaskStats;
 }
 
 /**

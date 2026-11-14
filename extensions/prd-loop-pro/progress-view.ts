@@ -313,6 +313,8 @@ export function buildTaskDetailLines(input: {
 	review?: TaskReviewProgress;
 	reviewNote?: string;
 	phaseCosts?: Partial<Record<CostPhase, number>>;
+	/** Formatted token counts of all subagent runs of the task (e.g. `1.2M in • 85.0k out`). */
+	tokens?: string;
 }): TaskDetailLine[] {
 	const lines: TaskDetailLine[] = [];
 	const review = input.review;
@@ -328,6 +330,7 @@ export function buildTaskDetailLines(input: {
 	if (input.phaseCosts && totalCost(input.phaseCosts) > 0) {
 		lines.push({ label: "Cost", text: formatPhaseCosts(input.phaseCosts) });
 	}
+	if (input.tokens?.trim()) lines.push({ label: "Tokens", text: input.tokens.trim() });
 	return lines;
 }
 

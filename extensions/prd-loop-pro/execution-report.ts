@@ -79,6 +79,22 @@ export interface ExecutionRecord {
 	commits: CommitRef[];
 	/** Cost in USD per phase; missing phases count as 0. */
 	cost: Partial<Record<CostPhase, number>>;
+	/** Formatted active time of the task (without time spent in dialogs), e.g. `1:23:45`. */
+	time?: string;
+	/** Formatted token counts of all subagent runs, e.g. `1.2M in • 85.0k out`. */
+	tokens?: string;
+	/** Stored sessions of the subagent runs (oldest first). */
+	sessions?: SessionRef[];
+}
+
+/** Stored pi session of one subagent run. */
+export interface SessionRef {
+	/** Session id (`pi --session <id>`). */
+	id: string;
+	/** Phase header of the run, e.g. `Implement (attempt 2)`. */
+	label: string;
+	/** Model + thinking level of the run. */
+	model?: string;
 }
 
 export const EXECUTION_REPORT_HEADING = "## Execution Report";
@@ -216,6 +232,8 @@ export function buildExecutionReport(record: ExecutionRecord): string {
 	);
 	out.push(`- **Commits:** ${record.commits.length}`);
 	out.push(`- **Cost:** ${formatCostLine(record.cost)}`);
+	if (record.time?.trim()) out.push(`- **Time:** ${oneLine(record.time)} (active, without time spent in dialogs)`);
+	if (record.tokens?.trim()) out.push(`- **Tokens:** ${oneLine(record.tokens)}`);
 	out.push("");
 
 	out.push("### Implementer summary", "", record.implementerSummary.trim() || NONE, "");
@@ -257,6 +275,20 @@ export function buildExecutionReport(record: ExecutionRecord): string {
 	);
 	out.push(section("Human reviewer callouts", dedupe(record.callouts).map((callout) => `- ${callout}`)), "");
 	out.push(section("Commits", record.commits.map(formatCommit)));
+
+	const sessions = (record.sessions ?? []).filter((session) => session.id.trim());
+	if (sessions.length > 0) {
+		out.push(
+			"",
+			"### Sessions",
+			"",
+			"Open one with `pi --session <id>` or with the *sessions* action of this todo in `/todos`.",
+			"",
+			sessions
+				.map((session) => `- \`${session.id}\` ${oneLine(session.label)}${session.model ? ` — ${oneLine(session.model)}` : ""}`)
+				.join("\n"),
+		);
+	}
 
 	return out.join("\n");
 }
