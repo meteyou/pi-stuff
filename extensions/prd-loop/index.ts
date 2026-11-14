@@ -562,6 +562,10 @@ export async function spawnSubagent(options: {
 	let settled = false;
 	let stderr = "";
 	let wasAborted = false;
+	/** Set if the process could not be started or signalled (e.g. `pi` not on PATH, prompt too long). */
+	let spawnError: Error | undefined;
+	/** Signal that ended the process, if it did not exit on its own. */
+	let exitSignal: NodeJS.Signals | null | undefined;
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
@@ -696,15 +700,18 @@ export async function spawnSubagent(options: {
 				stderr += data.toString();
 			});
 
-			proc.on("close", (code: number | null) => {
+			proc.on("close", (code: number | null, closeSignal: NodeJS.Signals | null) => {
 				// Process remaining buffer
 				if (buffer.trim()) processLine(buffer);
 				if (agentEndExitTimer) clearTimeout(agentEndExitTimer);
-				safeResolve(code ?? 0);
+				// code === null: the process was killed by a signal — not a clean exit.
+				exitSignal = closeSignal;
+				safeResolve(code ?? 1);
 			});
 
-			proc.on("error", () => {
+			proc.on("error", (err: Error) => {
 				if (agentEndExitTimer) clearTimeout(agentEndExitTimer);
+				spawnError = err;
 				safeResolve(1);
 			});
 
@@ -744,9 +751,14 @@ export async function spawnSubagent(options: {
 		// Handle non-zero exit code — but if we received agent_settled, the agent
 		// DID complete; the non-zero code is likely from post-agent cleanup.
 		if (exitCode !== 0 && !settled) {
+			const exitCause = spawnError
+				? `Failed to run subagent: ${spawnError.message}`
+				: exitSignal
+					? `Subagent was killed by signal ${exitSignal}`
+					: `Subagent exited with code ${exitCode}`;
 			return {
 				success: false,
-				errors: [`Subagent exited with code ${exitCode}${stderr ? `: ${stderr.trim()}` : ""}`],
+				errors: [`${exitCause}${stderr ? `: ${stderr.trim()}` : ""}`],
 				summary: "Subagent process failed",
 				usage,
 			};
