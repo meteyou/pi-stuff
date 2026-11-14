@@ -4194,7 +4194,7 @@ export async function runOrchestratorLoop(
 				}
 
 				if (outcome.kind === "released") {
-					return releaseTask(task, taskState, outcome.request);
+					return await releaseTask(task, taskState, outcome.request);
 				}
 				if (outcome.kind === "split") {
 					// The task is now the close-out of its subtasks: it runs again after them.
