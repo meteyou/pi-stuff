@@ -14,7 +14,9 @@ Compared to `/prd-loop`:
 - a task that is **too large or blocked** is reported as such by the implementer and can be **split into subtasks**
   from the pause menu; the loop then continues with the subtasks
 - nothing is lost on a failure: discarded changes are **saved as a git stash**, every failed attempt is **recorded in
-  the task todo** and every subagent run is **logged**
+  the task todo** and every subagent run is a **stored pi session**
+- **time, tokens, cost and sessions are saved in the task todos**, so they are still there after a restart and every
+  run can be opened again
 - invalid subagent JSON is **repaired** (deterministically, then via the orchestrator model) instead of aborting the run
 - commits are always clean Conventional Commits made by a committer agent (no simple fallback commit, no
   `Refs:`/`Task:` footers)
@@ -249,11 +251,45 @@ the loop and one made by hand in the main session look alike.
 | What | Where | Purpose |
 |------|-------|---------|
 | **Snapshot before every discard** | git stash, message `prd-loop-pro: Task <label> — <retry task \| skip task \| split> (<time>)` | *Retry task*, *Skip task* and *Split task* can be undone: `git stash apply <ref>` (the ref is shown in a notification and recorded in the todo). If the stash cannot be created, nothing is discarded. |
-| **Failed attempts in the todo** | `## Failed Attempts` section of the task todo | Phase, reason, errors, the last subagent summary, the chosen action, the stash ref and the log files. Written for every failure pause, and for a manual or round-limit pause that ends the attempt (retry task, skip task, split, release, abort). |
-| **Subagent run logs** | `~/.pi/agent/prd-loop-pro/logs/<project>/<run>/<nnn>-<task>-<phase>.jsonl` | One JSONL file per subagent run: prompt, all completed messages (incl. tool calls and results), compaction and auto-retry events, final status, error, usage and stderr. Outside the project, so never reviewed, committed or discarded. The newest 30 runs per project are kept. |
+| **Failed attempts in the todo** | `## Failed Attempts` section of the task todo | Phase, reason, errors, the last subagent summary, the chosen action, the stash ref and the sessions of the subagent runs. Written for every failure pause, and for a manual or round-limit pause that ends the attempt (retry task, skip task, split, release, abort). |
+| **Subagent sessions** | pi's session folder of the project | Every subagent run is a normal, named pi session with the full transcript (see [Statistics and sessions](#statistics-and-sessions)). |
 
 A subagent run that ends with a model/provider error (overloaded, rate limit, quota, …) after pi's own retries is
 reported as failed with that error; an earlier assistant text is never mistaken for its result.
+
+## Statistics and sessions
+
+What the loop spends on a task is saved in the task todo, so it survives a restart of the loop or of pi.
+
+**Stored in the todo** (JSON front matter, field `prd_loop`, kept on one line; the markdown body that agents read is
+not touched):
+
+- the **active time** on the task,
+- one record per **subagent run**: phase, label (`Implement (attempt 2)`, `Review #1`, …), session id, model +
+  thinking level, start, duration, tokens (input, output, cache read, cache write) and cost,
+- the review progress (rounds and finding counts).
+
+It is written after every subagent run, so an abort or a crash loses nothing. At the next start the overlay shows
+time, cost, tokens and review rounds of the tasks from earlier runs again, and the header shows the **PRD total**
+(cost and active time of all tasks over all runs) next to the numbers of the current run. The summary entry in the
+chat keeps counting the current run only. The Execution Report of a task additionally lists time, tokens and all
+sessions.
+
+**The clock stops while a dialog waits for you.** The task time and the elapsed time of the loop do not run while a
+pause menu or the split confirmation is open; they continue when you choose an option. The run settings dialog (`s`)
+does not stop them, because the subagent keeps working.
+
+**Sessions.** Subagents no longer run with `--no-session`. Every run is a normal pi session of the project with an
+id chosen by the loop and a name like `PRD #1 - Task 17a1/20 · Implement (attempt 2)`:
+
+- pi's session statistics count their tokens and cost,
+- `/resume` lists them (recognisable by the name),
+- `/todos` → select the task → **sessions** lists the runs of that task and switches to the one you pick,
+- `pi --session <id>` opens one from the shell; the ids are in the Execution Report and in `## Failed Attempts`.
+
+Closed todos are deleted by the todo garbage collection after `gcDays` (default 7 days after creation), and the
+statistics go with them. Set `"gc": false` in `.pi/todos/settings.json` to keep them (see the
+[todos extension](../todos/README.md#settings)).
 
 ## Needs-Human Resume Flow
 
@@ -265,7 +301,8 @@ reported as failed with that error; an earlier assistant text is never mistaken 
 3. The loop stops; uncommitted changes stay on disk.
 4. When you close the overlay, a **prepared prompt** for the main session is put into the editor (it is not sent, and
    an editor that already contains text is left alone). It names the task, the PRD, the phase, the reason, the errors,
-   the last subagent summary, the implementer's split proposal and the log files, and asks the agent to find the cause
+   the last subagent summary, the implementer's split proposal and the session files of the subagent runs, and asks
+   the agent to find the cause
    and propose a way out (fix, split or rewrite the task) before changing anything.
 
 `needs-human` is **not** closed: the task and all tasks depending on it are held back until it is resolved. Fix the
@@ -286,7 +323,8 @@ continues with the next task of the PRD.
 ## UI
 
 - **Live overlay** — task rows show the current phase and round (e.g. `Review 2/3`, `Fix #1 • 3 findings`). Expanded
-  task details show the review round counter, fixed/rejected/deferred/unresolved counts and the cost per phase.
+  task details show the review round counter, fixed/rejected/deferred/unresolved counts, the cost per phase and the
+  tokens. Time and cost include earlier loop runs (see [Statistics and sessions](#statistics-and-sessions)).
   Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
   `a` expand/collapse all, `o` output viewer, `s` change models/thinking while running (see
   [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `Ctrl+C` pause, `Esc` (twice) abort.
@@ -344,7 +382,8 @@ If both fail, the loop pauses (*JSON repair failed*).
 | `execution-report.ts` | Execution report and open-findings sections (pure) |
 | `pause.ts` | Pause reasons, menu options and labels (pure) |
 | `attempt-log.ts` | `## Failed Attempts` section of the task todo (pure) |
-| `run-log.ts` | Subagent run logs (JSONL files outside the project) |
+| `task-stats.ts` | Statistics stored in the task todo: time, runs, tokens, cost, sessions (pure) |
+| `session-files.ts` | Find the stored session file of a subagent run |
 | `task-split.ts` | Split a task into subtasks: labels, todo bodies, close-out task, PRD Task Index rows (pure) |
 | `splitter-prompt.ts` | Prompt builder for the splitter (pure) |
 | `handover.ts` | Prepared prompt for the main session after *Release / hand over* (pure) |

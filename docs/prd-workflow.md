@@ -212,7 +212,11 @@ implementer reports the task as blocked, a subagent result can't be repaired int
 hook fails, or you press `Ctrl+C`, it opens a pause menu (e.g. *Resume*, *Retry phase*, *Retry task*, *Split task*,
 *One more round*, *Commit as-is*, *Skip task*, *Abort*). Discarding changes never touches `.pi/`, and everything else
 is saved as a git stash first, so a discard can be undone. Every failed attempt is recorded in the task todo
-(`## Failed Attempts`) and every subagent run is logged.
+(`## Failed Attempts`) and every subagent run is a stored pi session.
+
+Time, tokens, cost and the sessions of every subagent run are saved in the task todos: after a restart the overlay
+shows them again, and `/todos` → task → **sessions** opens the session of a run. The clock stops while a pause menu
+waits for you.
 
 **Task too large?** The implementer reports a task it cannot finish in one run as *blocked* instead of grinding on it.
 **Split task** lets a splitter propose smaller subtasks (`Task 17/20` → `17a/20`, `17b/20`, …); after you confirm, the
