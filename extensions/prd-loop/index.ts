@@ -32,6 +32,7 @@ import {
 import type { SummaryEntryLine, SummaryInput, SummaryOutcome, TaskStatus } from "./summary.ts";
 import { arrowNavigation, clampScroll, findTaskBlock, revealBlock } from "./overlay-scroll.ts";
 import type { RowBlock } from "./overlay-scroll.ts";
+import { extractShortTitle, parseSequenceLabel, sequenceDepth, sortBySequence, subtaskProgress } from "../prd-loop-pro/task-sequence.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -824,14 +825,6 @@ export function parseBlockedBy(body: string): string[] {
 }
 
 /**
- * Extract the sequence label (e.g. "2/8") from a task title.
- */
-function parseSequenceLabel(title: string): string {
-	const match = title.match(/Task\s+(\d+\/\d+)/i);
-	return match ? match[1] : "?/?";
-}
-
-/**
  * Fetch all tasks for a given PRD tag and parse their dependencies.
  */
 export async function fetchPrdTasks(cwd: string, prdTag: string): Promise<TaskInfo[]> {
@@ -1259,14 +1252,6 @@ export function buildContinuePrompt(task: TaskInfo, prdId: string): string {
 	].join("\n");
 }
 
-/**
- * Extract the short title from a task title (removes "PRD #N - Task M/T: " prefix).
- */
-function extractShortTitle(title: string): string {
-	const match = title.match(/Task\s+\d+\/\d+:\s*(.*)/i);
-	return match ? match[1].trim() : title;
-}
-
 const COMMIT_SCOPE_STOP_WORDS = new Set([
 	"a", "an", "and", "the", "to", "in", "on", "for", "from", "of", "with", "by", "at", "into", "as",
 	"add", "adds", "added", "implement", "implements", "implemented", "integrate", "integrates", "integrated",
@@ -1633,6 +1618,8 @@ class PrdLoopOverlayComponent {
 			const isExpanded = this.expanded.has(i);
 			const prefix = isSelected ? this.theme.fg("accent", "▶") : " ";
 			const disclosure = this.theme.fg(isSelected ? "accent" : "dim", isExpanded ? "▾" : "▸");
+			// Split subtasks (17a, 17a1, …) are indented below their parent task.
+			const indent = "  ".repeat(sequenceDepth(task.sequenceLabel));
 			const icon = this.theme.fg(taskStatusColor(task.status), statusIcon(task.status));
 			const titleText = `Task ${task.sequenceLabel}: ${extractShortTitle(task.title)}`;
 			const title = isSelected
@@ -1646,12 +1633,14 @@ class PrdLoopOverlayComponent {
 			}
 			if (task.cost > 0) meta.push(`$${task.cost.toFixed(2)}`);
 			if (task.retries > 0) meta.push(`${task.retries} retry${task.retries === 1 ? "" : "s"}`);
+			const subtasks = subtaskProgress(task, this.state.tasks, (t) => t.status === "completed");
+			if (subtasks) meta.push(`subtasks ${subtasks.done}/${subtasks.total} done`);
 			const metaText = meta.length > 0 ? this.theme.fg("dim", ` • ${meta.join(" • ")}`) : "";
 
 			rows.push({
 				taskIndex: i,
 				kind: "header",
-				text: truncateToWidth(`${prefix} ${disclosure} ${icon} ${title}${metaText}`, width),
+				text: truncateToWidth(`${prefix} ${indent}${disclosure} ${icon} ${title}${metaText}`, width),
 			});
 
 			if (!isExpanded) continue;
@@ -2144,12 +2133,8 @@ async function runOrchestratorLoop(
 		return;
 	}
 
-	const allTasksSorted = [...resolution.allTasks].sort((a, b) => {
-		const aNum = parseFloat(a.sequenceLabel.split("/")[0]) || 999;
-		const bNum = parseFloat(b.sequenceLabel.split("/")[0]) || 999;
-		if (aNum !== bNum) return aNum - bNum;
-		return a.title.localeCompare(b.title);
-	});
+	// Hierarchical order: split subtasks (17a, 17a1, …) follow their parent task.
+	const allTasksSorted = sortBySequence(resolution.allTasks);
 
 	const loopState: LoopState = {
 		startTime: Date.now(),
