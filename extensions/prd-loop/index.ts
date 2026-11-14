@@ -33,6 +33,8 @@ import type { SummaryEntryLine, SummaryInput, SummaryOutcome, TaskStatus } from 
 import { arrowNavigation, clampScroll, findTaskBlock, revealBlock } from "./overlay-scroll.ts";
 import type { RowBlock } from "./overlay-scroll.ts";
 import { extractShortTitle, parseSequenceLabel, sequenceDepth, sortBySequence, subtaskProgress } from "../prd-loop-pro/task-sequence.ts";
+import { discardChanges, snapshotChanges } from "../prd-loop-pro/discard.ts";
+import { serializeFrontMatter } from "../prd-loop-pro/task-stats.ts";
 
 /** Extension directory for locating agent definition files. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1003,7 +1005,9 @@ async function updateTodoFileStatus(cwd: string, todoId: string, newStatus: stri
 	const meta = JSON.parse(split.jsonStr);
 	meta.status = newStatus;
 
-	writeFileSync(filePath, JSON.stringify(meta, null, 2) + split.body, "utf-8");
+	// `split.body` starts after the line break that ends the front matter. Fields
+	// written by /prd-loop-pro (statistics) are kept in their one-line form.
+	writeFileSync(filePath, `${serializeFrontMatter(meta)}\n${split.body}`, "utf-8");
 }
 
 /**
@@ -1978,8 +1982,8 @@ async function showPauseMenu(ctx: ExtensionCommandContext, task: TaskInfo): Prom
 	const options = [
 		"Resume — keep changes, continue where it left off",
 		"Release session — fix manually, re-run /prd-loop to continue",
-		"Retry task — discard changes, try again from scratch",
-		"Skip task — discard changes, mark done, continue with next",
+		"Retry task — discard changes (saved as git stash, .pi/ is kept), try again from scratch",
+		"Skip task — discard changes (saved as git stash, .pi/ is kept), mark done, continue with next",
 		"Abort loop — stop and keep changes on disk",
 	];
 
@@ -2159,6 +2163,31 @@ async function runOrchestratorLoop(
 	};
 
 	const prdTitle = prd.title;
+	/**
+	 * Discard all uncommitted changes outside `.pi/` ("Retry task", "Skip task").
+	 * They are saved as a git stash first, so the discard can be undone; if that
+	 * fails, nothing is discarded. `.pi/` (todos) is never touched.
+	 */
+	const discardTaskChanges = async (task: TaskInfo, what: string): Promise<void> => {
+		const git = (args: string[]) => pi.exec("git", args, { cwd: ctx.cwd });
+		const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+		let snapshot;
+		try {
+			snapshot = await snapshotChanges(git, `prd-loop: Task ${task.sequenceLabel} — ${what} (${stamp} UTC)`);
+		} catch (err) {
+			throw new Error(
+				`Could not save the uncommitted changes as a git stash, so nothing was discarded: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		await discardChanges(git);
+		if (snapshot) {
+			ctx.ui.notify(
+				`💾 Changes of Task ${task.sequenceLabel} were saved before the discard — restore with: git stash apply ${snapshot.ref}`,
+				"info",
+			);
+		}
+	};
+
 	let currentAbortController = new AbortController();
 	let aborted = false;
 	let pauseRequested = false;
@@ -2427,8 +2456,7 @@ async function runOrchestratorLoop(
 								};
 
 							case "retry":
-								await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+								await discardTaskChanges(task, "retry task");
 								currentAbortController = new AbortController();
 								currentPrompt = initialPrompt;
 								retriesRemaining = config.retryFixes;
@@ -2447,8 +2475,7 @@ async function runOrchestratorLoop(
 								continue;
 
 							case "skip": {
-								await pi.exec("git", ["checkout", "."], { cwd: ctx.cwd });
-								await pi.exec("git", ["clean", "-fd"], { cwd: ctx.cwd });
+								await discardTaskChanges(task, "skip task");
 								currentAbortController = new AbortController();
 								taskState.status = "completed";
 								taskState.endTime = Date.now();

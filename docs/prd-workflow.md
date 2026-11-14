@@ -122,7 +122,9 @@ The extension:
    tasks and the totals, `Ctrl+O` expands it to all tasks
 
 While the loop is running, `Ctrl+C` pauses the current subagent and opens a pause menu (*Resume*, *Release session*,
-*Retry task*, *Skip task*, *Abort loop*); `Esc` (twice) closes the overlay and aborts the loop.
+*Retry task*, *Skip task*, *Abort loop*); `Esc` (twice) closes the overlay and aborts the loop. *Retry task* and *Skip
+task* discard the uncommitted changes: they are saved as a git stash first (the restore command is shown), and `.pi/`
+is never touched.
 
 #### Commands
 
