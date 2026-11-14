@@ -151,7 +151,7 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 	switch (action) {
 		case "resume":
 			switch (phase) {
-				case "Implement": return "Resume current phase — keep changes, continue the implementation where it left off";
+				case "Implement": return "Resume current phase — keep changes, continue the implementation in the same session";
 				case "Review": return "Resume current phase — keep changes, restart the review";
 				case "Fix": return "Resume current phase — keep changes, restart the fixer for the open findings";
 				case "Commit": return "Resume current phase — keep changes, run the committer again";

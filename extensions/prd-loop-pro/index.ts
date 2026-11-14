@@ -106,6 +106,7 @@ import {
 import type { CommitRef, CostPhase, ExecutionRecord, RejectedFinding, UnresolvedFinding } from "./execution-report.ts";
 import {
 	checkGitClean,
+	findInterruptedTask,
 	isNeedsHuman,
 	isTaskClosed,
 	NEEDS_HUMAN_STATUS,
@@ -1092,13 +1093,24 @@ function formatHeldTasks(held: TaskInfo[]): string {
 // --- Needs-human resolution ---
 
 /** How a `needs-human` task is resolved at start. */
-type NeedsHumanAction = "commit" | "close" | "review" | "reopen" | "not-now";
+type NeedsHumanAction = "continue" | "commit" | "close" | "review" | "reopen" | "not-now";
 
-/** A `needs-human` task to resolve inside the orchestrator loop (runs first). */
+/**
+ * A task to pick up again inside the orchestrator loop (runs first): a
+ * `needs-human` task that is being resolved, or an open task whose run was
+ * interrupted (abort, quit, shutdown) and left uncommitted changes.
+ */
 interface NeedsHumanResume {
 	taskId: string;
-	/** "commit" = commit phase only; "review" = review-fix cycle, then commit. */
-	mode: "commit" | "review";
+	/**
+	 * "implement" = continue the implementation (resume the implementer's
+	 * session on the changes on disk), then the normal pipeline;
+	 * "review" = review-fix cycle on the changes, then commit;
+	 * "commit" = commit phase only.
+	 */
+	mode: "implement" | "commit" | "review";
+	/** True for an interrupted open task (not released to a human). */
+	interrupted?: boolean;
 }
 
 interface NeedsHumanTask {
@@ -1144,8 +1156,9 @@ async function showNeedsHumanMenu(
 			? "The working tree has uncommitted changes (assumed to be your work on this task)."
 			: "The working tree is clean.",
 	];
-	const actions: NeedsHumanAction[] = ["commit", "close", "review", "reopen", "not-now"];
+	const actions: NeedsHumanAction[] = ["continue", "commit", "close", "review", "reopen", "not-now"];
 	const labels: Record<NeedsHumanAction, string> = {
+		continue: "Continue implementation — resume the implementer's session on the current changes, then review, commit & close",
 		commit: "Commit changes (committer) & close — then continue with the next task",
 		close: "Already committed – just close — then continue with the next task",
 		review: "Review again — run the review-fix cycle on the current changes, then commit & close",
@@ -1200,10 +1213,57 @@ async function reopenNeedsHumanTask(cwd: string, entry: NeedsHumanTask): Promise
 	await syncPrdTaskIndexFile(cwd, prdId, await fetchPrdTasks(cwd, entry.prdTag));
 }
 
+/**
+ * The open task whose loop run was interrupted (abort, quit or shutdown in
+ * the middle of a task), if any: the task with the most recent subagent run
+ * that is neither closed nor released. Optionally restricted to one PRD.
+ */
+export async function getInterruptedTask(cwd: string, prdTag: string | null): Promise<NeedsHumanTask | undefined> {
+	const todos = await readAllTodos(cwd);
+	const candidates = todos
+		.filter((todo) => todo.tags.includes("task"))
+		.map((todo) => ({ todo, status: todo.status, stats: parseStats(todo.stats), prdTag: todo.tags.find((t) => /^prd-\d+$/.test(t)) }))
+		.filter((entry) => entry.prdTag && (!prdTag || entry.prdTag === prdTag));
+	const interrupted = findInterruptedTask(candidates);
+	if (!interrupted) return undefined;
+	return {
+		task: interrupted.todo,
+		taskId: interrupted.todo.id.startsWith("TODO-") ? interrupted.todo.id : `TODO-${interrupted.todo.id}`,
+		prdTag: interrupted.prdTag!,
+		prd: todos.find((t) => t.tags.includes("prd") && t.tags.includes(interrupted.prdTag!)),
+	};
+}
+
+/**
+ * Ask how to go on with an interrupted task whose uncommitted changes are
+ * still on disk. Cancelling the dialog = don't start the loop.
+ */
+async function showInterruptedTaskMenu(
+	ctx: ExtensionCommandContext,
+	entry: NeedsHumanTask,
+): Promise<NeedsHumanResume["mode"] | undefined> {
+	const lastRun = parseStats(entry.task.stats).runs.at(-1);
+	const when = lastRun?.startedAt ? localTimestamp(new Date(lastRun.startedAt)) : "";
+	const title = [
+		`⏯️  Interrupted task — ${entry.task.title}`,
+		entry.prd ? `PRD: ${entry.prd.title}` : `PRD: ${entry.prdTag}`,
+		lastRun ? `Last run: ${lastRun.label}${when ? `, started ${when}` : ""}` : "",
+		"",
+		"The working tree has uncommitted changes and the last loop run stopped in the middle of this task.",
+	].filter((line, index) => line !== "" || index === 3).join("\n");
+	const options: Array<{ mode: NeedsHumanResume["mode"]; label: string }> = [
+		{ mode: "implement", label: "Continue implementation — resume the implementer's session on the changes on disk, then review & commit" },
+		{ mode: "review", label: "Review & commit the changes — the implementation is complete; run the review-fix cycle on it" },
+	];
+	const cancel = "Cancel — don't start the loop";
+	const choice = await ctx.ui.select(title, [...options.map((option) => option.label), cancel]);
+	return options.find((option) => option.label === choice)?.mode;
+}
+
 /** Outcome of offering the `needs-human` tasks at start. */
 interface NeedsHumanStartResult {
 	/** Task to resolve inside the loop ("Commit changes" / "Review again"). */
-	resume?: { entry: NeedsHumanTask; mode: NeedsHumanResume["mode"] };
+	resume?: { entry: NeedsHumanTask; mode: NeedsHumanResume["mode"]; interrupted?: boolean };
 	/** PRD tag of the last task closed via "Already committed – just close" or re-opened via "Re-open". */
 	closedPrdTag?: string;
 }
@@ -1255,6 +1315,9 @@ async function offerNeedsHumanTasks(
 				result.closedPrdTag = entry.prdTag;
 				ctx.ui.notify(`🔓 Re-opened ${entry.taskId} (${extractShortTitle(entry.task.title)}).`, "info");
 				continue;
+			case "continue":
+				result.resume = { entry, mode: "implement" };
+				return result;
 			case "commit":
 			case "review":
 				result.resume = { entry, mode: action };
@@ -1331,6 +1394,23 @@ export function buildContinuePrompt(task: TaskInfo, prdId: string): string {
 		`A previous attempt was interrupted. The partial changes are still on disk (uncommitted).`,
 		`Run \`git diff\` to see what was already done, then continue from where it left off.`,
 		`Do not redo work that is already complete.`,
+	].join("\n");
+}
+
+/**
+ * Prompt that continues the implementer's own session (same pi session, full
+ * context of the earlier run) after an interruption: a manual pause, an
+ * aborted loop, a quit or a shutdown.
+ */
+export function buildSessionContinuePrompt(): string {
+	return [
+		`## ℹ️ Continuation`,
+		``,
+		`Your run on this task was interrupted before you finished. Your changes are still on disk (uncommitted).`,
+		`Some time may have passed, and your last step may not have completed: check the current state first`,
+		`(\`git status\`, \`git diff\`, re-read files you were editing), then continue where you left off and finish the task.`,
+		`Do not redo work that is already complete. The rules and the output format are unchanged:`,
+		`end with the JSON result as your very last message.`,
 	].join("\n");
 }
 
@@ -2311,7 +2391,8 @@ export async function runOrchestratorLoop(
 	const splitterAgent = await loadAgent(EXTENSION_DIR, "prd-splitter");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
-	const resume = options.resume && tasks.some((t) => t.id === options.resume!.taskId && isNeedsHuman(t.status))
+	const resume = options.resume &&
+		tasks.some((t) => t.id === options.resume!.taskId && (options.resume!.interrupted ? !isTaskClosed(t.status) : isNeedsHuman(t.status)))
 		? options.resume
 		: undefined;
 	const resolution = resolveTaskOrder(tasks, { resolvingTaskId: resume?.taskId });
@@ -2723,7 +2804,7 @@ export async function runOrchestratorLoop(
 		step: StepKey,
 		taskState: LoopTaskState,
 		output: { ref: PhaseRef; note?: string },
-		run: { taskPrompt: string; agent: AgentDefinition },
+		run: { taskPrompt: string; agent: AgentDefinition; continueSession?: string },
 	): Promise<SubagentRunResult> => {
 		const { model, thinking } = settings.steps[step];
 		const modelText = formatStepModel({ model, thinking });
@@ -2731,8 +2812,9 @@ export async function runOrchestratorLoop(
 		// Every run is stored as a named pi session of the project and recorded
 		// in the task todo (session id, model, duration, tokens, cost).
 		const header = phaseHeader(output.ref, output.note);
+		// `continueSession` continues an existing session (pi opens the session with that id).
 		const session = {
-			id: randomUUID(),
+			id: run.continueSession ?? randomUUID(),
 			name: `${titlePrefix(taskState.title)}Task ${taskState.sequenceLabel} · ${header}`,
 		};
 		const startedAt = Date.now();
@@ -3262,12 +3344,29 @@ export async function runOrchestratorLoop(
 		task: TaskInfo,
 		taskState: LoopTaskState,
 		phaseCosts: Partial<Record<CostPhase, number>>,
+		options: { continueInterrupted?: boolean } = {},
 	): Promise<ImplementPhaseOutcome> => {
 		let prompt = buildTaskPrompt(task, prdId);
 		let retriesRemaining = settings.implementationRetries;
 		let attempt = 1;
 		/** Qualifier of the next output group header (`resumed`, `retry`). */
 		let runNote: string | undefined;
+		/** Session of an earlier implementer run that the next run continues (full context). */
+		let sessionToContinue: string | undefined;
+
+		/**
+		 * Continue an interrupted implementation: in the implementer's own
+		 * session if it is still stored, otherwise with a fresh implementer that
+		 * is told to pick up the changes on disk.
+		 */
+		const continueImplementation = () => {
+			const lastImplement = taskState.stats.runs.findLast((run) => run.phase === "implement" && run.session);
+			const stored = lastImplement?.session && findSessionFile(sessionDirs, lastImplement.session) ? lastImplement.session : undefined;
+			sessionToContinue = stored;
+			prompt = stored ? buildSessionContinuePrompt() : buildContinuePrompt(task, prdId);
+			runNote = stored ? "continued" : "resumed";
+		};
+		if (options.continueInterrupted) continueImplementation();
 
 		/**
 		 * Pause menu of the implement phase. "Split task" runs the split flow;
@@ -3299,11 +3398,13 @@ export async function runOrchestratorLoop(
 		while (true) {
 			if (aborted) return { kind: "aborted" };
 
+			const continuedSession = sessionToContinue;
+			sessionToContinue = undefined;
 			const run = await runStepSubagent(
 				"implement",
 				taskState,
 				{ ref: { phase: "implement", attempt }, note: runNote },
-				{ taskPrompt: prompt, agent },
+				{ taskPrompt: prompt, agent, continueSession: continuedSession },
 			);
 			runNote = undefined;
 
@@ -3322,8 +3423,7 @@ export async function runOrchestratorLoop(
 				const action = await pauseImplement(options);
 				if (action === "split-applied") return { kind: "split" };
 				if (action === "resume") {
-					prompt = buildContinuePrompt(task, prdId);
-					runNote = "resumed";
+					continueImplementation();
 					taskState.currentActivity = "▶ resuming…";
 					requestOverlayRender();
 					continue;
@@ -3338,6 +3438,16 @@ export async function runOrchestratorLoop(
 			}
 
 			if (aborted) return { kind: "aborted" };
+
+			// The stored session could not be continued (e.g. the provider rejects
+			// its history): start a fresh implementer on the changes on disk instead.
+			if (continuedSession && !parsedRun.ok && parsedRun.status === "failed") {
+				endPhaseOutput(taskState, `session could not be continued — ${parsedRun.error}`, true);
+				prompt = buildContinuePrompt(task, prdId);
+				runNote = "resumed, fresh session";
+				requestOverlayRender();
+				continue;
+			}
 
 			// --- Pause: the worker finished, but its result is not valid JSON even after repair ---
 			if (!parsedRun.ok && parsedRun.status === "invalid-result") {
@@ -3786,13 +3896,18 @@ export async function runOrchestratorLoop(
 		phaseCosts: Partial<Record<CostPhase, number>>,
 		resumeMode: NeedsHumanResume["mode"] | undefined,
 	): Promise<TaskOutcome> => {
-		// --- Implement phase (skipped when resolving a needs-human task) ---
+		// --- Implement phase (skipped when the changes on disk are only reviewed / committed) ---
+		const interrupted = resume?.interrupted === true;
 		let implementerSummary: string;
-		if (resumeMode) {
-			implementerSummary = "Resolved manually after the task was released to a human (needs-human).";
+		if (resumeMode === "commit" || resumeMode === "review") {
+			implementerSummary = interrupted
+				? "Picked up after an interrupted loop run: the changes on disk were taken as the implementation."
+				: "Resolved manually after the task was released to a human (needs-human).";
 		} else {
 			setPhase(taskState, "Implement");
-			const implement = await runImplementPhase(task, taskState, phaseCosts);
+			const implement = await runImplementPhase(task, taskState, phaseCosts, {
+				continueInterrupted: resumeMode === "implement",
+			});
 			if (implement.kind !== "implemented") {
 				return exitToTaskOutcome(implement, {}, "Task execution was cancelled.");
 			}
@@ -3809,6 +3924,9 @@ export async function runOrchestratorLoop(
 		let reviewNote: string | undefined = resumeMode === "commit"
 			? "Resolved by a human (needs-human) — changes committed without another automated review."
 			: undefined;
+		const resumedReviewNote = interrupted
+			? "Reviewed after an interrupted loop run."
+			: "Re-reviewed after release to a human (needs-human).";
 		const updateCycleInfo = () => {
 			taskState.review = cycleProgress(cycle);
 			requestOverlayRender();
@@ -3836,7 +3954,7 @@ export async function runOrchestratorLoop(
 						reviewNote = step.round === 1
 							? "No changes outside .pi/ — review skipped."
 							: `No changes outside .pi/ left for review round ${step.round} — review skipped.`;
-						if (resumeMode === "review") reviewNote = `Re-reviewed after release to a human (needs-human). ${reviewNote}`;
+						if (resumeMode === "review") reviewNote = `${resumedReviewNote} ${reviewNote}`;
 						taskState.reviewNote = reviewNote;
 						break cycleLoop;
 					case "skip-phase":
@@ -3904,7 +4022,7 @@ export async function runOrchestratorLoop(
 
 		// --- Report: append execution report, close todo, update PRD Task Index ---
 		if (resumeMode === "review" && reviewNote === undefined) {
-			reviewNote = "Re-reviewed after release to a human (needs-human).";
+			reviewNote = resumedReviewNote;
 		}
 		const record: ExecutionRecord = {
 			implementerSummary,
@@ -4080,7 +4198,9 @@ export async function runOrchestratorLoop(
 				return {
 					outcome: "aborted",
 					notification: {
-						message: "⚠️ Loop aborted. Uncommitted code left on disk.",
+						message:
+							"⚠️ Loop aborted. Uncommitted code left on disk. Re-run /prd-loop-pro to continue the interrupted task " +
+							"(continue the implementation, or review & commit the changes).",
 						level: "warning",
 					},
 				};
@@ -4181,7 +4301,10 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 	}
 	const gitStatus = gitResult.stdout;
 	const needsHumanTasks = await getNeedsHumanTasks(ctx.cwd, parsedArgs.prdTag);
-	if (needsHumanTasks.length === 0) {
+	// An open task whose loop run was interrupted (abort, quit, shutdown) may
+	// also be picked up with its uncommitted changes (see step 2b).
+	const interruptedTask = gitStatus.trim() !== "" ? await getInterruptedTask(ctx.cwd, parsedArgs.prdTag) : undefined;
+	if (needsHumanTasks.length === 0 && !interruptedTask) {
 		const check = checkGitClean(gitStatus, false);
 		if (!check.ok) {
 			ctx.ui.notify(check.error, "error");
@@ -4203,7 +4326,15 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 	// Step 2: needs-human tasks first (before PRD selection):
 	// "Commit changes & close" / "Already committed – just close" / "Review again" / "Not now".
 	const needsHuman = await offerNeedsHumanTasks(ctx, needsHumanTasks, gitStatus.trim() !== "");
-	const resume = needsHuman.resume;
+	let resume = needsHuman.resume;
+
+	// Step 2b: an interrupted task with uncommitted changes: continue the
+	// implementation, or review & commit the changes as they are.
+	if (!resume && interruptedTask) {
+		const mode = await showInterruptedTaskMenu(ctx, interruptedTask);
+		if (!mode) return;
+		resume = { entry: interruptedTask, mode, interrupted: true };
+	}
 
 	// Git clean check: uncommitted changes pass only while resolving a needs-human task.
 	const gitCheck = checkGitClean(gitStatus, resume !== undefined);
@@ -4268,7 +4399,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 	// Step 6: Run the orchestrator loop (a resolved needs-human task runs first)
 	const selectedPrdTag = selectedPrd.prd.tags.find((t) => /^prd-\d+$/.test(t))!;
 	await runOrchestratorLoop(ctx, pi, selectedPrd.prd, selectedPrdTag, settings, commitRules, {
-		resume: resume ? { taskId: resume.entry.taskId, mode: resume.mode } : undefined,
+		resume: resume ? { taskId: resume.entry.taskId, mode: resume.mode, interrupted: resume.interrupted } : undefined,
 	});
 }
 

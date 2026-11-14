@@ -342,3 +342,19 @@ export function checkGitClean(porcelain: string, resolvingNeedsHuman: boolean): 
 			"\"Commit changes & close\" or \"Review again\").",
 	};
 }
+
+/**
+ * The task a loop run was interrupted in (abort, quit or shutdown in the
+ * middle of a task): the task with the most recent subagent run of all tasks,
+ * if it is still open. A task that finished (closed) or was released
+ * (`needs-human`) after its last run is not interrupted.
+ */
+export function findInterruptedTask<T extends Pick<TaskInfo, "status" | "stats">>(tasks: T[]): T | undefined {
+	let latest: { task: T; startedAt: string } | undefined;
+	for (const task of tasks) {
+		const startedAt = task.stats?.runs.at(-1)?.startedAt;
+		if (startedAt && (!latest || startedAt > latest.startedAt)) latest = { task, startedAt };
+	}
+	if (!latest || isTaskClosed(latest.task.status) || isNeedsHuman(latest.task.status)) return undefined;
+	return latest.task;
+}

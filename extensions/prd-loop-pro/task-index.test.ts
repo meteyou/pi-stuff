@@ -8,6 +8,7 @@ import {
 	INDEX_STATUS_LABELS,
 	NEEDS_HUMAN_STATUS,
 	checkGitClean,
+	findInterruptedTask,
 	isNeedsHuman,
 	isTaskClosed,
 	parseBlockedBy,
@@ -154,5 +155,30 @@ describe("checkGitClean", () => {
 		const failed = checkGitClean(porcelain, false);
 		assert.equal(failed.ok, false);
 		assert.match(failed.ok ? "" : failed.error, /Uncommitted changes detected/);
+	});
+});
+
+describe("findInterruptedTask", () => {
+	const withRun = (n: number, status: string, startedAt?: string): TaskInfo => ({
+		...task(n, status),
+		stats: startedAt
+			? { activeMs: 1, runs: [{ phase: "implement", label: "Implement", startedAt, durationMs: 1, cost: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }
+			: undefined,
+	});
+
+	it("is the open task with the most recent run", () => {
+		const tasks = [withRun(1, "closed", "2026-11-13T10:00:00.000Z"), withRun(2, "open", "2026-11-13T21:00:00.000Z"), withRun(3, "open")];
+		assert.equal(findInterruptedTask(tasks)?.id, "TODO-20");
+	});
+
+	it("is undefined when the most recently run task finished or was released", () => {
+		const older = withRun(1, "open", "2026-11-13T10:00:00.000Z");
+		assert.equal(findInterruptedTask([older, withRun(2, "closed", "2026-11-13T21:00:00.000Z")]), undefined);
+		assert.equal(findInterruptedTask([older, withRun(2, NEEDS_HUMAN_STATUS, "2026-11-13T21:00:00.000Z")]), undefined);
+	});
+
+	it("is undefined without any stored run", () => {
+		assert.equal(findInterruptedTask([withRun(1, "open"), withRun(2, "closed")]), undefined);
+		assert.equal(findInterruptedTask([]), undefined);
 	});
 });
