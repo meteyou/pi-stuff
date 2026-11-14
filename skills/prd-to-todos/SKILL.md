@@ -131,3 +131,34 @@ Status values:
 - `✅ closed` — completed (set by `/prd-loop` after task completion)
 
 This ensures that when someone selects the PRD via `/todo` and says "work", the agent sees the task index with dependencies and can determine exactly which task to work on next — even if earlier tasks were already completed in a previous session.
+
+## Splitting an existing task into subtasks
+
+Use this when the user asks to split a task that already exists (e.g. it turned out to be too big or kept failing in `/prd-loop`). Never renumber the existing tasks — split with a **hierarchical suffix** instead, so the original numbering and `T` stay stable.
+
+### Labels
+
+Numbers and lowercase letters alternate, one level per segment:
+
+| Split | Subtask labels |
+|-------|----------------|
+| Task `17/20` (1st level) | `17a/20`, `17b/20`, `17c/20`, … |
+| Task `17a/20` (2nd level) | `17a1/20`, `17a2/20`, `17a3/20`, … |
+| Task `17a1/20` (3rd level) | `17a1a/20`, `17a1b/20`, … |
+
+- Keep `T` (the total after the slash) of the original breakdown — do NOT change it.
+- Title format stays `PRD #N - Task <label>: <title>`, e.g. `PRD #1 - Task 17a1/20: Runtime memory and sprintf replacements`.
+- Number the subtasks consecutively in a valid dependency order (`17a1` before `17a2`, …), each label exactly once. Never reuse a label of a deleted task.
+- `/prd-loop` and `/prd-loop-pro` sort hierarchically (`17` < `17a` < `17a1` < `17a2` < `17a10` < `17b` < `18`) and show subtasks indented below their parent with a subtask progress count.
+
+### Process
+
+1. Fetch the task to split and its blockers/dependents. Draft the subtasks as vertical slices (step 3) and quiz the user (step 4).
+2. Create the subtask todos (blockers first) with the body structure above. Tags: `task` + `prd-N`.
+   - The first subtask(s) take over the parent's `Blocked by` (only the blockers that are still open matter).
+   - Later subtasks are blocked by the earlier subtasks they depend on.
+3. Keep the parent task as **umbrella / close-out task** (preferred): it stays open, its `Blocked by` is replaced with the last subtask(s), and its "What to build" / acceptance criteria are reduced to what remains after the subtasks (integration, acceptance). If nothing remains, the parent may be deleted instead — the subtasks are still displayed correctly.
+4. Tasks that were blocked by the parent keep pointing at the parent (umbrella) — or, if the parent was deleted, at the last subtask(s). Check every `Blocked by` / `Next task` reference to the split task.
+5. Add one Task Index row per subtask directly below the parent row (`| 17a1/20 | … | TODO-<id> | … | ⏳ blocked |`), update the parent row's `Blocked by`, remove rows of deleted tasks and update `Next up:` if needed.
+
+The same applies when splitting a subtask again (`17a` → `17a1`, `17a2`, …).
