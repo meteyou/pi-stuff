@@ -218,6 +218,10 @@ Time, tokens, cost and the sessions of every subagent run are saved in the task 
 shows them again, and `/todos` → task → **sessions** opens the session of a run. The clock stops while a pause menu
 waits for you.
 
+**Ending a day:** press `x` to stop after the current task; the next `/prd-loop-pro` continues with the next one. If
+a run was interrupted in the middle of a task instead (abort, quit, shutdown), the next start offers to *continue the
+implementation* in the implementer's stored session, or to review & commit the changes as they are.
+
 **Task too large?** The implementer reports a task it cannot finish in one run as *blocked* instead of grinding on it.
 **Split task** lets a splitter propose smaller subtasks (`Task 17/20` → `17a/20`, `17b/20`, …); after you confirm, the
 todos are created, the original task becomes the close-out task and the loop continues with the subtasks.

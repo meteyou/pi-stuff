@@ -33,8 +33,9 @@ in the saved [settings](#settings).
 
 ## Start Sequence
 
-1. **Git status** — the working tree must be clean (`.pi/` is ignored). Exception: uncommitted changes are allowed
-   while resolving a `needs-human` task (they are assumed to be your manual work on it).
+1. **Git status** — the working tree must be clean (`.pi/` is ignored). Exceptions: uncommitted changes are allowed
+   while resolving a `needs-human` task (they are assumed to be your manual work on it) and while picking up an
+   [interrupted task](#interrupted-tasks) again.
 2. **Commit rules** — loaded from the package's [`/commit` prompt template](../../prompts/commit.md) (frontmatter
    stripped). A missing or empty template is a hard error.
 3. **`needs-human` tasks first** — see [Needs-Human Resume Flow](#needs-human-resume-flow).
@@ -257,6 +258,25 @@ the loop and one made by hand in the main session look alike.
 A subagent run that ends with a model/provider error (overloaded, rate limit, quota, …) after pi's own retries is
 reported as failed with that error; an earlier assistant text is never mistaken for its result.
 
+## Interrupted tasks
+
+A loop run can end in the middle of a task: you abort it (`Esc` twice), quit pi, or the machine shuts down. The task
+is then still open and its half-done changes are on disk. At the next `/prd-loop-pro` the loop recognises this (the
+working tree is dirty and the task with the most recent subagent run is still open) and asks:
+
+| Option | Effect |
+|--------|--------|
+| Continue implementation | The implementer continues **in its own stored session**, with the full context of the interrupted run. It is told that it was interrupted, checks the state on disk and finishes the task; then review, commit and close as usual. |
+| Review & commit the changes | The implementation is complete (e.g. the run stopped during review or commit): the review-fix cycle runs on the changes as they are, then commit + close. |
+| Cancel | The loop does not start. |
+
+The same *Continue implementation* is offered for a `needs-human` task (after *Release / hand over*), and
+*Resume current phase* after a `Ctrl+C` pause during implement continues in the same session as well. If the session
+is no longer stored, or the provider rejects its history, a fresh implementer is started on the changes on disk
+instead.
+
+To end a day without an interruption, use **stop after the current task** (`x`, see [UI](#ui)).
+
 ## Statistics and sessions
 
 What the loop spends on a task is saved in the task todo, so it survives a restart of the loop or of pi.
@@ -312,6 +332,7 @@ open findings manually (or with the main agent), then run `/prd-loop-pro` again.
 
 | Option | Effect |
 |--------|--------|
+| Continue implementation | Resumes the implementer's own session on the current changes (see [Interrupted tasks](#interrupted-tasks)), then review, commit + close |
 | Commit changes (committer) & close | Runs only the commit phase on the current changes, then report + close |
 | Already committed – just close | Appends an execution report, closes the task and updates the PRD Task Index |
 | Review again | Runs the review-fix cycle on the current changes, then commit + close |
