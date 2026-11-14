@@ -161,4 +161,12 @@ Numbers and lowercase letters alternate, one level per segment:
 4. Tasks that were blocked by the parent keep pointing at the parent (umbrella) — or, if the parent was deleted, at the last subtask(s). Check every `Blocked by` / `Next task` reference to the split task.
 5. Add one Task Index row per subtask directly below the parent row (`| 17a1/20 | … | TODO-<id> | … | ⏳ blocked |`), update the parent row's `Blocked by`, remove rows of deleted tasks and update `Next up:` if needed.
 
+6. If the split task has the status `needs-human` (released by `/prd-loop-pro`), leave the status as it is and tell the user to choose **Re-open** for it at the next `/prd-loop-pro` start. Uncommitted changes of the failed attempt must be committed, stashed or discarded first; the loop only starts with a clean working tree.
+
 The same applies when splitting a subtask again (`17a` → `17a1`, `17a2`, …).
+
+`/prd-loop-pro` can do this split itself: **Split task** in its pause menu follows the same rules. Use this section when the split is made by hand in the main session, for example after **Release / hand over**.
+
+### Task bodies and follow-up work
+
+The implementer of `/prd-loop` and `/prd-loop-pro` cannot create or change todos. Do not write task bodies that ask it to ("create a follow-up todo for the rest"). Size every task so that one run can finish it; if the size is only known after measuring, say so in the task and let the implementer report the task as blocked with a proposed split.
