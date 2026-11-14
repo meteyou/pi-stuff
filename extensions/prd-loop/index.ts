@@ -2883,6 +2883,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		model: selectedModelId,
 		commitModel: commitModelId,
 		thinkingLevel,
+		commitThinkingLevel: flags.commitThinkingLevel ?? undefined,
 	};
 
 	// Step 4: Confirmation dialog
