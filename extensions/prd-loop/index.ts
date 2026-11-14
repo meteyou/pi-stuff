@@ -1053,74 +1053,10 @@ async function updateTodoFileBody(cwd: string, todoId: string, newBody: string):
 // --- PRD Task Index update ---
 
 /**
- * Update the PRD Task Index body after a task is completed.
- *
- * - Marks the completed task as ✅ closed
- * - Updates blocked tasks to 🔄 open if all their blockers are now closed
- * - Updates the "Start with" pointer to the next actionable task
- */
-function updateTaskIndexBody(
-	body: string,
-	completedTaskId: string,
-	allTasks: TaskInfo[],
-): string {
-	// Build the set of all closed task IDs (including the just-completed one)
-	const closedIds = new Set<string>();
-	for (const t of allTasks) {
-		if (isTaskClosed(t.status)) closedIds.add(t.id);
-	}
-	closedIds.add(completedTaskId);
-
-	const lines = body.split("\n");
-	const updatedLines: string[] = [];
-
-	for (const line of lines) {
-		// Match Task Index table rows: contain a TODO-xxx reference and a status indicator
-		const todoMatch = line.match(/TODO-[0-9a-f]+/i);
-		const isTableRow = line.includes("|") && todoMatch &&
-			(line.includes("✅") || line.includes("🔄") || line.includes("⏳") || line.includes("❌"));
-
-		if (isTableRow && todoMatch) {
-			const taskId = todoMatch[0];
-
-			if (closedIds.has(taskId)) {
-				// Mark as closed
-				updatedLines.push(
-					line.replace(/🔄 open|⏳ blocked|❌ failed/, "✅ closed"),
-				);
-			} else {
-				// Check if this task's blockers are all resolved
-				const task = allTasks.find((t) => t.id === taskId);
-				if (task && task.blockedBy.every((b) => closedIds.has(b))) {
-					updatedLines.push(line.replace(/⏳ blocked/, "🔄 open"));
-				} else {
-					updatedLines.push(line);
-				}
-			}
-		} else if (line.startsWith("Start with:")) {
-			// Find the next actionable open task (not closed, all blockers resolved)
-			const nextTask = allTasks
-				.filter((t) => !closedIds.has(t.id))
-				.find((t) => t.blockedBy.every((b) => closedIds.has(b)));
-
-			if (nextTask) {
-				updatedLines.push(`Start with: **${nextTask.id}** (${nextTask.title})`);
-			} else {
-				updatedLines.push("Start with: All tasks completed! 🎉");
-			}
-		} else {
-			updatedLines.push(line);
-		}
-	}
-
-	return updatedLines.join("\n");
-}
-
-/**
  * Sync the PRD Task Index body with the actual todo file statuses.
  *
- * Called once at loop start so that tasks completed outside the loop
- * (e.g. via `/todos`) are reflected in the PRD table before execution begins.
+ * Called at loop start (so that tasks completed outside the loop, e.g. via
+ * `/todos`, are reflected in the PRD table) and after every task status change.
  *
  * For each table row referencing a TODO-xxx:
  * - Closed/done tasks  → "✅ done"
@@ -2127,19 +2063,30 @@ async function runOrchestratorLoop(
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resolution = resolveTaskOrder(tasks);
 
-	// Sync PRD Task Index with actual todo statuses (picks up tasks closed outside the loop)
-	try {
-		const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-		const syncedBody = syncPrdTaskIndex(currentPrdBody, tasks);
-		if (syncedBody !== currentPrdBody) {
-			await updateTodoFileBody(ctx.cwd, prdId, syncedBody);
+	/**
+	 * Rewrite the PRD Task Index from the current task statuses.
+	 *
+	 * The index is a derived view; the task todos are the source of truth. A
+	 * PRD todo that cannot be read or written must not stop the loop after a
+	 * task was already closed, so the failure is reported as a warning here.
+	 */
+	const syncTaskIndex = async () => {
+		try {
+			const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
+			const syncedBody = syncPrdTaskIndex(currentPrdBody, tasks);
+			if (syncedBody !== currentPrdBody) {
+				await updateTodoFileBody(ctx.cwd, prdId, syncedBody);
+			}
+		} catch (err) {
+			ctx.ui.notify(
+				`⚠️ Failed to sync PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
 		}
-	} catch (err) {
-		ctx.ui.notify(
-			`⚠️ Failed to sync PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
-			"warning",
-		);
-	}
+	};
+
+	// Picks up tasks closed outside the loop
+	await syncTaskIndex();
 
 	if (resolution.error) {
 		ctx.ui.notify(resolution.error, "error");
@@ -2517,13 +2464,7 @@ async function runOrchestratorLoop(
 								taskState.errors = [];
 								await updateTodoFileStatus(ctx.cwd, task.id, "closed");
 								task.status = "closed";
-								try {
-									const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-									const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-									await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
-								} catch {
-									// Non-critical
-								}
+								await syncTaskIndex();
 								widgetTimer = setInterval(requestOverlayRender, 1000);
 								requestOverlayRender();
 								taskSucceeded = false;
@@ -2641,17 +2582,7 @@ Errors: ${result.errors.join("; ")}`,
 
 				await updateTodoFileStatus(ctx.cwd, task.id, "closed");
 				task.status = "closed";
-
-				try {
-					const currentPrdBody = await readTodoBody(ctx.cwd, prdId);
-					const updatedBody = updateTaskIndexBody(currentPrdBody, task.id, tasks);
-					await updateTodoFileBody(ctx.cwd, prdId, updatedBody);
-				} catch (err) {
-					ctx.ui.notify(
-						`⚠️ Failed to update PRD Task Index: ${err instanceof Error ? err.message : String(err)}`,
-						"warning",
-					);
-				}
+				await syncTaskIndex();
 
 				requestOverlayRender();
 			}
