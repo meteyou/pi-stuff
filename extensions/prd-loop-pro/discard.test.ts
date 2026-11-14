@@ -200,6 +200,53 @@ describe("snapshotChanges", () => {
 		assert.equal(git("stash", "list").trim(), "");
 	});
 
+	const ignoredPiScenario = async (trackedPi: boolean) => {
+		write(".gitignore", ".pi\n");
+		write("src/a.txt", "a\n");
+		write("src/old.txt", "old\n");
+		write("src/gone.txt", "gone\n");
+		git("add", "-A");
+		if (trackedPi) {
+			write(".pi/todos/tracked.md", "tracked\n");
+			git("add", "-f", ".pi/todos/tracked.md");
+		}
+		git("commit", "-q", "-m", "init");
+
+		write("src/a.txt", "changed\n");
+		write("src/new file.txt", "new\n");
+		git("mv", "src/old.txt", "src/renamed.txt");
+		rmSync(join(repo, "src/gone.txt"));
+		if (trackedPi) write(".pi/todos/tracked.md", "tracked changed\n");
+		write(".pi/todos/untracked.md", "untracked\n");
+
+		const snapshot = await snapshotChanges(exec, "x");
+		assert.ok(snapshot);
+		await discardChanges(exec);
+		assert.equal(read("src/a.txt"), "a\n");
+		assert.equal(read("src/old.txt"), "old\n");
+		assert.equal(read("src/gone.txt"), "gone\n");
+		assert.equal(existsSync(join(repo, "src/new file.txt")), false);
+		assert.equal(existsSync(join(repo, "src/renamed.txt")), false);
+		if (trackedPi) assert.equal(read(".pi/todos/tracked.md"), "tracked changed\n");
+		assert.equal(read(".pi/todos/untracked.md"), "untracked\n");
+
+		git("stash", "apply", snapshot.ref);
+		assert.equal(read("src/a.txt"), "changed\n");
+		assert.equal(read("src/new file.txt"), "new\n");
+		assert.equal(read("src/renamed.txt"), "old\n");
+		assert.equal(existsSync(join(repo, "src/gone.txt")), false);
+		assert.equal(existsSync(join(repo, "src/old.txt")), false);
+		if (trackedPi) assert.equal(read(".pi/todos/tracked.md"), "tracked changed\n");
+	};
+
+	it("works when .pi/ is gitignored", async () => {
+		await ignoredPiScenario(false);
+	});
+
+	it("works when .pi/ is gitignored but contains tracked files", async () => {
+		await ignoredPiScenario(true);
+	});
+
 	it("returns undefined in a repository without commits", async () => {
 		write("src/a.txt", "a\n");
 		assert.equal(await snapshotChanges(exec, "x"), undefined);

@@ -47,6 +47,23 @@ export async function discardChanges(git: GitExec): Promise<void> {
 	await run(git, ["clean", "-f", "-d", "-q", ...DISCARD_PATHSPEC]);
 }
 
+/**
+ * Paths of `git status --porcelain -z` output. The source path of a staged
+ * rename/copy is skipped: `git stash push` rejects pathspecs that match
+ * neither the index nor the working tree (the stash still records the rename).
+ */
+export function parsePorcelainPaths(output: string): string[] {
+	const entries = output.split("\0");
+	const paths: string[] = [];
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.length < 4) continue;
+		paths.push(entry.slice(3));
+		if (entry[0] === "R" || entry[0] === "C") i++;
+	}
+	return [...new Set(paths)];
+}
+
 /** Uncommitted changes saved as a git stash before a discard. */
 export interface ChangeSnapshot {
 	/** Commit SHA of the stash entry (stable while the entry exists; `git stash apply <ref>` restores it). */
@@ -67,9 +84,25 @@ export async function snapshotChanges(git: GitExec, message: string): Promise<Ch
 	const head = await git(["rev-parse", "--verify", "--quiet", "HEAD"]);
 	if (head.code !== 0 || head.stdout.trim() === "") return undefined;
 
-	const status = await git(["status", "--porcelain", "--untracked-files=all", ...DISCARD_PATHSPEC]);
+	const status = await git(["status", "--porcelain", "-z", "--untracked-files=all", ...DISCARD_PATHSPEC]);
 	if (status.code !== 0) throw new Error(`git status failed: ${(status.stderr || status.stdout).trim()}`);
 	if (status.stdout.trim() === "") return undefined;
+
+	// `git stash push --include-untracked` with an `:(exclude)` pathspec fails
+	// ("paths are ignored by one of your .gitignore files") and leaves the
+	// changes staged when the excluded `.pi/` is gitignored. Then `.pi/` is
+	// left out by `.` already (untracked ignored files are never stashed),
+	// unless files under `.pi/` are tracked anyway — in that rare case the
+	// changed paths are passed explicitly.
+	let pathspec: string[] = [...DISCARD_PATHSPEC];
+	const ignored = await git(["check-ignore", "-q", "--no-index", REVIEW_EXCLUDED_DIR]);
+	if (ignored.code === 0) {
+		const tracked = await git(["ls-files", "--", REVIEW_EXCLUDED_DIR]);
+		pathspec =
+			tracked.code === 0 && tracked.stdout.trim() === ""
+				? ["--", "."]
+				: ["--", ...parsePorcelainPaths(status.stdout).map((path) => `:(literal)${path}`)];
+	}
 
 	const stashRef = async () => {
 		const result = await git(["rev-parse", "--verify", "--quiet", "refs/stash"]);
@@ -77,7 +110,7 @@ export async function snapshotChanges(git: GitExec, message: string): Promise<Ch
 	};
 	const before = await stashRef();
 	const cleanMessage = message.replace(/\s+/g, " ").trim();
-	await run(git, ["stash", "push", "--include-untracked", "-m", cleanMessage, ...DISCARD_PATHSPEC]);
+	await run(git, ["stash", "push", "--include-untracked", "-m", cleanMessage, ...pathspec]);
 	const after = await stashRef();
 	if (!after || after === before) throw new Error("git stash did not create a snapshot of the changes");
 	return { ref: after, message: cleanMessage };
