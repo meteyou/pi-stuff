@@ -29,13 +29,15 @@
  * Use `/todos` to bring up the visual todo manager or just let the LLM use them
  * naturally.
  */
-import { DynamicBorder, copyToClipboard, getMarkdownTheme, keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, copyToClipboard, getAgentDir, getMarkdownTheme, keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import crypto from "node:crypto";
+import { STATS_KEY, parseStats, serializeFrontMatter, sessionChoices } from "../prd-loop-pro/task-stats.ts";
+import { findSessionFile, sessionDirsFor } from "../prd-loop-pro/session-files.ts";
 import {
 	Container,
 	type Focusable,
@@ -91,6 +93,12 @@ interface TodoFrontMatter {
 	status: string;
 	created_at: string;
 	assigned_to_session?: string;
+	/**
+	 * Front matter fields this extension does not know (e.g. `prd_loop`, the
+	 * statistics written by /prd-loop-pro). They are kept when a todo is
+	 * rewritten and never shown to the agent.
+	 */
+	extra?: Record<string, unknown>;
 }
 
 interface TodoRecord extends TodoFrontMatter {
@@ -155,6 +163,7 @@ type TodoMenuAction =
 	| "delete"
 	| "copyPath"
 	| "copyText"
+	| "sessions"
 	| "view";
 
 type TodoToolDetails =
@@ -486,6 +495,9 @@ class TodoActionMenuComponent extends Container {
 			...(todo.assigned_to_session
 				? [{ value: "release", label: "release", description: "Release assignment" }]
 				: []),
+			...(todoSessionChoices(todo).length > 0
+				? [{ value: "sessions", label: "sessions", description: "Open a /prd-loop-pro session of this task" }]
+				: []),
 			{ value: "copyPath", label: "copy path", description: "Copy absolute path to clipboard" },
 			{ value: "copyText", label: "copy text", description: "Copy title and body to clipboard" },
 			{ value: "delete", label: "delete", description: "Delete todo" },
@@ -808,6 +820,8 @@ function getLockPath(todosDir: string, id: string): string {
 	return path.join(todosDir, `${id}.lock`);
 }
 
+const KNOWN_FRONT_MATTER_KEYS = new Set(["id", "title", "tags", "status", "created_at", "assigned_to_session"]);
+
 function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 	const data: TodoFrontMatter = {
 		id: idFallback,
@@ -824,6 +838,11 @@ function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 	try {
 		const parsed = JSON.parse(trimmed) as Partial<TodoFrontMatter> | null;
 		if (!parsed || typeof parsed !== "object") return data;
+		const extra: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(parsed)) {
+			if (!KNOWN_FRONT_MATTER_KEYS.has(key) && value !== undefined) extra[key] = value;
+		}
+		if (Object.keys(extra).length > 0) data.extra = extra;
 		if (typeof parsed.id === "string" && parsed.id) data.id = parsed.id;
 		if (typeof parsed.title === "string") data.title = parsed.title;
 		if (typeof parsed.status === "string" && parsed.status) data.status = parsed.status;
@@ -898,7 +917,7 @@ function splitFrontMatter(content: string): { frontMatter: string; body: string 
 	return { frontMatter, body };
 }
 
-function parseTodoContent(content: string, idFallback: string): TodoRecord {
+export function parseTodoContent(content: string, idFallback: string): TodoRecord {
 	const { frontMatter, body } = splitFrontMatter(content);
 	const parsed = parseFrontMatter(frontMatter, idFallback);
 	return {
@@ -908,23 +927,22 @@ function parseTodoContent(content: string, idFallback: string): TodoRecord {
 		status: parsed.status,
 		created_at: parsed.created_at,
 		assigned_to_session: parsed.assigned_to_session,
+		extra: parsed.extra,
 		body: body ?? "",
 	};
 }
 
-function serializeTodo(todo: TodoRecord): string {
-	const frontMatter = JSON.stringify(
-		{
-			id: todo.id,
-			title: todo.title,
-			tags: todo.tags ?? [],
-			status: todo.status,
-			created_at: todo.created_at,
-			assigned_to_session: todo.assigned_to_session || undefined,
-		},
-		null,
-		2,
-	);
+export function serializeTodo(todo: TodoRecord): string {
+	// Unknown fields are kept (after the known ones); /prd-loop-pro's statistics stay on one line.
+	const frontMatter = serializeFrontMatter({
+		id: todo.id,
+		title: todo.title,
+		tags: todo.tags ?? [],
+		status: todo.status,
+		created_at: todo.created_at,
+		assigned_to_session: todo.assigned_to_session || undefined,
+		...(todo.extra ?? {}),
+	});
 
 	const body = todo.body ?? "";
 	const trimmedBody = body.replace(/^\n+/, "").replace(/\s+$/, "");
@@ -1099,6 +1117,28 @@ function listTodosSync(todosDir: string): TodoFrontMatter[] {
 	return sortTodos(todos);
 }
 
+/** `m:ss` / `h:mm:ss` */
+function formatDuration(ms: number): string {
+	const total = Math.max(0, Math.round(ms / 1000));
+	const hours = Math.floor(total / 3600);
+	const minutes = Math.floor((total % 3600) / 60);
+	const seconds = String(total % 60).padStart(2, "0");
+	return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}` : `${minutes}:${seconds}`;
+}
+
+/** Local `YYYY-MM-DD HH:MM` of an ISO timestamp. */
+function formatLocalTime(iso: string): string {
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return iso;
+	const pad = (value: number) => String(value).padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** Subagent sessions /prd-loop-pro stored for a task todo (see ../prd-loop-pro/task-stats.ts). */
+function todoSessionChoices(todo: TodoFrontMatter) {
+	return sessionChoices(parseStats(todo.extra?.[STATS_KEY]), { duration: formatDuration, time: formatLocalTime });
+}
+
 function getTodoTitle(todo: TodoFrontMatter): string {
 	return todo.title || "(untitled)";
 }
@@ -1180,14 +1220,15 @@ function formatTodoList(todos: TodoFrontMatter[]): string {
 	return lines.join("\n");
 }
 
-function serializeTodoForAgent(todo: TodoRecord): string {
-	const payload = { ...todo, id: formatTodoId(todo.id) };
+export function serializeTodoForAgent(todo: TodoRecord): string {
+	const { extra: _extra, ...known } = todo;
+	const payload = { ...known, id: formatTodoId(todo.id) };
 	return JSON.stringify(payload, null, 2);
 }
 
 function serializeTodoListForAgent(todos: TodoFrontMatter[]): string {
 	const { assignedTodos, openTodos, closedTodos } = splitTodosByAssignment(todos);
-	const mapTodo = (todo: TodoFrontMatter) => ({ ...todo, id: formatTodoId(todo.id) });
+	const mapTodo = ({ extra: _extra, ...todo }: TodoFrontMatter) => ({ ...todo, id: formatTodoId(todo.id) });
 	return JSON.stringify(
 		{
 			assigned: assignedTodos.map(mapTodo),
@@ -1831,6 +1872,8 @@ export default function todosExtension(pi: ExtensionAPI) {
 			}
 
 			let nextPrompt: string | null = null;
+			/** Todo whose /prd-loop-pro sessions are offered after the overlay closes. */
+			let sessionsTodo: TodoRecord | null = null;
 			let rootTui: TUI | null = null;
 			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 				rootTui = tui;
@@ -1933,6 +1976,13 @@ export default function todosExtension(pi: ExtensionAPI) {
 					}
 					if (action === "view") {
 						return "stay";
+					}
+					if (action === "sessions") {
+						// Switching the session replaces this command's context, so it
+						// happens after the overlay is closed (see below).
+						sessionsTodo = record;
+						done();
+						return "exit";
 					}
 					if (action === "copyPath") {
 						copyTodoPathToClipboard(record.id);
@@ -2088,6 +2138,30 @@ export default function todosExtension(pi: ExtensionAPI) {
 				ctx.ui.setEditorText(nextPrompt);
 				// rootTui is assigned inside the ctx.ui.custom() factory callback
 				(rootTui as TUI | null)?.requestRender();
+			}
+
+			// "sessions": pick one of the task's /prd-loop-pro sessions and switch to it.
+			const sessionsRecord = sessionsTodo as TodoRecord | null;
+			if (sessionsRecord) {
+				const choices = todoSessionChoices(sessionsRecord);
+				const labels = choices.map((choice) => choice.label);
+				const picked = await ctx.ui.select(
+					`Sessions of ${formatTodoId(sessionsRecord.id)} "${sessionsRecord.title || "(untitled)"}"\n` +
+						"Switches to the chosen session; use /resume to come back.",
+					labels,
+				);
+				const choice = picked === undefined ? undefined : choices[labels.indexOf(picked)];
+				if (!choice) return;
+				const sessionFile = findSessionFile(
+					sessionDirsFor(ctx.cwd, getAgentDir(), ctx.sessionManager.getSessionDir()),
+					choice.session,
+				);
+				if (!sessionFile) {
+					ctx.ui.notify(`Session ${choice.session} was not found (deleted, or stored for another directory).`, "error");
+					return;
+				}
+				// The command context is stale after the switch: nothing may follow.
+				await ctx.switchSession(sessionFile);
 			}
 		},
 	});

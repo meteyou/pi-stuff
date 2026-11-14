@@ -43,6 +43,9 @@ The `todo` tool is available to the LLM with these actions:
 | `Ctrl+Shift+R` | Quick-refine selected todo |
 | `Esc` | Close |
 
+The action menu of a task that `/prd-loop-pro` worked on has a **sessions** entry: it lists the subagent runs of the
+task (phase, duration, cost, model, time) and switches to the session you pick. Use `/resume` to come back.
+
 ## File Format
 
 ```
@@ -57,6 +60,9 @@ The `todo` tool is available to the LLM with these actions:
 
 Notes about the work go here.
 ```
+
+Front matter fields the extension does not know are kept when a todo is rewritten and are not shown to the agent.
+`/prd-loop-pro` uses this for its `prd_loop` field (time, tokens, cost and sessions of a task).
 
 ## Settings
 
