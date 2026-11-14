@@ -16,7 +16,7 @@
 
 import type { TaskStats } from "./task-stats.ts";
 
-/** Todo status of a task released to a human ("Release (fix manually)"). */
+/** Todo status of a task released to a human ("Release / hand over"). */
 export const NEEDS_HUMAN_STATUS = "needs-human";
 
 /** Status cell labels of the PRD Task Index. */
@@ -100,9 +100,10 @@ export interface TaskResolutionResult {
 
 export interface ResolveOptions {
 	/**
-	 * A `needs-human` task that is being resolved in this run ("Commit changes"
-	 * / "Review again"). It is treated as open (not held), so it and its
-	 * dependents become actionable.
+	 * The task that is picked up again in this run: a `needs-human` task being
+	 * resolved ("Continue implementation" / "Commit changes" / "Review again")
+	 * or an interrupted open task. It is treated as open (not held), so it and
+	 * its dependents become actionable, and it runs first.
 	 */
 	resolvingTaskId?: string;
 }
@@ -323,13 +324,14 @@ export type GitCleanCheck =
 	| { ok: false; error: string };
 
 /**
- * Git clean check at start. Uncommitted changes are only allowed while a
- * `needs-human` task is being resolved (they are the human's work on that
- * task); every other dirty state fails the check.
+ * Git clean check at start. Uncommitted changes are only allowed while a task
+ * is picked up again with them: a `needs-human` task that is being resolved
+ * (the changes are the human's work on it) or an interrupted task; every other
+ * dirty state fails the check.
  *
  * @param porcelain - output of `git status --porcelain`
- * @param resolvingNeedsHuman - true if a `needs-human` task is resolved with the
- *   current changes ("Commit changes & close" / "Review again")
+ * @param resolvingNeedsHuman - true if a task is picked up with the current
+ *   changes ("Continue implementation" / "Commit changes & close" / "Review again")
  */
 export function checkGitClean(porcelain: string, resolvingNeedsHuman: boolean): GitCleanCheck {
 	const dirty = porcelain.trim() !== "";
@@ -338,8 +340,8 @@ export function checkGitClean(porcelain: string, resolvingNeedsHuman: boolean): 
 		ok: false,
 		error:
 			"Uncommitted changes detected. Please clean your working directory before starting the loop " +
-			"(uncommitted changes are only allowed while resolving a needs-human task via " +
-			"\"Commit changes & close\" or \"Review again\").",
+			"(uncommitted changes are only allowed while a needs-human task or an interrupted task is picked up again via " +
+			"\"Continue implementation\", \"Commit changes & close\" or \"Review again\").",
 	};
 }
 

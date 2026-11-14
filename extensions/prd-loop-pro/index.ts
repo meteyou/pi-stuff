@@ -9,13 +9,17 @@
  * settings (see ./settings.ts and ./settings-ui.ts).
  *
  * Start sequence:
- * 1. Git status (uncommitted changes are only allowed while resolving a
- *    `needs-human` task, see ./task-index.ts `checkGitClean`)
+ * 1. Git status (uncommitted changes are only allowed while a `needs-human`
+ *    task is resolved or an interrupted task is picked up again, see
+ *    ./task-index.ts `checkGitClean` / `findInterruptedTask`)
  * 1b. Load the commit rules from the package's `/commit` prompt template
  *     (missing template = hard error)
- * 2. `needs-human` tasks first: "Commit changes (committer) & close",
- *    "Already committed – just close", "Review again", "Not now"
- * 2b. PRD selection (dialog, argument or the PRD of the resolved task)
+ * 2. `needs-human` tasks first: "Continue implementation", "Commit changes
+ *    (committer) & close", "Already committed – just close", "Review again",
+ *    "Re-open", "Not now"
+ * 2a. Interrupted task (dirty tree + the most recently run task is still
+ *     open): "Continue implementation" or "Review & commit the changes"
+ * 2b. PRD selection (dialog, argument or the PRD of the task picked up above)
  * 3. Load global settings (wizard on first start), merge per-field project
  *    overrides (`.pi/prd-loop-pro.json`) and validate
  * 4. Overview menu: entries editable in place; Confirm & start, or with
@@ -28,31 +32,42 @@
  *    Commit (prd-committer; failure or hook failure pauses the loop, hooks
  *    are never bypassed) → Report
  *    (`## Execution Report` in the task todo incl. rounds, fixed, rejected,
- *    deferred, unresolved findings and created commits, close todo, update
- *    PRD Task Index)
+ *    deferred, unresolved findings, created commits, time, tokens and
+ *    sessions; close todo, update PRD Task Index)
  *
  * Unified pause handling (./pause.ts): the loop never fails hard on a task.
- * Implementation still failing after all retries, an unrepairable JSON result,
- * a crashed reviewer/fixer, a failing committer/hook, the review round limit
- * and a manual Ctrl+C all open a pause menu that shows the task, the current
- * phase and the reason. Ctrl+C offers "Resume current phase", "Skip phase"
- * (not during commit), "Retry task" (discard changes, restart at implement),
- * "Release", "Skip task" and "Abort".
- * Discard operations ("Retry task", "Skip task") never touch `.pi/`
- * (./discard.ts), even when `.pi/` is tracked.
+ * Implementation still failing after all retries, a task the implementer
+ * reports as blocked, an unrepairable JSON result, a crashed reviewer/fixer, a
+ * failing committer/hook, the review round limit and a manual Ctrl+C all open
+ * a pause menu that shows the task, the current phase and the reason.
+ * Discard operations ("Retry task", "Skip task", "Split task") never touch
+ * `.pi/` and save everything else as a git stash first (./discard.ts). Every
+ * failed attempt is recorded in the task todo (./attempt-log.ts).
  *
- * "Release (fix manually)" (offered in every pause menu) sets the task todo to
- * `needs-human`, appends the open findings and stops the loop. `needs-human`
+ * "Split task" (./task-split.ts): the prd-splitter subagent proposes smaller
+ * subtasks; after confirmation the subtask todos are created, the task becomes
+ * the close-out task and the loop continues with the subtasks.
+ *
+ * "Release / hand over" (offered in every pause menu) sets the task todo to
+ * `needs-human`, appends the open findings, stops the loop and puts a prepared
+ * prompt for the main session into the editor (./handover.ts). `needs-human`
  * is not closed: dependent tasks stay blocked until the task is resolved at
  * the next start.
  *
+ * Sessions and statistics (./task-stats.ts, ./session-files.ts): every
+ * subagent run is a named pi session of the project. Its session id, model,
+ * duration, tokens and cost, and the active time of the task, are stored in
+ * the task todo (`prd_loop` front matter) and restored at the next start. The
+ * clocks stop while a pause menu waits for the human. An interrupted
+ * implementation is continued in the implementer's own session.
+ *
  * UI (view model in ./progress-view.ts): task rows show the current phase and
  * round; task details show the review round counter, fixed/rejected/deferred/
- * unresolved counts and the cost per phase. The output viewer (`o`) groups the
- * events per subagent run under phase headers (`Implement`, `Review #1`,
- * `Fix #1 • 3 findings`, `Commit`) with outcome, cost and duration. The
- * final summary widget lists rounds and counts per task and marks
- * `needs-human` tasks with ⚠️.
+ * unresolved counts, the cost per phase and the tokens. The output viewer
+ * (`o`) groups the events per subagent run under phase headers (`Implement`,
+ * `Review #1`, `Fix #1 • 3 findings`, `Commit`, `Split`) with outcome, cost
+ * and duration. `x` stops the loop after the current task. The final summary
+ * lists rounds and counts per task and marks `needs-human` tasks with ⚠️.
  *
  * Run settings (`s` in the overlay, ./settings-ui.ts `editRunSettings`): the
  * model + thinking level of every step can be changed while the loop keeps
@@ -1262,7 +1277,7 @@ async function showInterruptedTaskMenu(
 
 /** Outcome of offering the `needs-human` tasks at start. */
 interface NeedsHumanStartResult {
-	/** Task to resolve inside the loop ("Commit changes" / "Review again"). */
+	/** Task to pick up inside the loop ("Continue implementation" / "Commit changes" / "Review again"). */
 	resume?: { entry: NeedsHumanTask; mode: NeedsHumanResume["mode"]; interrupted?: boolean };
 	/** PRD tag of the last task closed via "Already committed – just close" or re-opened via "Re-open". */
 	closedPrdTag?: string;
@@ -1272,7 +1287,7 @@ interface NeedsHumanStartResult {
  * Offer `needs-human` tasks first (before PRD selection). With several
  * tasks, the user picks one (or continues without resolving); every task gets
  * the four options. "Just close" is handled here and the remaining tasks are
- * offered again; "Commit" / "Review again" end the dialog and are resolved
+ * offered again; "Continue implementation" / "Commit" / "Review again" end the dialog and are resolved
  * inside the orchestrator loop.
  */
 async function offerNeedsHumanTasks(
@@ -2368,10 +2383,12 @@ async function listExcludedFilesCommittedSince(pi: ExtensionAPI, cwd: string, be
  * - Output viewer overlay for the currently selected task
  * - Ctrl+C pauses the current subagent and opens the pause menu
  * - Commits via prd-committer subagent (commit model/thinking from settings)
- * - "Release (fix manually)": task todo → `needs-human` + open findings, loop stops
- * - Resolving a `needs-human` task (`options.resume`): the task runs first,
- *   starting at the commit phase ("Commit changes & close") or the review-fix
- *   cycle ("Review again") with the current uncommitted changes
+ * - "Release / hand over": task todo → `needs-human` + open findings, loop stops
+ * - Picking up a task again (`options.resume`: a `needs-human` task or an
+ *   interrupted open task): the task runs first, continuing the implementation
+ *   ("Continue implementation"), or starting at the review-fix cycle ("Review
+ *   again") or the commit phase ("Commit changes & close") with the current
+ *   uncommitted changes
  * - `needs-human` tasks (not being resolved) and their dependents are never started
  * - Final summary widget on completion/failure/abort/release
  */
@@ -2971,7 +2988,7 @@ export async function runOrchestratorLoop(
 	};
 
 	/**
-	 * "Release (fix manually)": append the open findings section (incl. the
+	 * "Release / hand over": append the open findings section (incl. the
 	 * reason and errors) to the task todo, set its status to `needs-human`,
 	 * update the PRD Task Index and stop the loop. Uncommitted changes stay on
 	 * disk; the task is offered first at the next start.
@@ -4324,7 +4341,8 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 	}
 
 	// Step 2: needs-human tasks first (before PRD selection):
-	// "Commit changes & close" / "Already committed – just close" / "Review again" / "Not now".
+	// "Continue implementation" / "Commit changes & close" / "Already committed – just close" /
+	// "Review again" / "Re-open" / "Not now".
 	const needsHuman = await offerNeedsHumanTasks(ctx, needsHumanTasks, gitStatus.trim() !== "");
 	let resume = needsHuman.resume;
 
@@ -4336,7 +4354,7 @@ async function prdLoopHandler(args: string, ctx: ExtensionCommandContext, pi: Ex
 		resume = { entry: interruptedTask, mode, interrupted: true };
 	}
 
-	// Git clean check: uncommitted changes pass only while resolving a needs-human task.
+	// Git clean check: uncommitted changes pass only while a needs-human or interrupted task is picked up.
 	const gitCheck = checkGitClean(gitStatus, resume !== undefined);
 	if (!gitCheck.ok) {
 		ctx.ui.notify(gitCheck.error, "error");
