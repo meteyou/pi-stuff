@@ -3330,6 +3330,12 @@ export async function runOrchestratorLoop(
 				createTodoFile(ctx.cwd, { id: subtask.id, title: subtask.title, tags: ["task", prdTag], status: "open", body: subtask.body });
 			}
 			await updateTodoFileBody(ctx.cwd, task.id, plan.parentBody);
+			// A needs-human task that is being resolved would be held again once the
+			// task list is re-read: it is the close-out now, so it must be open.
+			if (isNeedsHuman(task.status)) {
+				await updateTodoFileStatus(ctx.cwd, task.id, "open");
+				task.status = "open";
+			}
 
 			let indexUpdated = false;
 			try {
@@ -4080,6 +4086,8 @@ export async function runOrchestratorLoop(
 	let queue: TaskInfo[] = [...resolution.actionable];
 	/** Tasks already run in this loop (never started twice, except the close-out of a split). */
 	const processed = new Set<string>();
+	/** Tasks that were split in this run (they run again as close-out, from scratch). */
+	const splitParents = new Set<string>();
 	let executedCount = 0;
 	/** True once a task was started in this run ("stop after the current task" needs one). */
 	let startedAny = false;
@@ -4155,8 +4163,11 @@ export async function runOrchestratorLoop(
 				loopState.currentTaskIndex = taskStateIndex;
 				overlayComponent?.focusTask(taskStateIndex);
 
-				/** Resolving a `needs-human` task ("Retry task" restarts it at implement). */
-				let resumeMode = resume && resume.taskId === task.id ? resume.mode : undefined;
+				/**
+				 * Resolving a `needs-human` task ("Retry task" restarts it at implement).
+				 * After a split the changes were discarded: the close-out is a normal run.
+				 */
+				let resumeMode = resume && resume.taskId === task.id && !splitParents.has(task.id) ? resume.mode : undefined;
 				/**
 				 * Cost per phase for the execution report (kept across "Retry task",
 				 * and across a split when the task runs again as close-out).
@@ -4198,6 +4209,7 @@ export async function runOrchestratorLoop(
 				}
 				if (outcome.kind === "split") {
 					// The task is now the close-out of its subtasks: it runs again after them.
+					splitParents.add(task.id);
 					processed.delete(task.id);
 					executedCount--;
 					taskState.status = "pending";
