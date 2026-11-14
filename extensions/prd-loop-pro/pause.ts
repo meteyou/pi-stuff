@@ -10,8 +10,9 @@
  *
  * | Reason                  | Actions                                                                 |
  * |-------------------------|-------------------------------------------------------------------------|
- * | manual (Ctrl+C)         | Resume current phase, Skip phase*, Retry task, Release, Skip task, Abort |
- * | implementation-failed   | Retry task, Release, Skip task, Abort                                   |
+ * | manual (Ctrl+C)         | Resume current phase, Skip phase*, Retry task, Split task**, Release, Skip task, Abort |
+ * | implementation-failed   | Retry phase, Retry task, Split task, Release, Skip task, Abort          |
+ * | task-blocked            | Split task, Release, Retry phase, Retry task, Skip task, Abort          |
  * | invalid-result (JSON)   | Retry phase, Release, Skip task, Abort                                  |
  * | phase-failed            | Retry phase, Release, Skip task, Abort                                  |
  * | committer-failed        | Retry phase, Release, Skip task, Abort                                  |
@@ -20,6 +21,16 @@
  *
  * (*) "Skip phase" is never offered during the commit phase: the uncommitted
  * changes would leak into the next task.
+ * (**) "Split task" is only offered during the implement phase.
+ *
+ * "task-blocked" = the implementer reported that the task cannot be completed
+ * as written (too large for one run, missing prerequisite, contradictory
+ * criteria). No automatic retry happens for it.
+ *
+ * "Retry task", "Skip task" and "Split task" discard the uncommitted changes;
+ * they are saved as a git stash first (see ./discard.ts). "Release" keeps the
+ * changes and hands the task over to the main session with a prepared prompt
+ * (see ./handover.ts).
  *
  * Only erasable TypeScript syntax is used (`node --test` type stripping).
  */
@@ -31,6 +42,7 @@ export type PausePhase = "Implement" | "Review" | "Fix" | "Commit";
 export type PauseReasonKind =
 	| "manual"
 	| "implementation-failed"
+	| "task-blocked"
 	| "invalid-result"
 	| "phase-failed"
 	| "committer-failed"
@@ -45,6 +57,7 @@ export type PauseAction =
 	| "retry-task"
 	| "one-more-round"
 	| "commit-as-is"
+	| "split-task"
 	| "release"
 	| "skip-task"
 	| "abort";
@@ -85,17 +98,20 @@ export const PAUSE_MAX_LISTED_ERRORS = 5;
 export const PAUSE_MAX_ERROR_LENGTH = 300;
 
 /** Label of the "Release" option (shared by all pause menus). */
-export const RELEASE_LABEL = "Release (fix manually) — mark task needs-human, stop the loop, resolve at next start";
+export const RELEASE_LABEL =
+	"Release / hand over — mark task needs-human, stop the loop, keep changes, put a prompt for the main session into the editor";
 
 /** Actions offered for a pause reason in a phase. */
 export function pauseActions(reason: PauseReasonKind, phase: PausePhase): PauseAction[] {
 	switch (reason) {
 		case "manual":
-			return phase === "Commit"
-				? ["resume", "retry-task", "release", "skip-task", "abort"]
-				: ["resume", "skip-phase", "retry-task", "release", "skip-task", "abort"];
+			if (phase === "Commit") return ["resume", "retry-task", "release", "skip-task", "abort"];
+			if (phase === "Implement") return ["resume", "skip-phase", "retry-task", "split-task", "release", "skip-task", "abort"];
+			return ["resume", "skip-phase", "retry-task", "release", "skip-task", "abort"];
 		case "implementation-failed":
-			return ["retry-task", "release", "skip-task", "abort"];
+			return ["retry-phase", "retry-task", "split-task", "release", "skip-task", "abort"];
+		case "task-blocked":
+			return ["split-task", "release", "retry-phase", "retry-task", "skip-task", "abort"];
 		case "round-limit":
 			return ["one-more-round", "commit-as-is", "release", "skip-task", "abort"];
 		case "invalid-result":
@@ -121,6 +137,7 @@ export function defaultReasonText(reason: PauseReasonKind, phase: PausePhase): s
 	switch (reason) {
 		case "manual": return "manual pause (Ctrl+C)";
 		case "implementation-failed": return "implementation failed after all retries";
+		case "task-blocked": return "the implementer reported that the task cannot be completed as written";
 		case "invalid-result": return `JSON repair failed — the ${phaseAgentName(phase)} returned no valid result`;
 		case "phase-failed": return `${phase.toLowerCase()} phase failed`;
 		case "committer-failed": return "committer failed";
@@ -151,15 +168,17 @@ export function pauseActionLabel(action: PauseAction, phase: PausePhase): string
 		case "retry-phase":
 			return `Retry phase — keep changes, run the ${phaseAgentName(phase)} again`;
 		case "retry-task":
-			return "Retry task — discard changes (except .pi/), restart at implement";
+			return "Retry task — discard changes (saved as git stash, .pi/ is kept), restart at implement";
 		case "one-more-round":
 			return "One more round — fix the open findings and review again";
 		case "commit-as-is":
 			return "Commit as-is & close task — open findings go into the report";
+		case "split-task":
+			return "Split task — a splitter proposes smaller subtasks; after you confirm, changes are stashed, the subtask todos are created and the loop continues with them";
 		case "release":
 			return RELEASE_LABEL;
 		case "skip-task":
-			return "Skip task — discard changes (except .pi/), mark done, continue with next";
+			return "Skip task — discard changes (saved as git stash, .pi/ is kept), mark done, continue with next";
 		case "abort":
 			return "Abort loop — stop and keep changes on disk";
 	}

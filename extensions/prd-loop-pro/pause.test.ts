@@ -26,8 +26,8 @@ describe("module purity", () => {
 });
 
 describe("pauseActions", () => {
-	it("offers all options for a manual pause in implement/review/fix", () => {
-		for (const phase of ["Implement", "Review", "Fix"] as PausePhase[]) {
+	it("offers all options for a manual pause in review/fix", () => {
+		for (const phase of ["Review", "Fix"] as PausePhase[]) {
 			assert.deepEqual(pauseActions("manual", phase), [
 				"resume",
 				"skip-phase",
@@ -39,10 +39,26 @@ describe("pauseActions", () => {
 		}
 	});
 
+	it("adds split task to a manual pause during implement only", () => {
+		assert.deepEqual(pauseActions("manual", "Implement"), [
+			"resume",
+			"skip-phase",
+			"retry-task",
+			"split-task",
+			"release",
+			"skip-task",
+			"abort",
+		]);
+		for (const phase of ["Review", "Fix", "Commit"] as PausePhase[]) {
+			assert.equal(pauseActions("manual", phase).includes("split-task"), false, phase);
+		}
+	});
+
 	it("never offers skip phase during commit", () => {
 		const reasons: PauseReasonKind[] = [
 			"manual",
 			"implementation-failed",
+			"task-blocked",
 			"invalid-result",
 			"phase-failed",
 			"committer-failed",
@@ -55,8 +71,42 @@ describe("pauseActions", () => {
 		assert.deepEqual(pauseActions("manual", "Commit"), ["resume", "retry-task", "release", "skip-task", "abort"]);
 	});
 
-	it("offers retry task, release, skip task, abort when the implementation failed after all retries", () => {
-		assert.deepEqual(pauseActions("implementation-failed", "Implement"), ["retry-task", "release", "skip-task", "abort"]);
+	it("offers a retry that keeps the changes first when the implementation failed after all retries", () => {
+		assert.deepEqual(pauseActions("implementation-failed", "Implement"), [
+			"retry-phase",
+			"retry-task",
+			"split-task",
+			"release",
+			"skip-task",
+			"abort",
+		]);
+	});
+
+	it("offers split and release first when the implementer reported the task as blocked", () => {
+		assert.deepEqual(pauseActions("task-blocked", "Implement"), [
+			"split-task",
+			"release",
+			"retry-phase",
+			"retry-task",
+			"skip-task",
+			"abort",
+		]);
+	});
+
+	it("offers release in every menu", () => {
+		const reasons: PauseReasonKind[] = [
+			"manual",
+			"implementation-failed",
+			"task-blocked",
+			"invalid-result",
+			"phase-failed",
+			"committer-failed",
+			"hook-failed",
+			"round-limit",
+		];
+		for (const reason of reasons) {
+			for (const phase of PHASES) assert.ok(pauseActions(reason, phase).includes("release"), `${reason}/${phase}`);
+		}
 	});
 
 	it("offers retry phase, release, skip task, abort when JSON repair failed", () => {
@@ -85,10 +135,12 @@ describe("pauseActionLabel", () => {
 	it("labels the manual pause options as specified", () => {
 		assert.match(pauseActionLabel("resume", "Review"), /^Resume current phase/);
 		assert.match(pauseActionLabel("skip-phase", "Fix"), /Skip phase/);
-		assert.match(pauseActionLabel("retry-task", "Fix"), /Retry task — discard changes \(except \.pi\/\), restart at implement/);
+		assert.match(pauseActionLabel("retry-task", "Fix"), /Retry task — discard changes \(saved as git stash, \.pi\/ is kept\), restart at implement/);
 		assert.equal(pauseActionLabel("release", "Implement"), RELEASE_LABEL);
-		assert.match(pauseActionLabel("skip-task", "Implement"), /Skip task — discard changes \(except \.pi\/\)/);
+		assert.match(pauseActionLabel("skip-task", "Implement"), /Skip task — discard changes \(saved as git stash, \.pi\/ is kept\)/);
 		assert.match(pauseActionLabel("abort", "Implement"), /Abort/);
+		assert.match(pauseActionLabel("split-task", "Implement"), /^Split task — /);
+		assert.match(RELEASE_LABEL, /^Release \/ hand over — .*keep changes.*prompt for the main session/);
 	});
 
 	it("names the phase agent for retry phase", () => {
@@ -97,7 +149,7 @@ describe("pauseActionLabel", () => {
 	});
 
 	it("has a distinct label for every action within a menu", () => {
-		const reasons: PauseReasonKind[] = ["manual", "implementation-failed", "invalid-result", "round-limit"];
+		const reasons: PauseReasonKind[] = ["manual", "implementation-failed", "task-blocked", "invalid-result", "round-limit"];
 		for (const reason of reasons) {
 			for (const phase of PHASES) {
 				const labels = pauseActions(reason, phase).map((a: PauseAction) => pauseActionLabel(a, phase));
@@ -147,7 +199,7 @@ describe("buildPauseMenu", () => {
 	});
 
 	it("shows failure menus again when cancelled", () => {
-		for (const reason of ["implementation-failed", "invalid-result", "hook-failed", "round-limit"] as PauseReasonKind[]) {
+		for (const reason of ["implementation-failed", "task-blocked", "invalid-result", "hook-failed", "round-limit"] as PauseReasonKind[]) {
 			assert.equal(buildPauseMenu({ taskLabel: "T", phase: "Commit", reason }).cancelAction, undefined);
 		}
 	});
