@@ -650,7 +650,7 @@ export async function spawnSubagent(options: {
 						if (!resolved) {
 							proc.kill("SIGTERM");
 							setTimeout(() => {
-								if (!proc.killed) proc.kill("SIGKILL");
+								if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 							}, SIGKILL_TIMEOUT_MS);
 							safeResolve(0); // Treat as success — agent completed
 						}
@@ -760,7 +760,7 @@ export async function spawnSubagent(options: {
 					wasAborted = true;
 					proc.kill("SIGTERM");
 					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
+						if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 					}, SIGKILL_TIMEOUT_MS);
 				};
 
