@@ -106,3 +106,45 @@ export function subtaskProgress<T extends { sequenceLabel: string }>(
 	if (subtasks.length === 0) return undefined;
 	return { done: subtasks.filter(isDone).length, total: subtasks.length };
 }
+
+/** Number → letter segment (1=a … 26=z, 27=aa, …). */
+function letterSegment(value: number): string {
+	let out = "";
+	for (let n = value; n > 0; n = Math.floor((n - 1) / 26)) out = String.fromCharCode(97 + ((n - 1) % 26)) + out;
+	return out;
+}
+
+/**
+ * Labels for `count` new subtasks of a task: letters below a number
+ * (`17/20` → `17a/20`, `17b/20`), digits below a letter (`17a/20` →
+ * `17a1/20`, `17a2/20`). Continues after the highest suffix already used by
+ * an existing (transitive) subtask, so labels are never reused. Returns [] for
+ * an unknown parent label.
+ */
+export function nextSubtaskLabels(parentLabel: string, existingLabels: string[], count: number): string[] {
+	const parent = sequenceSegments(parentLabel);
+	if (parent.length === 0) return [];
+	const total = parentLabel.split("/")[1] ?? "";
+	const position = parentLabel.split("/")[0]!.toLowerCase();
+	const letters = /\d/.test(parent.at(-1)!);
+
+	let highest = 0;
+	for (const label of existingLabels) {
+		if (!isSubtaskOf(label, parentLabel)) continue;
+		const segment = sequenceSegments(label)[parent.length]!;
+		highest = Math.max(highest, letters ? letterValue(segment) : Number(segment));
+	}
+
+	const labels: string[] = [];
+	for (let i = 1; i <= count; i++) {
+		const suffix = letters ? letterSegment(highest + i) : String(highest + i);
+		labels.push(`${position}${suffix}/${total}`);
+	}
+	return labels;
+}
+
+/** Title prefix before the sequence label: "PRD #1 - Task 17a/20: X" → "PRD #1 - ". */
+export function titlePrefix(title: string): string {
+	const match = title.match(SEQUENCE_PATTERN);
+	return match && match.index !== undefined ? title.slice(0, match.index) : "";
+}

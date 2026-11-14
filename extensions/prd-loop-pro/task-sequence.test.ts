@@ -9,11 +9,13 @@ import {
 	compareSequenceLabels,
 	extractShortTitle,
 	isSubtaskOf,
+	nextSubtaskLabels,
 	parseSequenceLabel,
 	sequenceDepth,
 	sequenceSegments,
 	sortBySequence,
 	subtaskProgress,
+	titlePrefix,
 } from "./task-sequence.ts";
 
 describe("module purity", () => {
@@ -84,5 +86,28 @@ describe("subtaskProgress", () => {
 
 	it("is undefined for tasks that were not split", () => {
 		assert.equal(subtaskProgress(tasks[4]!, tasks, (x) => x.done), undefined);
+	});
+});
+
+describe("nextSubtaskLabels / titlePrefix", () => {
+	it("uses letters below a number and digits below a letter", () => {
+		assert.deepEqual(nextSubtaskLabels("17/20", [], 3), ["17a/20", "17b/20", "17c/20"]);
+		assert.deepEqual(nextSubtaskLabels("17a/20", [], 2), ["17a1/20", "17a2/20"]);
+		assert.deepEqual(nextSubtaskLabels("17a1/20", [], 1), ["17a1a/20"]);
+	});
+
+	it("continues after existing (transitive) subtasks and never reuses a label", () => {
+		assert.deepEqual(nextSubtaskLabels("17/20", ["17a1/20", "17h/20", "18/20", "1/20"], 2), ["17i/20", "17j/20"]);
+		assert.deepEqual(nextSubtaskLabels("17a/20", ["17a8/20", "17b/20"], 2), ["17a9/20", "17a10/20"]);
+		assert.deepEqual(nextSubtaskLabels("3/9", ["3z/9"], 1), ["3aa/9"]);
+	});
+
+	it("returns [] for an unknown parent label", () => {
+		assert.deepEqual(nextSubtaskLabels("?/?", [], 2), []);
+	});
+
+	it("extracts the title prefix", () => {
+		assert.equal(titlePrefix("PRD #1 - Task 17a/20: X"), "PRD #1 - ");
+		assert.equal(titlePrefix("No label"), "");
 	});
 });
