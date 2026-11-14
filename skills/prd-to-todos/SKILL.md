@@ -107,7 +107,7 @@ The Task Index encodes **dependencies and status** so that any agent reading the
 ## ⚠️ Working on this PRD
 
 Do NOT implement this PRD directly. It has been broken into sequential tasks.
-Work through the tasks below in order. Use /prd-loop (or /ralph) to execute autonomously, or pick individual tasks.
+Work through the tasks below in order. Use /prd-loop or /prd-loop-pro to execute autonomously, or pick individual tasks.
 
 ## Task Index
 
@@ -125,10 +125,15 @@ Start with: **TODO-<first-task-id>** (PRD #N - Task 1/T: <title>)
 <original PRD content follows>
 ```
 
-Status values:
+Status values to write when creating the index:
 - `🔄 open` — actionable, no unresolved blockers
 - `⏳ blocked` — waiting for blocker tasks to complete
-- `✅ closed` — completed (set by `/prd-loop` after task completion)
+
+The loops maintain the status column afterwards, so an existing index can contain other values:
+- `/prd-loop`: `🔄 open`, `⏳ blocked`, `✅ closed`
+- `/prd-loop-pro`: `🔓 ready`, `⏳ blocked`, `✅ done`, `🔧 needs-human` (released to a human), and `Next up:` instead of `Start with:`
+
+When you add rows to an existing index (e.g. after a split), use the values that are already in use there.
 
 This ensures that when someone selects the PRD via `/todo` and says "work", the agent sees the task index with dependencies and can determine exactly which task to work on next — even if earlier tasks were already completed in a previous session.
 
