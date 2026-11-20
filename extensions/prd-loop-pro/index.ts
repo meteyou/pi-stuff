@@ -48,6 +48,14 @@
  * subtasks; after confirmation the subtask todos are created, the task becomes
  * the close-out task and the loop continues with the subtasks.
  *
+ * Auto mode (./auto-mode.ts, setting `autoMode`, `m` in the overlay): the
+ * prd-decider subagent (orchestrator model) answers the pause menus of a
+ * blocked task, a failed implementation and the review round limit instead of
+ * the human (split, retry, one more round, commit as-is or release; never
+ * abort or skip task). A split chosen by auto mode is applied without the
+ * confirmation. Guard rails limit the decisions per task; everything else,
+ * and every failed decision, falls back to the normal pause menu.
+ *
  * "Release / hand over" (offered in every pause menu) sets the task todo to
  * `needs-human`, appends the open findings, stops the loop and puts a prepared
  * prompt for the main session into the editor (./handover.ts). `needs-human`
@@ -65,8 +73,8 @@
  * round; task details show the review round counter, fixed/rejected/deferred/
  * unresolved counts, the cost per phase and the tokens. The output viewer
  * (`o`) groups the events per subagent run under phase headers (`Implement`,
- * `Review #1`, `Fix #1 • 3 findings`, `Commit`, `Split`) with outcome, cost
- * and duration. `x` stops the loop after the current task. The final summary
+ * `Review #1`, `Fix #1 • 3 findings`, `Commit`, `Split`, `Auto decision`) with
+ * outcome, cost and duration. `m` toggles auto mode. `x` stops the loop after the current task. The final summary
  * lists rounds and counts per task and marks `needs-human` tasks with ⚠️.
  *
  * Run settings (`s` in the overlay, ./settings-ui.ts `editRunSettings`): the
@@ -94,6 +102,7 @@ import { editRunSettings, resolveStartSettings } from "./settings-ui.ts";
 import type { RunningStep } from "./settings-ui.ts";
 import {
 	COMMITTER_RESULT_SCHEMA,
+	DECIDER_RESULT_SCHEMA,
 	FIXER_RESULT_SCHEMA,
 	parseSubagentResult,
 	rawSnippet,
@@ -158,7 +167,7 @@ import { buildFixerPrompt } from "./fixer-prompt.ts";
 import { buildReviewerPrompt, filterReviewableStatus, REVIEW_EXCLUDED_DIR, REVIEW_PATHSPEC } from "./reviewer-prompt.ts";
 import { buildCommitterPrompt, loadCommitRules } from "./committer-prompt.ts";
 import { loadProjectReviewGuidelines } from "../review/review-prompts.ts";
-import { buildPauseMenu, defaultReasonText, releaseReasonFor, skipSummaryFor } from "./pause.ts";
+import { buildPauseMenu, defaultReasonText, pauseActionLabel, releaseReasonFor, skipSummaryFor } from "./pause.ts";
 import type { PauseAction, PauseReasonKind, PauseRequest } from "./pause.ts";
 import { discardChanges, snapshotChanges } from "./discard.ts";
 import type { ChangeSnapshot } from "./discard.ts";
@@ -179,6 +188,14 @@ import type { RunRecord, TaskStats } from "./task-stats.ts";
 import { findSessionFile, sessionDirsFor } from "./session-files.ts";
 import { addSplitToPrdIndex, describeSplitProposal, planSplit, validateSplitProposal } from "./task-split.ts";
 import { buildSplitterPrompt } from "./splitter-prompt.ts";
+import {
+	autoAttemptActionText,
+	autoCandidateActions,
+	buildDeciderPrompt,
+	createAutoTaskState,
+	validateDecision,
+} from "./auto-mode.ts";
+import type { AutoTaskState } from "./auto-mode.ts";
 import { buildHandoverPrompt } from "./handover.ts";
 import { arrowNavigation, clampScroll, findTaskBlock, revealBlock } from "./overlay-scroll.ts";
 import type { RowBlock } from "./overlay-scroll.ts";
@@ -1494,6 +1511,8 @@ interface LoopTaskState {
 	currentModel?: string;
 	/** Output events for the viewer overlay, grouped per subagent run (phase). */
 	outputGroups: PhaseOutputGroup[];
+	/** Automatic decisions of auto mode for this task (see ./auto-mode.ts). */
+	auto: AutoTaskState;
 }
 
 /** Token counts of all subagent runs of a task, or undefined if there are none. */
@@ -1524,6 +1543,8 @@ interface LoopState {
 	pauseStart?: number;
 	/** "Stop after the current task" (`x` in the overlay): the loop ends cleanly once the running task is done. */
 	stopAfterTask?: boolean;
+	/** Auto mode (`m` in the overlay): the orchestrator decides blocked tasks, failed implementations and the round limit. */
+	autoMode: boolean;
 	tasks: LoopTaskState[];
 	totalCost: number;
 	totalCommits: number;
@@ -1673,6 +1694,12 @@ class PrdLoopOverlayComponent {
 				this.requestRender();
 				return;
 			}
+			// Auto mode on/off: the orchestrator answers the next decidable pause menus.
+			if (data === "m" || data === "M") {
+				this.state.autoMode = !this.state.autoMode;
+				this.requestRender();
+				return;
+			}
 			// Change models/thinking while the loop keeps running (not after the run).
 			if (data === "s" || data === "S") {
 				this.onEditSettings();
@@ -1799,7 +1826,8 @@ class PrdLoopOverlayComponent {
 				width,
 			),
 			truncateToWidth(
-				this.theme.fg("muted", `${completed}/${total} done • ${running} active • ${failed} failed • max retries ${this.state.maxRetries}`),
+				this.theme.fg("muted", `${completed}/${total} done • ${running} active • ${failed} failed • max retries ${this.state.maxRetries}`) +
+					(this.state.autoMode ? this.theme.fg("accent", " • 🤖 auto mode") : this.theme.fg("dim", " • auto mode off")),
 				width,
 			),
 			truncateToWidth(
@@ -1857,8 +1885,8 @@ class PrdLoopOverlayComponent {
 				? this.theme.fg("warning", "⚠️  Abort loop? Press Esc again to confirm, any other key to cancel")
 				: this.state.stopAfterTask
 					? this.theme.fg("warning", "⏹ Stopping after the current task (x to cancel)") +
-						this.theme.fg("dim", " • o output • s models • ctrl+c pause • esc abort")
-					: this.theme.fg("dim", "↑↓ select/scroll • enter expand • a expand all • o output • s models • x stop after task • ← collapse • ctrl+c pause • esc abort");
+						this.theme.fg("dim", ` • o output • s models • m auto ${this.state.autoMode ? "off" : "on"} • ctrl+c pause • esc abort`)
+					: this.theme.fg("dim", `↑↓ select/scroll • enter expand • a expand all • o output • s models • m auto ${this.state.autoMode ? "off" : "on"} • x stop after task • ← collapse • ctrl+c pause • esc abort`);
 		const scroll = totalRows > contentHeight
 			? this.theme.fg("muted", ` ${this.scrollOffset + 1}-${end}/${totalRows}`)
 			: "";
@@ -2418,6 +2446,7 @@ export async function runOrchestratorLoop(
 	const fixerAgent = await loadAgent(EXTENSION_DIR, "prd-fixer");
 	const committerAgent = await loadAgent(EXTENSION_DIR, "prd-committer");
 	const splitterAgent = await loadAgent(EXTENSION_DIR, "prd-splitter");
+	const deciderAgent = await loadAgent(EXTENSION_DIR, "prd-decider");
 	const prdId = prd.id.startsWith("TODO-") ? prd.id : `TODO-${prd.id}`;
 	const tasks = await fetchPrdTasks(ctx.cwd, prdTag);
 	const resume = options.resume &&
@@ -2473,6 +2502,7 @@ export async function runOrchestratorLoop(
 			currentActivity: undefined,
 			currentTurn: 0,
 			outputGroups: [],
+			auto: createAutoTaskState(),
 			phaseCosts: phaseCostsOf(stats),
 			stats,
 			attemptRuns: [],
@@ -2490,6 +2520,7 @@ export async function runOrchestratorLoop(
 		currentTaskIndex: 0,
 		currentRetry: 0,
 		maxRetries: settings.implementationRetries,
+		autoMode: settings.autoMode === true,
 	};
 
 	const prdTitle = prd.title;
@@ -3088,7 +3119,96 @@ export async function runOrchestratorLoop(
 		| { kind: "aborted" };
 
 	/**
-	 * Pause the loop and ask the human. The menu shows task, current phase
+	 * Auto mode (see ./auto-mode.ts): the prd-decider subagent (orchestrator
+	 * model/thinking) picks one of the offered actions. Returns undefined when
+	 * the human has to decide: auto mode off, pause not decidable, budget used
+	 * up, decider failed or picked something that is not offered, Ctrl+C / Esc
+	 * while it ran, or auto mode switched off in the meantime.
+	 */
+	const decideAutomatically = async (
+		task: TaskInfo,
+		taskState: LoopTaskState,
+		phase: TaskPhase,
+		options: PauseOptions,
+		reasonText: string,
+	): Promise<{ action: PauseAction; rationale: string } | undefined> => {
+		if (!loopState.autoMode || aborted) return undefined;
+		const candidates = autoCandidateActions({
+			reason: options.reason,
+			phase,
+			sequenceLabel: task.sequenceLabel,
+			state: taskState.auto,
+		});
+		if (candidates.length === 0) return undefined;
+
+		const status = await pi.exec("git", ["status", "--porcelain", "--untracked-files=all", ...REVIEW_PATHSPEC], { cwd: ctx.cwd });
+		const hasChanges = status.code === 0 && status.stdout.trim() !== "";
+		let taskBody = task.body;
+		try {
+			// Current body incl. the `## Failed Attempts` written so far.
+			taskBody = await readTodoBody(ctx.cwd, task.id);
+		} catch {
+			// keep the body read at the start
+		}
+
+		taskState.currentActivity = "🤖 auto mode: deciding how to continue…";
+		requestOverlayRender();
+		const run = await runStepSubagent(
+			"orchestrator",
+			taskState,
+			{ ref: { phase: "decide" } },
+			{
+				taskPrompt: buildDeciderPrompt({
+					taskTitle: task.title,
+					taskBody,
+					prdId,
+					phase,
+					phaseLabel: taskState.phaseLabel ?? phase,
+					reason: options.reason,
+					reasonText,
+					errors: options.errors,
+					details: options.details,
+					summary: taskState.summary,
+					blockedReason: options.reason === "task-blocked" ? taskState.blocked?.reason : undefined,
+					proposedSplit: options.reason === "task-blocked" ? taskState.blocked?.proposedSplit : undefined,
+					candidates,
+					previousDecisions: taskState.auto.decisions,
+					hasChanges,
+				}),
+				agent: deciderAgent,
+			},
+		);
+		const parsed = await parseRunResult(run, DECIDER_RESULT_SCHEMA, createRepairFactory(taskState));
+		addCost(taskState, taskState.phaseCosts, "decide", parsed.usage.cost);
+
+		const fallBack = (outcome: string, warning?: string) => {
+			endPhaseOutput(taskState, `${outcome} — the pause menu is shown`, true);
+			if (warning) ctx.ui.notify(`🤖 Auto mode: ${warning} The pause menu is shown.`, "warning");
+			return undefined;
+		};
+		if (aborted) return fallBack("cancelled");
+		if (pauseRequested) return fallBack("cancelled (Ctrl+C)");
+		if (!parsed.ok) return fallBack(`failed — ${parsed.error}`, `no decision (${parsed.error}).`);
+		const decision = validateDecision(parsed.value, candidates);
+		if (!decision.ok) return fallBack(`invalid decision — ${decision.error}`, `${decision.error}.`);
+		if (!loopState.autoMode) return fallBack(`→ ${decision.action} (ignored: auto mode was switched off)`);
+
+		endPhaseOutput(taskState, `→ ${decision.action}${decision.rationale ? ` — ${decision.rationale}` : ""}${repairedSuffix(parsed)}`);
+		taskState.auto.decisions.push({ reason: reasonText, action: decision.action, rationale: decision.rationale });
+		const actionLabel = pauseActionLabel(decision.action, phase).split(" — ")[0];
+		ctx.ui.notify(
+			`🤖 Auto mode — Task ${task.sequenceLabel}: ${actionLabel}${decision.rationale ? `. ${decision.rationale}` : ""}`,
+			"info",
+		);
+		return decision;
+	};
+
+	/** True if the action returned by the latest `pause` was picked by auto mode. */
+	let lastPauseAuto = false;
+
+	/**
+	 * Pause the loop and ask the human (in auto mode, the orchestrator decides
+	 * first; see `decideAutomatically`). The menu shows task, current phase
 	 * (incl. round progress) and reason. The overlay refresh stops while the
 	 * menu is open; afterwards a fresh abort controller is installed so the
 	 * chosen action can spawn subagents again.
@@ -3100,6 +3220,7 @@ export async function runOrchestratorLoop(
 		options: PauseOptions,
 	): Promise<PauseAction> => {
 		pauseRequested = false;
+		lastPauseAuto = false;
 		const reasonText = options.reasonText ?? defaultReasonText(options.reason, phase);
 		taskState.currentActivity = `⏸ ${reasonText}`;
 		const lastGroup = taskState.outputGroups.at(-1);
@@ -3107,6 +3228,35 @@ export async function runOrchestratorLoop(
 			finishPhaseGroup(taskState.outputGroups, { outcome: `⏸ paused — ${reasonText}`, failed: true });
 		}
 		requestOverlayRender();
+
+		// --- Auto mode: the orchestrator decides (the clocks keep running, the decider works) ---
+		const auto = await decideAutomatically(task, taskState, phase, options, reasonText);
+		if (aborted) {
+			pendingAttempt = undefined;
+			return "abort";
+		}
+		if (auto) {
+			lastPauseAuto = true;
+			taskState.currentActivity = undefined;
+			requestOverlayRender();
+			pendingAttempt = shouldRecordAttempt(options.reason, auto.action)
+				? {
+					timestamp: localTimestamp(),
+					phase: taskState.phaseLabel ?? phase,
+					reason: reasonText,
+					action: autoAttemptActionText(auto.action, auto.rationale),
+					errors: options.errors,
+					summary: taskState.summary,
+				}
+				: undefined;
+			if (auto.action !== "retry-task" && auto.action !== "split-task") await recordAttempt(task, taskState);
+			return auto.action;
+		}
+		// Ctrl+C while the decider ran: the menu below is the manual pause.
+		pauseRequested = false;
+		taskState.currentActivity = `⏸ ${reasonText}`;
+		requestOverlayRender();
+
 		if (widgetTimer) clearInterval(widgetTimer);
 		// The clocks stop while the menu waits for the human.
 		const resumeClocks = pauseClocks(taskState);
@@ -3210,6 +3360,7 @@ export async function runOrchestratorLoop(
 		taskState: LoopTaskState,
 		phaseCosts: Partial<Record<CostPhase, number>>,
 		pauseOptions: PauseOptions,
+		flow: { auto?: boolean } = {},
 	): Promise<boolean> => {
 		const existingLabels = tasks.map((t) => t.sequenceLabel);
 		const labelsFor = (count: number) => nextSubtaskLabels(task.sequenceLabel, existingLabels, count);
@@ -3299,14 +3450,17 @@ export async function runOrchestratorLoop(
 		].join("\n");
 		const applyLabel = `Apply split — create ${count} subtask todos and continue with ${labels[0]!.split("/")[0]}`;
 		const backLabel = "Back to the pause menu — change nothing";
-		const resumeClocks = pauseClocks(taskState);
-		let choice: string | undefined;
-		try {
-			choice = await withOverlayHidden(() => ctx.ui.select(title, [applyLabel, backLabel]));
-		} finally {
-			resumeClocks();
+		// Auto mode applies the split without asking (the changes are still saved as a git stash).
+		if (!flow.auto || !loopState.autoMode) {
+			const resumeClocks = pauseClocks(taskState);
+			let choice: string | undefined;
+			try {
+				choice = await withOverlayHidden(() => ctx.ui.select(title, [applyLabel, backLabel]));
+			} finally {
+				resumeClocks();
+			}
+			if (choice !== applyLabel) return false;
 		}
-		if (choice !== applyLabel) return false;
 
 		// --- Apply ---
 		try {
@@ -3347,6 +3501,9 @@ export async function runOrchestratorLoop(
 			}
 
 			lastSplitIds = plan.subtasks.map((subtask) => subtask.id);
+			// The close-out is new work: auto mode gets a fresh budget for it, but
+			// keeps the split so the close-out is not split again automatically.
+			taskState.auto = { decisions: taskState.auto.decisions.filter((decision) => decision.action === "split-task") };
 			const range = `${labels[0]!.split("/")[0]}–${labels.at(-1)!.split("/")[0]}`;
 			taskState.summary = `Split into ${range}; runs again as close-out after the subtasks.`;
 			ctx.ui.notify(
@@ -3411,7 +3568,7 @@ export async function runOrchestratorLoop(
 			while (true) {
 				const action = await pause(task, taskState, "Implement", options);
 				if (action !== "split-task") return action;
-				if (await runSplitFlow(task, taskState, phaseCosts, options)) return "split-applied";
+				if (await runSplitFlow(task, taskState, phaseCosts, options, { auto: lastPauseAuto })) return "split-applied";
 				if (aborted) return "abort";
 			}
 		};
@@ -4030,6 +4187,11 @@ export async function runOrchestratorLoop(
 					updateCycleInfo();
 					continue;
 				case "commit-as-is":
+					if (lastPauseAuto) {
+						const rationale = taskState.auto.decisions.at(-1)?.rationale;
+						reviewNote = `Committed as-is at the review round limit (${step.round}/${step.roundLimit}) by auto mode${rationale ? `: ${rationale}` : "."}`;
+						taskState.reviewNote = reviewNote;
+					}
 					cycle = commitAsIs(cycle);
 					updateCycleInfo();
 					continue;
