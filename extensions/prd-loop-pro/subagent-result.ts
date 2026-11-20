@@ -292,6 +292,25 @@ export const SPLITTER_RESULT_SCHEMA: ResultSchema<SplitProposal> = {
 	},
 };
 
+/** prd-decider (auto mode): the pause action the orchestrator picks instead of the human. */
+export interface DeciderResult {
+	/** One of the offered action ids (checked against the offered actions by the loop). */
+	action: string;
+	rationale: string;
+}
+
+/** prd-decider: `{ action, rationale }`. */
+export const DECIDER_RESULT_SCHEMA: ResultSchema<DeciderResult> = {
+	name: "prd-decider",
+	schema: {
+		type: "object",
+		properties: {
+			action: { type: "string", description: "id of one of the offered actions" },
+			rationale: { type: "string", optional: true, default: "", description: "one or two sentences: why this action" },
+		},
+	},
+};
+
 export type FindingPriority = "P0" | "P1" | "P2" | "P3";
 
 export interface ReviewFinding {

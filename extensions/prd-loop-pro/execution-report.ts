@@ -15,9 +15,9 @@
 import type { ReviewFinding } from "./subagent-result.ts";
 
 /** Pipeline phases that can incur cost. */
-export type CostPhase = "implement" | "review" | "fix" | "commit" | "split" | "repair";
+export type CostPhase = "implement" | "review" | "fix" | "commit" | "split" | "decide" | "repair";
 
-export const COST_PHASES: readonly CostPhase[] = ["implement", "review", "fix", "commit", "split", "repair"];
+export const COST_PHASES: readonly CostPhase[] = ["implement", "review", "fix", "commit", "split", "decide", "repair"];
 
 export const COST_PHASE_LABELS: Record<CostPhase, string> = {
 	implement: "implement",
@@ -25,6 +25,7 @@ export const COST_PHASE_LABELS: Record<CostPhase, string> = {
 	fix: "fix",
 	commit: "commit",
 	split: "split",
+	decide: "auto decision",
 	repair: "JSON repair",
 };
 
