@@ -50,7 +50,15 @@ const FIELD_LABELS: Record<Exclude<OverrideField, `steps.${StepKey}`>, string> =
 	fixThreshold: "Fix threshold",
 	maxReviewRounds: "Max review rounds",
 	implementationRetries: "Impl. retries",
+	autoMode: "Auto mode",
 };
+
+/** Display value of the auto mode setting. */
+export function formatAutoMode(value: unknown): string {
+	if (value === true) return "on — the orchestrator decides pause menus";
+	if (value === false) return "off";
+	return JSON.stringify(value);
+}
 
 export function fieldLabel(field: OverrideField): string {
 	const step = overrideFieldStep(field);
@@ -69,6 +77,7 @@ export function formatFieldValue(settings: PrdLoopProSettings, field: OverrideFi
 	}
 	if (field === "fixThreshold") return formatThreshold(settings.fixThreshold);
 	if (field === "maxReviewRounds") return String(settings.maxReviewRounds);
+	if (field === "autoMode") return formatAutoMode(settings.autoMode);
 	return String(settings.implementationRetries);
 }
 

@@ -51,6 +51,7 @@ export const FIX_THRESHOLD_LABELS: Record<FixThreshold, string> = {
 export const DEFAULT_FIX_THRESHOLD: FixThreshold = "P1";
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 export const DEFAULT_IMPLEMENTATION_RETRIES = 0;
+export const DEFAULT_AUTO_MODE = false;
 export const MIN_MAX_REVIEW_ROUNDS = 1;
 export const MIN_IMPLEMENTATION_RETRIES = 0;
 
@@ -78,6 +79,11 @@ export interface PrdLoopProSettings {
 	maxReviewRounds: number;
 	/** Integer ≥ 0 when valid. */
 	implementationRetries: number;
+	/**
+	 * Auto mode: the orchestrator decides pause menus (blocked task, failed
+	 * implementation, round limit) instead of the human. Boolean when valid.
+	 */
+	autoMode: boolean;
 }
 
 /** Minimal model description needed for validation (structurally compatible with pi's Model). */
@@ -98,6 +104,7 @@ export type SettingsField =
 	| "fixThreshold"
 	| "maxReviewRounds"
 	| "implementationRetries"
+	| "autoMode"
 	/** The project settings file itself cannot be used (unreadable / invalid JSON). */
 	| "projectFile";
 
@@ -105,7 +112,10 @@ export type SettingsField =
  * A field that can be overridden per project. Steps are overridden as a unit
  * (model + thinking belong together), all other fields individually.
  */
-export type OverrideField = `steps.${StepKey}` | "fixThreshold" | "maxReviewRounds" | "implementationRetries";
+export type OverrideField = `steps.${StepKey}` | "fixThreshold" | "maxReviewRounds" | "implementationRetries" | "autoMode";
+
+/** Scalar (non-step) override fields. */
+type ScalarField = Exclude<OverrideField, `steps.${StepKey}`>;
 
 /** All overridable fields in display order. */
 export const OVERRIDE_FIELDS: readonly OverrideField[] = [
@@ -113,6 +123,7 @@ export const OVERRIDE_FIELDS: readonly OverrideField[] = [
 	"fixThreshold",
 	"maxReviewRounds",
 	"implementationRetries",
+	"autoMode",
 ];
 
 /** Where a resolved field value comes from. */
@@ -128,6 +139,7 @@ export interface SettingsOverrides {
 	fixThreshold?: string;
 	maxReviewRounds?: number;
 	implementationRetries?: number;
+	autoMode?: boolean;
 }
 
 /** Effective settings (global merged with project overrides) plus the source of every field. */
@@ -227,6 +239,7 @@ export function createDefaultSettings(defaults: { model: string; thinking: strin
 		fixThreshold: DEFAULT_FIX_THRESHOLD,
 		maxReviewRounds: DEFAULT_MAX_REVIEW_ROUNDS,
 		implementationRetries: DEFAULT_IMPLEMENTATION_RETRIES,
+		autoMode: DEFAULT_AUTO_MODE,
 	};
 }
 
@@ -280,7 +293,14 @@ export function normalizeSettings(raw: Record<string, unknown>): PrdLoopProSetti
 					: String(raw.fixThreshold),
 		maxReviewRounds: normalizeNumber(raw.maxReviewRounds, DEFAULT_MAX_REVIEW_ROUNDS),
 		implementationRetries: normalizeNumber(raw.implementationRetries, DEFAULT_IMPLEMENTATION_RETRIES),
+		autoMode: normalizeBoolean(raw.autoMode, DEFAULT_AUTO_MODE),
 	};
+}
+
+/** Missing → fallback; values of the wrong type are kept so validation flags them. */
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+	if (value === undefined) return fallback;
+	return value as boolean;
 }
 
 /**
@@ -322,6 +342,7 @@ export function normalizeOverrides(raw: Record<string, unknown>): SettingsOverri
 	if (raw.implementationRetries !== undefined) {
 		overrides.implementationRetries = normalizeNumber(raw.implementationRetries, DEFAULT_IMPLEMENTATION_RETRIES);
 	}
+	if (raw.autoMode !== undefined) overrides.autoMode = normalizeBoolean(raw.autoMode, DEFAULT_AUTO_MODE);
 
 	return overrides;
 }
@@ -413,6 +434,7 @@ export function saveProjectSettingsFile(path: string, overrides: SettingsOverrid
 	if (overrides.fixThreshold !== undefined) data.fixThreshold = overrides.fixThreshold;
 	if (overrides.maxReviewRounds !== undefined) data.maxReviewRounds = overrides.maxReviewRounds;
 	if (overrides.implementationRetries !== undefined) data.implementationRetries = overrides.implementationRetries;
+	if (overrides.autoMode !== undefined) data.autoMode = overrides.autoMode;
 	writeJsonAtomic(path, data);
 	return "written";
 }
@@ -437,7 +459,8 @@ export function hasOverrides(overrides: SettingsOverrides | undefined): boolean 
 	return (
 		overrides.fixThreshold !== undefined ||
 		overrides.maxReviewRounds !== undefined ||
-		overrides.implementationRetries !== undefined
+		overrides.implementationRetries !== undefined ||
+		overrides.autoMode !== undefined
 	);
 }
 
@@ -450,7 +473,7 @@ export function overrideFieldStep(field: OverrideField): StepKey | undefined {
 function isOverridden(overrides: SettingsOverrides, field: OverrideField): boolean {
 	const step = overrideFieldStep(field);
 	if (step) return overrides.steps?.[step] !== undefined;
-	return overrides[field as Exclude<OverrideField, `steps.${StepKey}`>] !== undefined;
+	return overrides[field as ScalarField] !== undefined;
 }
 
 /** Copy a field value from `source` settings into `target` settings. */
@@ -458,20 +481,21 @@ function copyField(target: PrdLoopProSettings, source: PrdLoopProSettings, field
 	const step = overrideFieldStep(field);
 	if (step) {
 		target.steps[step] = { ...source.steps[step] };
-	} else if (field === "fixThreshold") {
-		target.fixThreshold = source.fixThreshold;
-	} else if (field === "maxReviewRounds") {
-		target.maxReviewRounds = source.maxReviewRounds;
-	} else if (field === "implementationRetries") {
-		target.implementationRetries = source.implementationRetries;
+	} else {
+		setScalar(target, field as ScalarField, source[field as ScalarField]);
 	}
+}
+
+/** Assign a scalar field (keeps the field/value pairing in one place). */
+function setScalar<K extends ScalarField>(target: { [P in K]?: PrdLoopProSettings[P] }, field: K, value: PrdLoopProSettings[K]): void {
+	target[field] = value;
 }
 
 /** Whether a field has the same value in both settings objects. */
 export function fieldEquals(a: PrdLoopProSettings, b: PrdLoopProSettings, field: OverrideField): boolean {
 	const step = overrideFieldStep(field);
 	if (step) return a.steps[step].model === b.steps[step].model && a.steps[step].thinking === b.steps[step].thinking;
-	const key = field as "fixThreshold" | "maxReviewRounds" | "implementationRetries";
+	const key = field as ScalarField;
 	return Object.is(a[key], b[key]);
 }
 
@@ -523,6 +547,10 @@ export function mergeSettings(global: PrdLoopProSettings, overrides?: SettingsOv
 		settings.implementationRetries = overrides.implementationRetries;
 		sources.implementationRetries = "project";
 	}
+	if (overrides.autoMode !== undefined) {
+		settings.autoMode = overrides.autoMode;
+		sources.autoMode = "project";
+	}
 	return { settings, sources };
 }
 
@@ -537,12 +565,8 @@ export function computeProjectOverrides(global: PrdLoopProSettings, target: PrdL
 		const step = overrideFieldStep(field);
 		if (step) {
 			overrides.steps = { ...overrides.steps, [step]: { ...target.steps[step] } };
-		} else if (field === "fixThreshold") {
-			overrides.fixThreshold = target.fixThreshold;
-		} else if (field === "maxReviewRounds") {
-			overrides.maxReviewRounds = target.maxReviewRounds;
-		} else if (field === "implementationRetries") {
-			overrides.implementationRetries = target.implementationRetries;
+		} else {
+			setScalar(overrides, field as ScalarField, target[field as ScalarField]);
 		}
 	}
 	return overrides;
@@ -557,12 +581,8 @@ export function withoutOverrides(overrides: SettingsOverrides, fields: readonly 
 		const step = overrideFieldStep(field);
 		if (step) {
 			result.steps = { ...result.steps, [step]: { ...overrides.steps![step] } };
-		} else if (field === "fixThreshold") {
-			result.fixThreshold = overrides.fixThreshold;
-		} else if (field === "maxReviewRounds") {
-			result.maxReviewRounds = overrides.maxReviewRounds;
-		} else if (field === "implementationRetries") {
-			result.implementationRetries = overrides.implementationRetries;
+		} else {
+			setScalar(result, field as ScalarField, overrides[field as ScalarField] as PrdLoopProSettings[ScalarField]);
 		}
 	}
 	return result;
@@ -756,6 +776,13 @@ export function validateSettings(
 		issues.push({
 			field: "implementationRetries",
 			message: `Implementation retries must be an integer ≥ ${MIN_IMPLEMENTATION_RETRIES} (got ${String(settings.implementationRetries)})`,
+		});
+	}
+
+	if (typeof settings.autoMode !== "boolean") {
+		issues.push({
+			field: "autoMode",
+			message: `Auto mode must be true or false (got ${JSON.stringify(settings.autoMode)})`,
 		});
 	}
 

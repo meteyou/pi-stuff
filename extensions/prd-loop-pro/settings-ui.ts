@@ -229,6 +229,20 @@ async function pickFixThreshold(
 	return index === -1 ? undefined : FIX_THRESHOLDS[index];
 }
 
+async function pickAutoMode(ctx: ExtensionCommandContext, title: string, current: unknown): Promise<boolean | undefined> {
+	const values = [false, true];
+	const options = values.map((value) => {
+		const label = value
+			? "On — the orchestrator decides blocked tasks, failed implementations and the review round limit (toggle with m while running)"
+			: "Off — every pause menu waits for you";
+		return value === current ? `${label} ★` : label;
+	});
+	const choice = await ctx.ui.select(title, options);
+	if (choice === undefined) return undefined;
+	const index = options.indexOf(choice);
+	return index === -1 ? undefined : values[index];
+}
+
 async function inputInteger(
 	ctx: ExtensionCommandContext,
 	title: string,
@@ -245,7 +259,7 @@ async function inputInteger(
 
 // --- Wizard ---
 
-const WIZARD_ENTRY_COUNT = STEP_KEYS.length + 3;
+const WIZARD_ENTRY_COUNT = STEP_KEYS.length + 4;
 
 /**
  * Walk through every settings entry, using `initial` as defaults.
@@ -300,6 +314,11 @@ export async function runSettingsWizard(
 	});
 	if (retries === undefined) return undefined;
 	settings.implementationRetries = retries;
+
+	entry++;
+	const autoMode = await pickAutoMode(ctx, `${prefix()} Auto mode`, settings.autoMode);
+	if (autoMode === undefined) return undefined;
+	settings.autoMode = autoMode;
 
 	return settings;
 }
@@ -425,6 +444,13 @@ async function editField(
 		const threshold = await pickFixThreshold(ctx, label, draft.fixThreshold);
 		if (threshold === undefined) return false;
 		draft.fixThreshold = threshold;
+		return true;
+	}
+
+	if (field === "autoMode") {
+		const value = await pickAutoMode(ctx, label, draft.autoMode);
+		if (value === undefined) return false;
+		draft.autoMode = value;
 		return true;
 	}
 

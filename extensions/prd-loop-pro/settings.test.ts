@@ -652,3 +652,70 @@ describe("project overrides: files", () => {
 		assert.equal(removeProjectSettingsFile(projectPath), false);
 	});
 });
+
+describe("auto mode setting", () => {
+	let dir: string;
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "prd-loop-pro-auto-"));
+	});
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("is off by default and when missing in the file", () => {
+		assert.equal(validSettings().autoMode, false);
+		const path = join(dir, SETTINGS_FILE_NAME);
+		writeFileSync(path, JSON.stringify({ version: 1, steps: {} }), "utf-8");
+		const result = loadSettingsFile(path);
+		assert.equal(result.status, "loaded");
+		if (result.status === "loaded") assert.equal(result.settings.autoMode, false);
+	});
+
+	it("round-trips through the global file", () => {
+		const path = join(dir, SETTINGS_FILE_NAME);
+		const settings = validSettings();
+		settings.autoMode = true;
+		saveSettingsFile(path, settings);
+		const result = loadSettingsFile(path);
+		assert.equal(result.status, "loaded");
+		if (result.status === "loaded") assert.equal(result.settings.autoMode, true);
+	});
+
+	it("flags a non-boolean value", () => {
+		const path = join(dir, SETTINGS_FILE_NAME);
+		writeFileSync(path, JSON.stringify({ version: 1, autoMode: "yes" }), "utf-8");
+		const result = loadSettingsFile(path);
+		assert.equal(result.status, "loaded");
+		if (result.status !== "loaded") return;
+		assert.equal(fieldIssues(validateSettings(result.settings, AVAILABLE), "autoMode").length, 1);
+		assert.equal(fieldIssues(validateSettings(validSettings(), AVAILABLE), "autoMode").length, 0);
+	});
+
+	it("is overridable per project", () => {
+		const global = validSettings();
+		const draft = validSettings();
+		draft.autoMode = true;
+		assert.deepEqual(changedFields(global, draft), ["autoMode"]);
+		const overrides = computeProjectOverrides(global, draft);
+		assert.deepEqual(overrides, { autoMode: true });
+		assert.equal(hasOverrides(overrides), true);
+		const { settings, sources } = mergeSettings(global, overrides);
+		assert.equal(settings.autoMode, true);
+		assert.equal(sources.autoMode, "project");
+
+		const path = getProjectSettingsPath(dir);
+		saveProjectSettingsFile(path, overrides);
+		const loaded = loadProjectSettingsFile(path);
+		assert.equal(loaded.status, "loaded");
+		if (loaded.status === "loaded") assert.deepEqual(loaded.overrides, { version: SETTINGS_VERSION, autoMode: true });
+	});
+
+	it("global save drops the project override of the auto mode", () => {
+		const global = validSettings();
+		const before = mergeSettings(global, { autoMode: true }).settings;
+		const draft = { ...before, autoMode: false };
+		const next = planGlobalSave({ global, overrides: { autoMode: true } }, before, draft);
+		assert.equal(next.global.autoMode, false);
+		assert.equal(hasOverrides(next.overrides), false);
+	});
+});
