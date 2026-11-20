@@ -13,6 +13,8 @@ Compared to `/prd-loop`:
   **released to a human** (`needs-human`, with a prepared prompt for the main session) and resumed at the next start
 - a task that is **too large or blocked** is reported as such by the implementer and can be **split into subtasks**
   from the pause menu; the loop then continues with the subtasks
+- an optional **auto mode** (`m` while running, or saved in the settings) lets the orchestrator answer the pause menus
+  of blocked tasks, failed implementations and the review round limit itself (split, retry, one more round, …)
 - nothing is lost on a failure: discarded changes are **saved as a git stash**, every failed attempt is **recorded in
   the task todo** and every subagent run is a **stored pi session**
 - **time, tokens, cost and sessions are saved in the task todos**, so they are still there after a restart and every
@@ -92,7 +94,7 @@ review → findings ≥ threshold? ──no────────────�
 Appended to the task todo after the task is committed (or closed via a pause/resume option). Contains the implementer
 summary, review rounds, fixed findings, rejected findings with reasons, deferred findings, unresolved findings, human
 reviewer callouts, the created commit SHAs (HEAD before vs. after the commit phase, determined by the orchestrator),
-the cost per phase (implement, review, fix, commit, split, JSON repair), the active time, the tokens and the sessions
+the cost per phase (implement, review, fix, commit, split, auto decision, JSON repair), the active time, the tokens and the sessions
 of all subagent runs of the task.
 
 ## Settings
@@ -105,10 +107,11 @@ of all subagent runs of the task.
 | `steps.review` | model + thinking level | session model + thinking level |
 | `steps.fix` | model + thinking level | session model + thinking level |
 | `steps.commit` | model + thinking level | session model + thinking level |
-| `steps.orchestrator` | model + thinking level (used for JSON repair and for the splitter of *Split task*) | session model + thinking level |
+| `steps.orchestrator` | model + thinking level (used for JSON repair, the splitter of *Split task* and the decider of [auto mode](#auto-mode)) | session model + thinking level |
 | `fixThreshold` | `P0` (only P0), `P1` (≤ P1), `P2` (≤ P2), `P3` (≤ P3) | `P1` |
 | `maxReviewRounds` | integer ≥ 1 | `3` |
 | `implementationRetries` | integer ≥ 0 | `0` |
+| `autoMode` | `true` / `false` — start the loop with [auto mode](#auto-mode) on | `false` |
 
 Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` — only those supported by the selected model;
 non-reasoning models only offer `off`.
@@ -136,15 +139,15 @@ together). Example project file:
 ### First start: setup wizard
 
 Without a global settings file, a wizard walks through all entries (model + thinking for each of the five steps, fix
-threshold, max review rounds, implementation retries), pre-filled with the current session model and thinking level.
+threshold, max review rounds, implementation retries, auto mode), pre-filled with the current session model and thinking level.
 The result is saved globally. If the global file is invalid, you're offered to re-run the wizard (overwrites the file).
 
 ### Overview
 
 Every start shows one overview menu with the PRD, open/completed task counts, the paths of both settings files and
 every entry with its source (`[global]` or `[project]`). The cursor starts on **Confirm & start**; move up with `↑` to
-select an entry and change it in place (model + thinking for steps, the fix threshold, max review rounds and
-implementation retries). The model picker lists your scoped models first and offers **All available models…** as last
+select an entry and change it in place (model + thinking for steps, the fix threshold, max review rounds,
+implementation retries and auto mode). The model picker lists your scoped models first and offers **All available models…** as last
 option, so steps can mix providers. Changed entries are marked `• changed` and the cursor stays on the edited row.
 
 Actions:
@@ -176,7 +179,8 @@ background and the overlay comes back when you confirm or leave the dialog.
   project only** (only the steps edited in this dialog are written; earlier run-only edits stay unsaved) and
   **Discard changes & back to loop**. `Esc` returns to the loop (asks before dropping unsaved changes).
 - If the loop needs a pause menu while the dialog is open, the pause menu is shown right after the dialog closes.
-- Fix threshold, max review rounds and implementation retries can only be changed at start.
+- Fix threshold, max review rounds and implementation retries can only be changed at start. Auto mode is toggled with
+  `m` (see [Auto mode](#auto-mode)).
 
 The model each subagent run used is shown in the output viewer's phase headers and, while it runs, in the task
 details (`Model:`).
@@ -191,7 +195,9 @@ details (`Model:`).
 ## Pause Cases
 
 The loop never fails hard on a task. Instead, it opens a pause menu that shows the task, the current phase (incl.
-progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any errors/details:
+progress, e.g. `Review 2/3` or `Fix #1 • 3 findings`), the reason and any errors/details. In
+[auto mode](#auto-mode), the orchestrator picks the option for a blocked task, a failed implementation and the round
+limit instead:
 
 | Reason | Options |
 |--------|---------|
@@ -225,6 +231,39 @@ tracked by git. Everything else is saved as a git stash before it is discarded (
 committer never uses `--no-verify` and never tries to fix hook failures; it reports `hookFailed: true` and the loop
 pauses so you can resolve the hook problem.
 
+## Auto mode
+
+In auto mode the orchestrator answers some pause menus itself instead of waiting for you. The
+[`prd-decider`](./agents/prd-decider.md) subagent (read-only, orchestrator model + thinking level) gets the task, the
+reason, the errors, the open findings or the implementer's split proposal, the earlier automatic decisions of the task
+and the offered actions, may inspect the uncommitted changes, and picks one action with a short rationale.
+
+- **On/off:** `m` in the live overlay toggles it for the running loop (the header shows `🤖 auto mode`). The setting
+  `autoMode` (overview / setup wizard, global or per project) decides whether a loop *starts* with it.
+- **Which pauses** (everything else always waits for you):
+
+  | Reason | Actions auto mode may pick |
+  |--------|----------------------------|
+  | Implementer reported the task as blocked | Split task, Release, Retry phase, Retry task |
+  | Implementation failed after all retries | Retry phase, Retry task, Split task, Release |
+  | Review round limit reached | One more round, Commit as-is & close task, Release |
+
+- **Never picked:** *Abort*, *Skip task*, *Resume* and *Skip phase*. Manual pauses (`Ctrl+C`), invalid JSON, crashed
+  phases, committer and hook failures always open the menu.
+- **Guard rails:** at most 4 automatic decisions per task; *Retry phase*, *Retry task*, *One more round* and *Split
+  task* at most once per task each; a task is only split automatically while its subtasks stay at depth ≤ 2 (`17` →
+  `17a` → `17a1`, but `17a1` is not split again). After a split the close-out task gets a fresh budget but is not split
+  again automatically. If nothing but *Release* is left, the menu is shown.
+- **Split without confirmation:** a split chosen by auto mode is applied right away (the changes are still saved as a git
+  stash first). If the splitter fails, the decider is asked again (without *Split task*).
+- **Fallback:** if the decider fails, returns no valid action, is interrupted (`Ctrl+C` / `Esc`) or auto mode is
+  switched off while it runs, the normal pause menu is shown.
+- **Traceability:** every decision shows up as an `Auto decision` group in the output viewer (action + rationale) and as
+  a notification; decisions that end an attempt are recorded in `## Failed Attempts` (`… — chosen by auto mode:
+  <rationale>`), *Commit as-is* by auto mode is noted in the execution report, and the decider's cost is booked as
+  *auto decision*.
+- The task clock keeps running while the decider works (it is not a dialog).
+
 ## Blocked tasks and Split task
 
 A task can turn out to be too large for one run, or to need something that does not exist yet. The implementer then
@@ -232,12 +271,13 @@ ends its run with a **blocked** result (`blocked: { reason, proposedSplit[] }`) 
 does not retry such a task automatically, since the same task would fail the same way. It pauses with the reason and
 the parts the implementer proposed.
 
-**Split task** (offered for a blocked task, a failed implementation and a manual pause during implement):
+**Split task** (offered for a blocked task, a failed implementation and a manual pause during implement; picked
+automatically in [auto mode](#auto-mode)):
 
 1. The [`prd-splitter`](./agents/prd-splitter.md) subagent (read-only, orchestrator model + thinking level) reads the
    task, the reason, the implementer's proposal and the uncommitted changes of the attempt, and proposes 2–12 subtasks
    plus what remains for the original task. An unusable proposal is requested once more.
-2. You see the proposal and confirm it (*Apply split*) or go back to the pause menu.
+2. You see the proposal and confirm it (*Apply split*) or go back to the pause menu. In auto mode this step is skipped.
 3. The changes of the attempt are saved as a git stash and removed from the working tree.
 4. The subtask todos are created with hierarchical labels (`Task 17/20` → `17a/20`, `17b/20`; `Task 17a/20` →
    `17a1/20`, `17a2/20`; the total stays, labels are never reused). Subtasks that depend on nothing inside the split
@@ -353,7 +393,8 @@ PRD.
   tokens. Time and cost include earlier loop runs (see [Statistics and sessions](#statistics-and-sessions)).
   Keys: `↑/↓` select (long task details are scrolled through line by line first), `Enter` expand, `←` collapse,
   `a` expand/collapse all, `o` output viewer, `s` change models/thinking while running (see
-  [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `x` stop after the current task,
+  [Changing models while the loop runs](#changing-models-while-the-loop-runs)), `m` auto mode on/off (see
+  [Auto mode](#auto-mode)), `x` stop after the current task,
   `Ctrl+C` pause, `Esc` (twice) abort.
 - **Stop after the current task** (`x`, press again to cancel) — the loop finishes the running task completely
   (implement, review, fix, commit, report) and then stops instead of starting the next one. The working tree is clean
@@ -363,7 +404,7 @@ PRD.
   `prd-to-todos` skill) are sorted below their parent (`17` < `17a` < `17a1` < `17a2` < `17b` < `18`), indented per
   level, and the parent row shows `subtasks x/y done`.
 - **Output viewer** (`o`) — events grouped per subagent run under phase headers (`Implement`, `Review #1`,
-  `Fix #1 • 3 findings`, `Commit`, `Split`) with the model + thinking level of the run, outcome, cost and duration.
+  `Fix #1 • 3 findings`, `Commit`, `Split`, `Auto decision`) with the model + thinking level of the run, outcome, cost and duration.
   It shows the runs of the current loop run; earlier runs are opened as sessions (`/todos` → task → **sessions**).
 - **Finished view** — when the run is over (completed, stopped after a task, failed, aborted or released), the overlay
   stays open: the header shows the outcome, totals and the final notification; tasks can still be expanded and their
@@ -381,13 +422,14 @@ message**.
 |-------|------|-------|-----------------|
 | [`prd-worker`](./agents/prd-worker.md) | Implement | read, bash, write, edit | `{ success, errors[], summary, blocked?: { reason, proposedSplit: [{ title, description }] } }` |
 | [`prd-splitter`](./agents/prd-splitter.md) | Split task (orchestrator model) | read, bash (read-only) | `{ rationale, subtasks: [{ title, whatToBuild, acceptanceCriteria[], dependsOn[] }], parent: { whatToBuild, acceptanceCriteria[] } }` |
+| [`prd-decider`](./agents/prd-decider.md) | Auto mode (orchestrator model) | read, bash (read-only) | `{ action, rationale }` (`action` must be one of the offered action ids) |
 | [`prd-reviewer`](./agents/prd-reviewer.md) | Review | read, bash, grep, find, ls (read-only) | `{ verdict: "correct" \| "needs attention", summary, findings: [{ priority: "P0".."P3", title, file, line?, body }], callouts: [string] }` |
 | [`prd-fixer`](./agents/prd-fixer.md) | Fix | read, bash, edit, write | `{ results: [{ id, status: "fixed" \| "rejected", reason, summary }], verification }` (one entry per finding) |
 | [`prd-committer`](./agents/prd-committer.md) | Commit | read, bash | `{ success, errors[], summary, hookFailed }` |
 
 Rules shared by all agents: never touch `.pi/`, never use the todo tool (also not when a task body asks for follow-up
 todos: the worker reports such work as blocked with a proposed split, and the orchestrator creates the todos).
-Worker, splitter, reviewer and fixer never run git write operations; only the committer commits (explicit paths, no
+Worker, splitter, decider, reviewer and fixer never run git write operations; only the committer commits (explicit paths, no
 `git add -A`, no `--no-verify`, no footers).
 
 ### JSON repair
@@ -419,6 +461,7 @@ If both fail, the loop pauses (*JSON repair failed*).
 | `session-files.ts` | Find the stored session file of a subagent run |
 | `task-split.ts` | Split a task into subtasks: labels, todo bodies, close-out task, PRD Task Index rows (pure) |
 | `splitter-prompt.ts` | Prompt builder for the splitter (pure) |
+| `auto-mode.ts` | Auto mode: decidable pauses, candidate actions + guard rails, decider prompt, decision validation (pure) |
 | `handover.ts` | Prepared prompt for the main session after *Release / hand over* (pure) |
 | `task-sequence.ts` | Sequence labels incl. split subtasks (`17a1/20`): parsing, hierarchical sort, depth, subtask progress (pure) |
 | `task-index.ts` | Task graph, `needs-human` handling, PRD Task Index sync, git clean check (pure) |
